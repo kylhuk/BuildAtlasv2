@@ -1,0 +1,32 @@
+{
+  "scenario_id": "delve_tier_2",
+  "version": "v0",
+  "profile_id": "delve",
+  "pob_config": {
+    "name": "Delve Depth Tier 2",
+    "boss": "Delve_Guardian_2",
+    "debuffs": ["enfeeble", "brutality"],
+    "flasks": {
+      "granite": 3,
+      "basalt": 3,
+      "quicksilver": 1
+    }
+  },
+  "gate_thresholds": {
+    "resists": {
+      "fire": 82,
+      "cold": 80,
+      "lightning": 83,
+      "chaos": 68
+    },
+    "reservation": {
+      "max_percent": 90
+    },
+    "attributes": {
+      "strength": 190,
+      "dexterity": 160,
+      "intelligence": 140
+    },
+    "min_max_hit": 3700
+  }
+}

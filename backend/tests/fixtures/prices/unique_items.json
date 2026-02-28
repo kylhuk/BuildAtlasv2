@@ -1,0 +1,12 @@
+[
+  {
+    "name": "Headhunter",
+    "chaos": 1200,
+    "rarity": "legendary"
+  },
+  {
+    "name": "Lion's Roar",
+    "chaos": 25,
+    "rarity": "rare"
+  }
+]

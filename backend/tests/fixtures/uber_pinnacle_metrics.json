@@ -1,0 +1,32 @@
+{
+  "uber_pinnacle": {
+    "metrics": {
+      "full_dps": 3100.0,
+      "max_hit": 3400.0,
+      "utility_score": 0.9
+    },
+    "defense": {
+      "armour": 6800.0,
+      "evasion": 1900.0,
+      "resists": {
+        "fire": 80.0,
+        "cold": 80.0,
+        "lightning": 80.0,
+        "chaos": 63.0
+      }
+    },
+    "resources": {
+      "life": 9000.0,
+      "mana": 2200.0
+    },
+    "reservation": {
+      "reserved_percent": 92.0,
+      "available_percent": 85.0
+    },
+    "attributes": {
+      "strength": 182.0,
+      "dexterity": 160.0,
+      "intelligence": 148.0
+    }
+  }
+}

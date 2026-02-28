@@ -1,0 +1,32 @@
+{
+  "mapping_t16": {
+    "metrics": {
+      "full_dps": 5200.0,
+      "max_hit": 4700.0,
+      "utility_score": 1.2
+    },
+    "defense": {
+      "armour": 6500.0,
+      "evasion": 2100.0,
+      "resists": {
+        "fire": 78.0,
+        "cold": 79.5,
+        "lightning": 80.0,
+        "chaos": 65.0
+      }
+    },
+    "resources": {
+      "life": 9600.0,
+      "mana": 2800.0
+    },
+    "reservation": {
+      "reserved_percent": 62.0,
+      "available_percent": 88.0
+    },
+    "attributes": {
+      "strength": 185.0,
+      "dexterity": 140.0,
+      "intelligence": 125.0
+    }
+  }
+}

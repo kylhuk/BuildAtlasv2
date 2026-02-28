@@ -1,0 +1,47 @@
+{
+  "schema_version": "v0",
+  "nodes": [
+    {"id": "start_marauder", "pob_id": "A1", "kind": "start"},
+    {"id": "start_duelist", "pob_id": "B1", "kind": "start"},
+    {"id": "start_ranger", "pob_id": "C1", "kind": "start"},
+    {"id": "start_shadow", "pob_id": "D1", "kind": "start"},
+    {"id": "start_witch", "pob_id": "E1", "kind": "start"},
+    {"id": "start_templar", "pob_id": "F1", "kind": "start"},
+    {"id": "start_scion", "pob_id": "G1", "kind": "start"},
+    {"id": "node_central", "kind": "hub"},
+    {"id": "node_armour_required", "pob_id": "ARM_REQ", "kind": "target"},
+    {"id": "node_armour_desired", "kind": "target"},
+    {"id": "node_evasion_required", "pob_id": "EVA_REQ", "kind": "target"},
+    {"id": "node_evasion_desired", "kind": "target"},
+    {"id": "node_es_required", "pob_id": "ES_REQ", "kind": "target"},
+    {"id": "node_es_desired", "kind": "target"},
+    {"id": "node_hybrid_required", "pob_id": "HYB_REQ", "kind": "target"},
+    {"id": "node_hybrid_desired", "kind": "target"}
+  ],
+  "edges": [
+    {"from": "start_marauder", "to": "node_central"},
+    {"from": "start_duelist", "to": "node_central"},
+    {"from": "start_ranger", "to": "node_central"},
+    {"from": "start_shadow", "to": "node_central"},
+    {"from": "start_witch", "to": "node_central"},
+    {"from": "start_templar", "to": "node_central"},
+    {"from": "start_scion", "to": "node_central"},
+    {"from": "node_central", "to": "node_armour_required"},
+    {"from": "node_armour_required", "to": "node_armour_desired"},
+    {"from": "node_central", "to": "node_evasion_required"},
+    {"from": "node_evasion_required", "to": "node_evasion_desired"},
+    {"from": "node_central", "to": "node_es_required"},
+    {"from": "node_es_required", "to": "node_es_desired"},
+    {"from": "node_central", "to": "node_hybrid_required"},
+    {"from": "node_hybrid_required", "to": "node_hybrid_desired"}
+  ],
+  "start_nodes": {
+    "marauder": "start_marauder",
+    "duelist": "start_duelist",
+    "ranger": "start_ranger",
+    "shadow": "start_shadow",
+    "witch": "start_witch",
+    "templar": "start_templar",
+    "scion": "start_scion"
+  }
+}

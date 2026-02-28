@@ -1,0 +1,33 @@
+{
+  "samples": [
+    {
+      "endpoint": "GET /runs/phase1-e2-baseline-map-a",
+      "top_level_keys": [
+        "archive",
+        "created_at",
+        "emitters",
+        "evaluation",
+        "generation",
+        "parameters",
+        "paths",
+        "run_id",
+        "status"
+      ],
+      "run_id": "phase1-e2-baseline-map-a",
+      "status": "completed"
+    },
+    {
+      "endpoint": "GET /archives/phase1-e2-baseline-map-a",
+      "top_level_keys": [
+        "axes",
+        "bins",
+        "created_at",
+        "metrics",
+        "run_id"
+      ],
+      "run_id": "phase1-e2-baseline-map-a",
+      "bins_count": 1,
+      "axes_count": 2
+    }
+  ]
+}

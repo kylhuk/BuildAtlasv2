@@ -1,0 +1,27 @@
+{
+  "phase": 1,
+  "epic": 3,
+  "bundle": "bundle_20260226T003500Z",
+  "artifacts": [
+    {
+      "path": "docs/phase-1/trial-provenance-schema.md",
+      "sha256": "7d1ccd1a5a0fd4b679e6b476704549a41108ae6de899974613322164ec73ff88",
+      "description": "Phase 1 trial provenance schema"
+    },
+    {
+      "path": "evidence/phase_1/epic_3/bundle_20260226T003500Z/commands.log",
+      "sha256": "c761c1bc5ec6666dc99c6108d293e6531df41e1004950cafb7c89b61eee29b1e",
+      "description": "Schema mapping commands and run summary extraction"
+    },
+    {
+      "path": "evidence/phase_1/epic_3/bundle_20260226T003500Z/queries.log",
+      "sha256": "c6ee5564e22d3772920aad37696a49e496afbd8c32e1d76f94afe53d154b08b2",
+      "description": "N/A rationale for ClickHouse run-level provenance query in Phase 1.3"
+    },
+    {
+      "path": "evidence/phase_1/epic_3/bundle_20260226T003500Z/api_samples.json",
+      "sha256": "938e3310e959c137fd4aa3fecbebaeb57dabb670ef9b847d1dbbaca3ead56893",
+      "description": "API linkage samples for /runs and /archives"
+    }
+  ]
+}

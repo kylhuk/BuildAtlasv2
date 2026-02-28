@@ -1,0 +1,178 @@
+{
+  "runs": {
+    "phase1-e2-baseline-map-a": {
+      "archive_path": "/home/wenga/src/BuildAtlasv2/data/runs/phase1-e2-baseline-map-a/archive.json",
+      "summary_path": "/home/wenga/src/BuildAtlasv2/data/runs/phase1-e2-baseline-map-a/summary.json"
+    },
+    "phase1-e2-baseline-map-b": {
+      "archive_path": "/home/wenga/src/BuildAtlasv2/data/runs/phase1-e2-baseline-map-b/archive.json",
+      "summary_path": "/home/wenga/src/BuildAtlasv2/data/runs/phase1-e2-baseline-map-b/summary.json"
+    }
+  },
+  "seeds": {
+    "42": {
+      "artifact_hashes": {
+        "build.code.txt": {
+          "match": true,
+          "run_a": "a48b18b970e391c788e736456893373d7a573400de9d72421e05763f38642b65",
+          "run_b": "a48b18b970e391c788e736456893373d7a573400de9d72421e05763f38642b65"
+        },
+        "genome.json": {
+          "match": true,
+          "run_a": "923ecb57321181d3622b9ac31aeb8e7f844f62eaa2b57089bd434bcc21da69c7",
+          "run_b": "923ecb57321181d3622b9ac31aeb8e7f844f62eaa2b57089bd434bcc21da69c7"
+        },
+        "metrics_raw.json": {
+          "match": true,
+          "run_a": "a51c8e7747dea641897f0dc7a951d75a0fb70456390378205472a30d8b4ad94d",
+          "run_b": "a51c8e7747dea641897f0dc7a951d75a0fb70456390378205472a30d8b4ad94d"
+        },
+        "scenarios_used.json": {
+          "match": true,
+          "run_a": "35e91f820216ca0738479a2ca2b5588da67f9a4c44f6ba5f97eaf160043179e4",
+          "run_b": "35e91f820216ca0738479a2ca2b5588da67f9a4c44f6ba5f97eaf160043179e4"
+        }
+      },
+      "build_ids": {
+        "run_a": "4dfe3aed546c465c8122b34e98b20192",
+        "run_b": "facbae532f39405182691e93bffd5012"
+      },
+      "metrics": {
+        "mapping_t16": {
+          "full_dps": {
+            "a": 5040.0,
+            "b": 5040.0,
+            "pass": true,
+            "pct_delta": 0.0
+          },
+          "max_hit": {
+            "a": 3084.0,
+            "b": 3084.0,
+            "pass": true,
+            "pct_delta": 0.0
+          },
+          "utility_score": {
+            "a": 52.0,
+            "b": 52.0,
+            "pass": true,
+            "pct_delta": 0.0
+          }
+        }
+      }
+    },
+    "43": {
+      "artifact_hashes": {
+        "build.code.txt": {
+          "match": true,
+          "run_a": "11d144750d2700cb341caf2314a6ecf2a8417941ed3a9f89b6ef0a5b77d9ced2",
+          "run_b": "11d144750d2700cb341caf2314a6ecf2a8417941ed3a9f89b6ef0a5b77d9ced2"
+        },
+        "genome.json": {
+          "match": true,
+          "run_a": "5e8972b5726f2d9bdc06598f22a4d8449135e64fbc90157f095f9a9a77730f17",
+          "run_b": "5e8972b5726f2d9bdc06598f22a4d8449135e64fbc90157f095f9a9a77730f17"
+        },
+        "metrics_raw.json": {
+          "match": true,
+          "run_a": "99f5f314e3024dd964e4d374fa2bf86af4a45c9255f986de01f64e6dfae02be9",
+          "run_b": "99f5f314e3024dd964e4d374fa2bf86af4a45c9255f986de01f64e6dfae02be9"
+        },
+        "scenarios_used.json": {
+          "match": true,
+          "run_a": "35e91f820216ca0738479a2ca2b5588da67f9a4c44f6ba5f97eaf160043179e4",
+          "run_b": "35e91f820216ca0738479a2ca2b5588da67f9a4c44f6ba5f97eaf160043179e4"
+        }
+      },
+      "build_ids": {
+        "run_a": "6718564c343843a8b541226bfb4c5dbb",
+        "run_b": "ca5fd5c06e4b47e9a2e4c431f76938b3"
+      },
+      "metrics": {
+        "mapping_t16": {
+          "full_dps": {
+            "a": 5160.0,
+            "b": 5160.0,
+            "pass": true,
+            "pct_delta": 0.0
+          },
+          "max_hit": {
+            "a": 3086.0,
+            "b": 3086.0,
+            "pass": true,
+            "pct_delta": 0.0
+          },
+          "utility_score": {
+            "a": 53.0,
+            "b": 53.0,
+            "pass": true,
+            "pct_delta": 0.0
+          }
+        }
+      }
+    },
+    "44": {
+      "artifact_hashes": {
+        "build.code.txt": {
+          "match": true,
+          "run_a": "586b30d8d9137889165ddcfaf2f04c141867727273fdcbd2f3718762ee711f3d",
+          "run_b": "586b30d8d9137889165ddcfaf2f04c141867727273fdcbd2f3718762ee711f3d"
+        },
+        "genome.json": {
+          "match": true,
+          "run_a": "090ea46569b3ea255536492793d8e37a69e3606ccf7915babf561251f0236090",
+          "run_b": "090ea46569b3ea255536492793d8e37a69e3606ccf7915babf561251f0236090"
+        },
+        "metrics_raw.json": {
+          "match": true,
+          "run_a": "b2421433aa202fe582ec323cba778e7d2e342d252a43bc60b3727a5ccf03bdf8",
+          "run_b": "b2421433aa202fe582ec323cba778e7d2e342d252a43bc60b3727a5ccf03bdf8"
+        },
+        "scenarios_used.json": {
+          "match": true,
+          "run_a": "35e91f820216ca0738479a2ca2b5588da67f9a4c44f6ba5f97eaf160043179e4",
+          "run_b": "35e91f820216ca0738479a2ca2b5588da67f9a4c44f6ba5f97eaf160043179e4"
+        }
+      },
+      "build_ids": {
+        "run_a": "25a0ca4910b14c9f8284f1a0d1d1a2c3",
+        "run_b": "6cfb1b9d4f4747799790f42873302508"
+      },
+      "metrics": {
+        "mapping_t16": {
+          "full_dps": {
+            "a": 5280.0,
+            "b": 5280.0,
+            "pass": true,
+            "pct_delta": 0.0
+          },
+          "max_hit": {
+            "a": 3088.0,
+            "b": 3088.0,
+            "pass": true,
+            "pct_delta": 0.0
+          },
+          "utility_score": {
+            "a": 54.0,
+            "b": 54.0,
+            "pass": true,
+            "pct_delta": 0.0
+          }
+        }
+      }
+    }
+  },
+  "summary": {
+    "archive_timestamp_within_tolerance": true,
+    "artifact_hashes_match": true,
+    "metrics_within_tolerance": true,
+    "summary_timestamp_within_tolerance": true
+  },
+  "timestamp_delta_seconds": {
+    "archive_created_at": 0.368274,
+    "summary_created_at": 0.368275
+  },
+  "tolerance": {
+    "metrics_pct": 0.005,
+    "timestamp_seconds": 10
+  }
+}

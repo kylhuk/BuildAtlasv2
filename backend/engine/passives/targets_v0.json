@@ -1,0 +1,21 @@
+{
+  "schema_version": "v0",
+  "defense_archetypes": {
+    "armour": {
+      "required": ["node_armour_required"],
+      "desired": ["node_armour_desired"]
+    },
+    "evasion": {
+      "required": ["node_evasion_required"],
+      "desired": ["node_evasion_desired"]
+    },
+    "energy_shield": {
+      "required": ["node_es_required"],
+      "desired": ["node_es_desired"]
+    },
+    "hybrid": {
+      "required": ["node_hybrid_required"],
+      "desired": ["node_hybrid_desired", "node_central"]
+    }
+  }
+}

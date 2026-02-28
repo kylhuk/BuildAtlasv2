@@ -1,0 +1,316 @@
+{
+  "main_packages": [
+    {
+      "id": "cyclone",
+      "name": "Cyclone Smash",
+      "profile_ids": ["alpha", "bravo"],
+      "defense_archetypes": ["armour", "hybrid"],
+      "tags": ["melee", "aoe", "physical"],
+      "support_gems": [
+        {"id": "brutality_support", "name": "Brutality Support"},
+        {"id": "fortify_support", "name": "Fortify Support"}
+      ],
+      "gem_groups": [
+        {
+          "id": "cyclone_main",
+          "name": "Cyclone Primary",
+          "type": "damage",
+          "gems": ["cyclone", "melee_physical_damage_support", "maim_support"]
+        },
+        {
+          "id": "cyclone_mobility",
+          "name": "Cyclone Mobility",
+          "type": "utility",
+          "gems": ["dash", "phase_run", "faster_attacks_support"]
+        }
+      ]
+    },
+    {
+      "id": "arc",
+      "name": "Arc Conduit",
+      "profile_ids": ["charlie", "delta"],
+      "defense_archetypes": ["energy_shield", "hybrid"],
+      "tags": ["caster", "lightning", "chain"],
+      "support_gems": [
+        {"id": "elemental_focus_support", "name": "Elemental Focus Support"},
+        {"id": "controlled_destruction_support", "name": "Controlled Destruction Support"}
+      ],
+      "gem_groups": [
+        {
+          "id": "arc_main",
+          "name": "Arc Chain",
+          "type": "damage",
+          "gems": ["arc", "lightning_penetration_support", "controlled_destruction_support"]
+        },
+        {
+          "id": "arc_survivability",
+          "name": "Arc Buff",
+          "type": "utility",
+          "gems": ["frostblink", "arctic_armour"]
+        }
+      ]
+    },
+    {
+      "id": "tornado_shot",
+      "name": "Tornado Shot Barrage",
+      "profile_ids": ["alpha", "delta"],
+      "defense_archetypes": ["evasion", "armour"],
+      "tags": ["ranged", "projectile", "physical"],
+      "support_gems": [
+        {"id": "greater_multiple_projectiles_support", "name": "Greater Multiple Projectiles Support"},
+        {"id": "faster_projectiles_support", "name": "Faster Projectiles Support"}
+      ],
+      "gem_groups": [
+        {
+          "id": "tornado_shot_main",
+          "name": "Tornado Shot Volley",
+          "type": "damage",
+          "gems": ["tornado_shot", "chain_support", "increased_critical_strikes_support"]
+        },
+        {
+          "id": "tornado_shot_miasma",
+          "name": "Toxic Miasma",
+          "type": "utility",
+          "gems": ["smoke_bomb", "swift_affliction_support"]
+        }
+      ]
+    },
+    {
+      "id": "blade_vortex",
+      "name": "Blade Vortex Swirl",
+      "profile_ids": ["bravo"],
+      "defense_archetypes": ["armour", "energy_shield"],
+      "tags": ["caster", "damage_over_time", "cold"],
+      "support_gems": [
+        {"id": "increased_area_of_effect_support", "name": "Increased Area of Effect Support"},
+        {"id": "swift_affliction_support", "name": "Swift Affliction Support"}
+      ],
+      "gem_groups": [
+        {
+          "id": "blade_vortex_main",
+          "name": "Blade Vortex",
+          "type": "damage",
+          "gems": ["blade_vortex", "controlled_destruction_support", "faster_projectiles_support"]
+        },
+        {
+          "id": "blade_vortex_defense",
+          "name": "Blade Guard",
+          "type": "utility",
+          "gems": ["steelskin", "pulse_wave"]
+        }
+      ]
+    },
+    {
+      "id": "summon_raging_spirit",
+      "name": "Summon Raging Spirit",
+      "profile_ids": ["alpha", "bravo", "charlie"],
+      "defense_archetypes": ["energy_shield", "hybrid"],
+      "tags": ["minion", "fire", "burst"],
+      "support_gems": [
+        {"id": "minion_damage_support", "name": "Minion Damage Support"},
+        {"id": "unbound_aura_support", "name": "Unbound Aegis Support"}
+      ],
+      "gem_groups": [
+        {
+          "id": "summon_raging_spirit_main",
+          "name": "Spirit Onslaught",
+          "type": "damage",
+          "gems": ["summon_raging_spirit", "minion_damage_support", "empower_support"]
+        },
+        {
+          "id": "summon_raging_spirit_support",
+          "name": "Spirit Safety",
+          "type": "utility",
+          "gems": ["zombie", "summon_ice_golem"]
+        }
+      ]
+    },
+    {
+      "id": "essence_drain",
+      "name": "Essence Drain Bloom",
+      "profile_ids": ["charlie", "delta"],
+      "defense_archetypes": ["energy_shield", "evasion"],
+      "tags": ["caster", "chaos", "dot"],
+      "support_gems": [
+        {"id": "controlled_destruction_support", "name": "Controlled Destruction Support"},
+        {"id": "spell_echo_support", "name": "Spell Echo Support"}
+      ],
+      "gem_groups": [
+        {
+          "id": "essence_drain_main",
+          "name": "Essence Drain",
+          "type": "damage",
+          "gems": ["essence_drain", "spell_echo_support", "void_manipulation_support"]
+        },
+        {
+          "id": "essence_drain_safety",
+          "name": "Essence Shield",
+          "type": "utility",
+          "gems": ["arcane_surge", "vessel_of_vinktar"]
+        }
+      ]
+    },
+    {
+      "id": "sunder",
+      "name": "Sunder Smash",
+      "profile_ids": ["alpha"],
+      "defense_archetypes": ["armour", "evasion"],
+      "tags": ["melee", "area", "physical"],
+      "support_gems": [
+        {"id": "fortify_support", "name": "Fortify Support"},
+        {"id": "brutality_support", "name": "Brutality Support"}
+      ],
+      "gem_groups": [
+        {
+          "id": "sunder_main",
+          "name": "Sunder Impact",
+          "type": "damage",
+          "gems": ["sunder", "mortar_support", "increased_area_of_effect_support"]
+        },
+        {
+          "id": "sunder_gap_close",
+          "name": "Sunder Movement",
+          "type": "utility",
+          "gems": ["leap_slam", "faster_attacks_support"]
+        }
+      ]
+    },
+    {
+      "id": "frostbolt",
+      "name": "Frostbolt Volley",
+      "profile_ids": ["delta"],
+      "defense_archetypes": ["energy_shield", "evasion"],
+      "tags": ["caster", "cold", "single_target"],
+      "support_gems": [
+        {"id": "hypothermia_support", "name": "Hypothermia Support"},
+        {"id": "increased_critical_strikes_support", "name": "Increased Critical Strikes Support"}
+      ],
+      "gem_groups": [
+        {
+          "id": "frostbolt_main",
+          "name": "Frost Nova",
+          "type": "damage",
+          "gems": ["frostbolt", "elemental_focus_support", "hypothermia_support"]
+        },
+        {
+          "id": "frostbolt_defense",
+          "name": "Frost Shell",
+          "type": "utility",
+          "gems": ["ice_golem", "cold_to_fire_support"]
+        }
+      ]
+    },
+    {
+      "id": "toxic_rain",
+      "name": "Toxic Rain Canopy",
+      "profile_ids": ["bravo"],
+      "defense_archetypes": ["evasion", "energy_shield"],
+      "tags": ["ranged", "chaos", "dot"],
+      "support_gems": [
+        {"id": "poison_support", "name": "Poison Support"},
+        {"id": "swift_affliction_support", "name": "Swift Affliction Support"}
+      ],
+      "gem_groups": [
+        {
+          "id": "toxic_rain_main",
+          "name": "Toxic Rain",
+          "type": "damage",
+          "gems": ["toxic_rain", "doa_support", "swift_affliction_support"]
+        },
+        {
+          "id": "toxic_rain_utility",
+          "name": "Toadstool Retreat",
+          "type": "utility",
+          "gems": ["movement_speed_support", "dousing_flames_support"]
+        }
+      ]
+    },
+    {
+      "id": "blade_flurry",
+      "name": "Blade Flurry Precision",
+      "profile_ids": ["alpha", "charlie"],
+      "defense_archetypes": ["armour", "hybrid"],
+      "tags": ["melee", "single_target", "physical"],
+      "support_gems": [
+        {"id": "increased_critical_strikes_support", "name": "Increased Critical Strikes Support"},
+        {"id": "faster_attacks_support", "name": "Faster Attacks Support"}
+      ],
+      "gem_groups": [
+        {
+          "id": "blade_flurry_main",
+          "name": "Blade Flurry Burst",
+          "type": "damage",
+          "gems": ["blade_flurry", "spell_echo_support", "faster_attacks_support"]
+        },
+        {
+          "id": "blade_flurry_gap_close",
+          "name": "Blade Flurry Dash",
+          "type": "utility",
+          "gems": ["dash", "blind_support"]
+        }
+      ]
+    }
+  ],
+  "utility_packs": [
+    {
+      "id": "utility_movement_quickstep",
+      "name": "Quickstep Movement Pack",
+      "type": "movement",
+      "description": "Fast reposition and evasion.",
+      "profile_ids": ["alpha", "charlie"],
+      "defense_archetypes": ["evasion", "armour"],
+      "tags": ["movement", "utility"],
+      "support_gems": [
+        {"id": "faster_movement_support", "name": "Faster Movement Support"}
+      ],
+      "gem_groups": [
+        {
+          "id": "utility_movement_quickstep_group",
+          "name": "Quickstep Burst",
+          "type": "utility",
+          "gems": ["dash", "smoke_phase"]
+        }
+      ]
+    },
+    {
+      "id": "utility_aura_valor",
+      "name": "Valor Aura Pack",
+      "type": "aura",
+      "description": "Aura coverage for toughness.",
+      "profile_ids": ["bravo", "delta"],
+      "defense_archetypes": ["energy_shield", "armour"],
+      "tags": ["aura", "defense"],
+      "support_gems": [
+        {"id": "aura_support", "name": "Aura Support"}
+      ],
+      "gem_groups": [
+        {
+          "id": "utility_aura_valor_group",
+          "name": "Valor Auras",
+          "type": "utility",
+          "gems": ["determination", "vitality", "purity_of_elements"]
+        }
+      ]
+    },
+    {
+      "id": "utility_defense_guardian",
+      "name": "Guardian Defense Pack",
+      "type": "defense",
+      "description": "Defensive cooldowns and auras.",
+      "profile_ids": ["alpha", "delta"],
+      "defense_archetypes": ["armour", "hybrid"],
+      "tags": ["defense", "cooldown"],
+      "support_gems": [
+        {"id": "life_gain_on_hit_support", "name": "Life Gain On Hit Support"}
+      ],
+      "gem_groups": [
+        {
+          "id": "utility_defense_guardian_group",
+          "name": "Guardian Cover",
+          "type": "utility",
+          "gems": ["stone_going", "determination"]
+        }
+      ]
+    }
+  ]
+}

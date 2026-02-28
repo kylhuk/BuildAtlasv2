@@ -1,0 +1,53 @@
+{
+  "phase": 1,
+  "epic": 1,
+  "samples": [
+    {
+      "endpoint": "GET /health",
+      "response": {
+        "clickhouse": "127.0.0.1:8124",
+        "data_path": "data",
+        "status": "ok"
+      }
+    },
+    {
+      "endpoint": "GET /builds?limit=1",
+      "first_build_id": "ae8b512adace49f38b92772e1ff41ed3"
+    },
+    {
+      "endpoint": "GET /builds/{build_id}",
+      "build_id": "ae8b512adace49f38b92772e1ff41ed3",
+      "top_level_keys": [
+        "build",
+        "costs",
+        "prediction",
+        "scenario_metrics",
+        "scenarios_used"
+      ]
+    },
+    {
+      "endpoint": "GET /runs/{run_id}",
+      "run_id": "18b39902e1a7459a830aa9511aba6ce6",
+      "top_level_keys": [
+        "archive",
+        "created_at",
+        "emitters",
+        "evaluation",
+        "generation",
+        "parameters",
+        "paths",
+        "run_id",
+        "status"
+      ]
+    }
+  ],
+  "filesystem_samples": {
+    "build_dir": "01c0069f855c4ff490b73f57e3bd3963",
+    "build_files": [
+      "build.code.txt",
+      "genome.json",
+      "metrics_raw.json",
+      "scenarios_used.json"
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.1
+    container_name: clickhouse_local
+    restart: unless-stopped
+    ports:
+      - 8124:8123
+      - 9001:9000
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: default
+      CLICKHOUSE_DB: default
+    healthcheck:
+      test: ["CMD-SHELL", 'clickhouse-client --user default --password default --query "SELECT 1"']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  clickhouse_data:

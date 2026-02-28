@@ -1,0 +1,31 @@
+{
+  "scenario_id": "pinnacle",
+  "version": "v0",
+  "profile_id": "pinnacle",
+  "pob_config": {
+    "name": "Pinnacle Boss",
+    "boss": "Pinnacle",
+    "debuffs": ["bane", "temporalChains"],
+    "flasks": {
+      "granite": 5,
+      "basalt": 5
+    }
+  },
+  "gate_thresholds": {
+    "resists": {
+      "fire": 80,
+      "cold": 80,
+      "lightning": 80,
+      "chaos": 65
+    },
+    "reservation": {
+      "max_percent": 90
+    },
+    "attributes": {
+      "strength": 180,
+      "dexterity": 150,
+      "intelligence": 130
+    },
+    "min_max_hit": 4500
+  }
+}

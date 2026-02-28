@@ -1,0 +1,32 @@
+{
+  "scenario_id": "delve_tier_1",
+  "version": "v0",
+  "profile_id": "delve",
+  "pob_config": {
+    "name": "Delve Depth Tier 1",
+    "boss": "Delve_Guardian_1",
+    "debuffs": ["enfeeble", "temporalChains"],
+    "flasks": {
+      "granite": 2,
+      "basalt": 2,
+      "quicksilver": 1
+    }
+  },
+  "gate_thresholds": {
+    "resists": {
+      "fire": 78,
+      "cold": 75,
+      "lightning": 79,
+      "chaos": 64
+    },
+    "reservation": {
+      "max_percent": 90
+    },
+    "attributes": {
+      "strength": 170,
+      "dexterity": 150,
+      "intelligence": 130
+    },
+    "min_max_hit": 3200
+  }
+}

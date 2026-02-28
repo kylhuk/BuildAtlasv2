@@ -1,0 +1,187 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "autoupdate": true,
+  "compaction": {
+    "auto": true,
+    "prune": true,
+    "reserved": 15000
+  },
+  "watcher": {
+    "ignore": [
+      ".git/**",
+      "node_modules/**",
+      "vendor/**",
+      "dist/**",
+      "build/**",
+      "tmp/**",
+      ".cache/**",
+      "__pycache__/**",
+      ".pytest_cache/**",
+      ".mypy_cache/**",
+      ".venv/**",
+      ".idea/**",
+      ".vscode/**",
+      ".vestige/**",
+      "data/builds/**",
+      "data/prices/**",
+      "data/models/**",
+      "data/datasets/**",
+      "PathOfBuilding/.git/**"
+    ]
+  },
+  "instructions": [
+    ".opencode/rules/*.md",
+    "AGENTS.md"
+  ],
+  "formatter": {
+    "prettier": {
+      "disabled": true
+    },
+    "biome": {
+      "disabled": true
+    },
+    "ruff-format": {
+      "command": [
+        "ruff",
+        "format",
+        "$FILE"
+      ],
+      "extensions": [
+        ".py"
+      ]
+    }
+  },
+  "mcp": {
+    "vestige": {
+      "type": "local",
+      "command": [
+        "vestige-mcp",
+        "--data-dir",
+        "./.vestige"
+      ],
+      "enabled": true
+    },
+    "playwright": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@playwright/mcp@0.0.38"
+      ],
+      "enabled": true,
+      "timeout": 15000
+    },
+    "brave-search": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-brave-search"
+      ],
+      "enabled": true,
+      "environment": {
+        "BRAVE_API_KEY": "${BRAVE_API_KEY}"
+      }
+    },
+    "git": {
+      "type": "local",
+      "command": [
+        "uvx",
+        "mcp-server-git"
+      ],
+      "enabled": true,
+      "timeout": 15000
+    },
+    "fetch": {
+      "type": "local",
+      "command": [
+        "uvx",
+        "mcp-server-fetch"
+      ],
+      "enabled": true,
+      "timeout": 15000
+    }
+  },
+  "permission": {
+    "task": "allow",
+    "webfetch": "allow",
+    "external_directory": "deny",
+    "doom_loop": "deny",
+    "read": {
+      "*": "allow",
+      ".env": "deny",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      ".env.*": "deny",
+      "*.env.example": "allow",
+      ".env.example": "allow",
+      "**/.env": "deny",
+      "**/.env.*": "deny",
+      "**/*.env": "deny",
+      "**/*.env.*": "deny",
+      "**/*.env.example": "allow",
+      "**/.ssh/**": "deny",
+      ".ssh/**": "deny",
+      "**/*id_rsa*": "deny",
+      "**/*.pem": "deny",
+      "**/*.key": "deny"
+    },
+    "edit": {
+      "*": "allow",
+      ".env": "deny",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      ".env.*": "deny",
+      "**/.env": "deny",
+      "**/.env.*": "deny",
+      "**/*.env": "deny",
+      "**/*.env.*": "deny"
+    },
+    "bash": {
+      "*": "ask",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "git show*": "allow",
+      "git rev-parse*": "allow",
+      "git ls-files*": "allow",
+      "ls*": "allow",
+      "python*": "allow",
+      "pip*": "allow",
+      "uv*": "allow",
+      "uvicorn*": "allow",
+      "ruff*": "allow",
+      "pytest*": "allow",
+      "mypy*": "allow",
+      "node*": "allow",
+      "npm*": "allow",
+      "npx*": "allow",
+      "pnpm*": "allow",
+      "bun*": "allow",
+      "clickhouse-local*": "allow",
+      "clickhouse-client*": "allow",
+      "sqlite3*": "allow",
+      "make*": "allow",
+      "docker compose*": "allow",
+      "docker-compose*": "allow",
+      "rm*": "deny",
+      "sudo*": "deny",
+      "curl*": "ask",
+      "wget*": "ask",
+      "docker*": "ask",
+      "kubectl*": "ask",
+      "cat .env*": "deny",
+      "cat *.env*": "deny",
+      "cat **/.env*": "deny",
+      "cat **/*.env*": "deny",
+      "cat *id_rsa*": "deny",
+      "cat *.pem": "deny",
+      "cat *.key": "deny",
+      "cat **/*id_rsa*": "deny",
+      "cat **/*.pem": "deny",
+      "cat **/*.key": "deny"
+    },
+    "websearch": "allow"
+  },
+  "default_agent": "proj-lead"
+}

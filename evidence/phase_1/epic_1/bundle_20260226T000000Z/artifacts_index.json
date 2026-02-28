@@ -1,0 +1,27 @@
+{
+  "phase": 1,
+  "epic": 1,
+  "bundle": "bundle_20260226T000000Z",
+  "artifacts": [
+    {
+      "path": "docs/phase-1/compatibility-checklist.md",
+      "sha256": "49ade8fb5e5df96127f98282382b85586997131f16e9168bc2428eeb1bf8163a",
+      "description": "Phase 1 compatibility freeze checklist"
+    },
+    {
+      "path": "evidence/phase_1/epic_1/bundle_20260226T000000Z/commands.log",
+      "sha256": "3636cfa66681eb5a69155dd8b16df900e163da48d354e1bb3d4411ae67793f7c",
+      "description": "Worker contract and migration command outputs"
+    },
+    {
+      "path": "evidence/phase_1/epic_1/bundle_20260226T000000Z/queries.log",
+      "sha256": "38e01e049e154910babc683b473c9d986f2da5667406a8f7acc59b3afd19f210",
+      "description": "ClickHouse DESCRIBE output and artifact root inspection"
+    },
+    {
+      "path": "evidence/phase_1/epic_1/bundle_20260226T000000Z/api_samples.json",
+      "sha256": "9cf4e01bccda7f6b4803e34e469dd00b727d5f887552b086f9f7874c37e4d373",
+      "description": "FastAPI and filesystem sample payloads"
+    }
+  ]
+}

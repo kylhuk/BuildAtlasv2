@@ -1,0 +1,7 @@
+{
+  "delve_tier_1": "pob:smoke|scenarios:delve_tier_1@v0|prices:demo",
+  "mapping_t16": "pob:smoke|scenarios:mapping_t16@v0|prices:demo",
+  "pinnacle": "pob:smoke|scenarios:pinnacle@v0|prices:demo",
+  "support_party": "pob:smoke|scenarios:support_party@v0|prices:demo",
+  "uber_pinnacle": "pob:smoke|scenarios:uber_pinnacle@v0|prices:demo"
+}

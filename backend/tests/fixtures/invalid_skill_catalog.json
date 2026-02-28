@@ -1,0 +1,82 @@
+{
+  "main_packages": [
+    {
+      "id": "cyclone",
+      "name": "Cyclone",
+      "profile_ids": ["alpha"],
+      "defense_archetypes": ["armour"],
+      "tags": ["melee"],
+      "support_gems": [
+        {"id": "brutality_support", "name": "Brutality"}
+      ],
+      "gem_groups": [
+        {
+          "id": "cyclone_main",
+          "name": "Cyclone Main",
+          "type": "damage",
+          "gems": ["cyclone"]
+        }
+      ]
+    },
+    {
+      "id": "cyclone",
+      "name": "Cyclone Duplicate",
+      "profile_ids": ["bravo"],
+      "defense_archetypes": ["hybrid"],
+      "tags": ["aoe"],
+      "support_gems": [
+        {"id": "fortify_support", "name": "Fortify"}
+      ],
+      "gem_groups": [
+        {
+          "id": "cyclone_copy",
+          "name": "Cyclone Copy",
+          "type": "damage",
+          "gems": ["cyclone"]
+        }
+      ]
+    }
+  ],
+  "utility_packs": [
+    {
+      "id": "utility_movement_quickstep",
+      "name": "Quickstep",
+      "type": "movement",
+      "description": "Movement",
+      "profile_ids": ["alpha"],
+      "defense_archetypes": ["evasion"],
+      "tags": ["movement"],
+      "support_gems": [
+        {"id": "faster_movement_support", "name": "Faster Movement"}
+      ],
+      "gem_groups": [
+        {
+          "id": "movement_group",
+          "name": "Movement",
+          "type": "utility",
+          "gems": ["dash"]
+        }
+      ]
+    },
+    {
+      "id": "utility_aura_valor",
+      "name": "Valor Aura",
+      "type": "aura",
+      "description": "Aura",
+      "profile_ids": ["delta"],
+      "defense_archetypes": ["energy_shield"],
+      "tags": ["aura"],
+      "support_gems": [
+        {"id": "aura_support", "name": "Aura"}
+      ],
+      "gem_groups": [
+        {
+          "id": "aura_group",
+          "name": "Aura",
+          "type": "utility",
+          "gems": ["determination"]
+        }
+      ]
+    }
+  ]
+}

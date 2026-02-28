@@ -1,0 +1,4 @@
+<build>
+  <id>smoke-fixture</id>
+  <name>BuildAtlas smoke fixture</name>
+</build>

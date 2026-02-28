@@ -1,0 +1,32 @@
+{
+  "scenario_id": "support_party",
+  "version": "v0",
+  "profile_id": "support",
+  "pob_config": {
+    "name": "Party Support",
+    "boss": "Support_Boss",
+    "debuffs": ["enfeeble"],
+    "flasks": {
+      "granite": 1,
+      "basalt": 1
+    },
+    "utility_focus": "auras"
+  },
+  "gate_thresholds": {
+    "resists": {
+      "fire": 70,
+      "cold": 70,
+      "lightning": 72,
+      "chaos": 60
+    },
+    "reservation": {
+      "max_percent": 95
+    },
+    "attributes": {
+      "strength": 160,
+      "dexterity": 140,
+      "intelligence": 120
+    },
+    "min_max_hit": 2500
+  }
+}

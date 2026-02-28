@@ -1,0 +1,319 @@
+{
+  "archives": {
+    "phase1-e2-baseline-map-a": {
+      "axes": [
+        {
+          "bins": 8,
+          "max_value": 4000.0,
+          "metric_key": "full_dps",
+          "min_value": 0.0,
+          "name": "damage"
+        },
+        {
+          "bins": 5,
+          "max_value": 200.0,
+          "metric_key": "utility_score",
+          "min_value": 0.0,
+          "name": "utility"
+        }
+      ],
+      "bins": [
+        {
+          "bin_key": "7-1",
+          "build_id": "25a0ca4910b14c9f8284f1a0d1d1a2c3",
+          "descriptor": {
+            "damage": 5280.0,
+            "utility": 54.0
+          },
+          "metadata": {
+            "budget_tier": "starter",
+            "metrics_source": "verified",
+            "seed": 44,
+            "status": "evaluated"
+          },
+          "score": 5280.0
+        }
+      ],
+      "created_at": "2026-02-26T20:27:35.882315+00:00",
+      "metrics": {
+        "bins_filled": 1,
+        "coverage": 0.025,
+        "qd_score": 5280.0,
+        "total_bins": 40
+      },
+      "run_id": "phase1-e2-baseline-map-a"
+    },
+    "phase1-e2-baseline-map-b": {
+      "axes": [
+        {
+          "bins": 8,
+          "max_value": 4000.0,
+          "metric_key": "full_dps",
+          "min_value": 0.0,
+          "name": "damage"
+        },
+        {
+          "bins": 5,
+          "max_value": 200.0,
+          "metric_key": "utility_score",
+          "min_value": 0.0,
+          "name": "utility"
+        }
+      ],
+      "bins": [
+        {
+          "bin_key": "7-1",
+          "build_id": "6cfb1b9d4f4747799790f42873302508",
+          "descriptor": {
+            "damage": 5280.0,
+            "utility": 54.0
+          },
+          "metadata": {
+            "budget_tier": "starter",
+            "metrics_source": "verified",
+            "seed": 44,
+            "status": "evaluated"
+          },
+          "score": 5280.0
+        }
+      ],
+      "created_at": "2026-02-26T20:27:36.250589+00:00",
+      "metrics": {
+        "bins_filled": 1,
+        "coverage": 0.025,
+        "qd_score": 5280.0,
+        "total_bins": 40
+      },
+      "run_id": "phase1-e2-baseline-map-b"
+    }
+  },
+  "health": {
+    "clickhouse": "127.0.0.1:8124",
+    "data_path": "data",
+    "status": "ok"
+  },
+  "runs": {
+    "phase1-e2-baseline-map-a": {
+      "archive": {
+        "axes": [
+          {
+            "bins": 8,
+            "max_value": 4000.0,
+            "metric_key": "full_dps",
+            "min_value": 0.0,
+            "name": "damage"
+          },
+          {
+            "bins": 5,
+            "max_value": 200.0,
+            "metric_key": "utility_score",
+            "min_value": 0.0,
+            "name": "utility"
+          }
+        ],
+        "created_at": "2026-02-26T20:27:35.882315+00:00",
+        "metrics": {
+          "bins_filled": 1,
+          "coverage": 0.025,
+          "qd_score": 5280.0,
+          "total_bins": 40
+        }
+      },
+      "created_at": "2026-02-26T20:27:35.882538+00:00",
+      "emitters": [
+        {
+          "budget": 1,
+          "name": "exploit",
+          "selected": 1
+        },
+        {
+          "budget": 1,
+          "name": "novelty",
+          "selected": 1
+        },
+        {
+          "budget": 1,
+          "name": "uncertainty",
+          "selected": 0
+        }
+      ],
+      "evaluation": {
+        "attempted": 3,
+        "errors": 0,
+        "failures": 0,
+        "records": [
+          {
+            "build_id": "4dfe3aed546c465c8122b34e98b20192",
+            "error": null,
+            "status": "evaluated"
+          },
+          {
+            "build_id": "6718564c343843a8b541226bfb4c5dbb",
+            "error": null,
+            "status": "evaluated"
+          },
+          {
+            "build_id": "25a0ca4910b14c9f8284f1a0d1d1a2c3",
+            "error": null,
+            "status": "evaluated"
+          }
+        ],
+        "successes": 3
+      },
+      "generation": {
+        "count": 3,
+        "precheck_failures": {
+          "attribute_precheck_failed": 0,
+          "reservation_precheck_failed": 0,
+          "socket_precheck_failed": 0
+        },
+        "processed": 3,
+        "records": [
+          {
+            "build_id": "4dfe3aed546c465c8122b34e98b20192",
+            "evaluation_error": null,
+            "evaluation_status": "evaluated",
+            "precheck_failures": [],
+            "seed": 42
+          },
+          {
+            "build_id": "6718564c343843a8b541226bfb4c5dbb",
+            "evaluation_error": null,
+            "evaluation_status": "evaluated",
+            "precheck_failures": [],
+            "seed": 43
+          },
+          {
+            "build_id": "25a0ca4910b14c9f8284f1a0d1d1a2c3",
+            "evaluation_error": null,
+            "evaluation_status": "evaluated",
+            "precheck_failures": [],
+            "seed": 44
+          }
+        ]
+      },
+      "parameters": {
+        "count": 3,
+        "profile_id": "mapping",
+        "ruleset_id": "standard",
+        "seed_start": 42
+      },
+      "paths": {
+        "archive": "/home/wenga/src/BuildAtlasv2/data/runs/phase1-e2-baseline-map-a/archive.json"
+      },
+      "run_id": "phase1-e2-baseline-map-a",
+      "status": "completed"
+    },
+    "phase1-e2-baseline-map-b": {
+      "archive": {
+        "axes": [
+          {
+            "bins": 8,
+            "max_value": 4000.0,
+            "metric_key": "full_dps",
+            "min_value": 0.0,
+            "name": "damage"
+          },
+          {
+            "bins": 5,
+            "max_value": 200.0,
+            "metric_key": "utility_score",
+            "min_value": 0.0,
+            "name": "utility"
+          }
+        ],
+        "created_at": "2026-02-26T20:27:36.250589+00:00",
+        "metrics": {
+          "bins_filled": 1,
+          "coverage": 0.025,
+          "qd_score": 5280.0,
+          "total_bins": 40
+        }
+      },
+      "created_at": "2026-02-26T20:27:36.250813+00:00",
+      "emitters": [
+        {
+          "budget": 1,
+          "name": "exploit",
+          "selected": 1
+        },
+        {
+          "budget": 1,
+          "name": "novelty",
+          "selected": 1
+        },
+        {
+          "budget": 1,
+          "name": "uncertainty",
+          "selected": 0
+        }
+      ],
+      "evaluation": {
+        "attempted": 3,
+        "errors": 0,
+        "failures": 0,
+        "records": [
+          {
+            "build_id": "facbae532f39405182691e93bffd5012",
+            "error": null,
+            "status": "evaluated"
+          },
+          {
+            "build_id": "ca5fd5c06e4b47e9a2e4c431f76938b3",
+            "error": null,
+            "status": "evaluated"
+          },
+          {
+            "build_id": "6cfb1b9d4f4747799790f42873302508",
+            "error": null,
+            "status": "evaluated"
+          }
+        ],
+        "successes": 3
+      },
+      "generation": {
+        "count": 3,
+        "precheck_failures": {
+          "attribute_precheck_failed": 0,
+          "reservation_precheck_failed": 0,
+          "socket_precheck_failed": 0
+        },
+        "processed": 3,
+        "records": [
+          {
+            "build_id": "facbae532f39405182691e93bffd5012",
+            "evaluation_error": null,
+            "evaluation_status": "evaluated",
+            "precheck_failures": [],
+            "seed": 42
+          },
+          {
+            "build_id": "ca5fd5c06e4b47e9a2e4c431f76938b3",
+            "evaluation_error": null,
+            "evaluation_status": "evaluated",
+            "precheck_failures": [],
+            "seed": 43
+          },
+          {
+            "build_id": "6cfb1b9d4f4747799790f42873302508",
+            "evaluation_error": null,
+            "evaluation_status": "evaluated",
+            "precheck_failures": [],
+            "seed": 44
+          }
+        ]
+      },
+      "parameters": {
+        "count": 3,
+        "profile_id": "mapping",
+        "ruleset_id": "standard",
+        "seed_start": 42
+      },
+      "paths": {
+        "archive": "/home/wenga/src/BuildAtlasv2/data/runs/phase1-e2-baseline-map-b/archive.json"
+      },
+      "run_id": "phase1-e2-baseline-map-b",
+      "status": "completed"
+    }
+  }
+}

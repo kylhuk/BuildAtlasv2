@@ -1,0 +1,100 @@
+{
+  "version": "EP-V1-03",
+  "scenarios": [
+    {
+      "scenario_id": "delve_tier_1",
+      "build_id": "delve_tier_1",
+      "ruleset_id": "pob:smoke|scenarios:delve_tier_1@v0|prices:demo",
+      "metrics": {
+        "full_dps": {
+          "min": 3400.0,
+          "max": 3400.0
+        },
+        "max_hit": {
+          "min": 4600.0,
+          "max": 4600.0
+        },
+        "utility_score": {
+          "min": 3.1,
+          "max": 3.1
+        }
+      }
+    },
+    {
+      "scenario_id": "mapping_t16",
+      "build_id": "mapping_t16",
+      "ruleset_id": "pob:smoke|scenarios:mapping_t16@v0|prices:demo",
+      "metrics": {
+        "full_dps": {
+          "min": 5200.0,
+          "max": 5200.0
+        },
+        "max_hit": {
+          "min": 4700.0,
+          "max": 4700.0
+        },
+        "utility_score": {
+          "min": 1.2,
+          "max": 1.2
+        }
+      }
+    },
+    {
+      "scenario_id": "pinnacle",
+      "build_id": "pinnacle",
+      "ruleset_id": "pob:smoke|scenarios:pinnacle@v0|prices:demo",
+      "metrics": {
+        "full_dps": {
+          "min": 6100.0,
+          "max": 6100.0
+        },
+        "max_hit": {
+          "min": 6000.0,
+          "max": 6000.0
+        },
+        "utility_score": {
+          "min": 1.0,
+          "max": 1.0
+        }
+      }
+    },
+    {
+      "scenario_id": "support_party",
+      "build_id": "support_party",
+      "ruleset_id": "pob:smoke|scenarios:support_party@v0|prices:demo",
+      "metrics": {
+        "full_dps": {
+          "min": 1600.0,
+          "max": 1600.0
+        },
+        "max_hit": {
+          "min": 2200.0,
+          "max": 2200.0
+        },
+        "utility_score": {
+          "min": 5.4,
+          "max": 5.4
+        }
+      }
+    },
+    {
+      "scenario_id": "uber_pinnacle",
+      "build_id": "uber_pinnacle",
+      "ruleset_id": "pob:smoke|scenarios:uber_pinnacle@v0|prices:demo",
+      "metrics": {
+        "full_dps": {
+          "min": 3100.0,
+          "max": 3100.0
+        },
+        "max_hit": {
+          "min": 3400.0,
+          "max": 3400.0
+        },
+        "utility_score": {
+          "min": 0.9,
+          "max": 0.9
+        }
+      }
+    }
+  ]
+}

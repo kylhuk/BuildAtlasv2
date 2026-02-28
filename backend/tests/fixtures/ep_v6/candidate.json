@@ -1,0 +1,15 @@
+{
+  "candidate_id": "c1",
+  "features": {
+    "full_dps": 9200,
+    "max_hit": 1900,
+    "resists": 35,
+    "attributes": 60,
+    "reservation": 40
+  },
+  "constraints": {
+    "resists_ok": false,
+    "attributes_ok": false,
+    "reservation_ok": true
+  }
+}
