@@ -12,19 +12,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from math import exp, floor
+from math import exp, floor, log1p
 from pathlib import Path
 from statistics import mean, median, pstdev
+from time import monotonic
 from typing import Any, Iterable, Mapping, Sequence
 
 from backend.engine.surrogate.dataset import (
+    FEATURE_IDENTITY_CROSS_TOKENS,
+    FEATURE_IDENTITY_TOKENS,
     FEATURE_SCHEMA_VERSION,
     FEATURE_SIGNAL_KEYS,
-    FEATURE_IDENTITY_TOKENS,
-    FEATURE_IDENTITY_CROSS_TOKENS,
 )
 
 MODEL_BACKEND = "ep-v4-baseline"
@@ -65,6 +68,15 @@ DETERMINISTIC_BALANCE_MIN_OUTPUT_ROWS = 30
 DETERMINISTIC_BALANCE_MIN_RETENTION_RATIO = 0.6
 DETERMINISTIC_BALANCE_HASH_SALT = "ep-v4-balance-v1"
 DETERMINISTIC_BALANCE_UNKNOWN_LABEL = _MISSING_SKILL
+
+logger = logging.getLogger(__name__)
+
+
+def _train_phase_log(message: str, *args: object) -> None:
+    if logger.isEnabledFor(logging.INFO):
+        logger.info(message, *args)
+        return
+    logger.warning(message, *args)
 
 
 @dataclass(frozen=True)
@@ -145,6 +157,9 @@ class EvaluationResult:
     row_count: int
     metric_mae: Mapping[str, float]
     pass_probability: Mapping[str, float]
+    metric_median_ae: Mapping[str, float] = field(default_factory=dict)
+    metric_trimmed_mae: Mapping[str, float] = field(default_factory=dict)
+    metric_mae_log1p: Mapping[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -313,8 +328,8 @@ def _normalize_niche_label(value: Any) -> str:
 
 def _niche_key_from_row(row: Mapping[str, Any]) -> tuple[str, str]:
     return (
-        _normalize_niche_label(row.get('class')),
-        _normalize_niche_label(row.get('main_skill_package')),
+        _normalize_niche_label(row.get("class")),
+        _normalize_niche_label(row.get("main_skill_package")),
     )
 
 
@@ -323,7 +338,7 @@ def _serialize_niche_key(key: tuple[str, str]) -> str:
 
 
 def _group_rows_by_niche(
-    rows: Sequence[Mapping[str, Any]]
+    rows: Sequence[Mapping[str, Any]],
 ) -> dict[tuple[str, str], list[Mapping[str, Any]]]:
     groups: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
     for row in rows:
@@ -333,24 +348,21 @@ def _group_rows_by_niche(
 
 
 def _serialize_niche_counts(
-    counts: Mapping[tuple[str, str], Sequence[Mapping[str, Any]]]
+    counts: Mapping[tuple[str, str], Sequence[Mapping[str, Any]]],
 ) -> dict[str, int]:
-    return {
-        _serialize_niche_key(key): len(values)
-        for key, values in sorted(counts.items())
-    }
+    return {_serialize_niche_key(key): len(values) for key, values in sorted(counts.items())}
 
 
 def _balance_row_rank(row: Mapping[str, Any]) -> int:
-    build_id = str(row.get('build_id') or '')
-    scenario_id = str(row.get('scenario_id') or '')
+    build_id = str(row.get("build_id") or "")
+    scenario_id = str(row.get("scenario_id") or "")
     balance_str = f"{build_id}|{scenario_id}|{DETERMINISTIC_BALANCE_HASH_SALT}"
-    digest = hashlib.sha256(balance_str.encode('utf-8')).hexdigest()
+    digest = hashlib.sha256(balance_str.encode("utf-8")).hexdigest()
     return int(digest, 16)
 
 
 def _apply_deterministic_balance(
-    rows: Sequence[Mapping[str, Any]]
+    rows: Sequence[Mapping[str, Any]],
 ) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
     original_rows = list(rows)
     total_rows = len(original_rows)
@@ -368,17 +380,13 @@ def _apply_deterministic_balance(
     gating_passed = False
     fallback = False
     cap_value: int | None = None
-    reason = ''
+    reason = ""
     if total_rows < DETERMINISTIC_BALANCE_MIN_TOTAL_ROWS:
-        reason = (
-            f"total rows {total_rows} below minimum {DETERMINISTIC_BALANCE_MIN_TOTAL_ROWS}"
-        )
+        reason = f"total rows {total_rows} below minimum {DETERMINISTIC_BALANCE_MIN_TOTAL_ROWS}"
     elif eligible_count < 2:
         reason = f"eligible niches {eligible_count} below minimum 2"
     elif dominant_share <= DETERMINISTIC_BALANCE_DOMINANT_SHARE:
-        reason = (
-            f"dominant share {dominant_share:.3f} <= {DETERMINISTIC_BALANCE_DOMINANT_SHARE}"
-        )
+        reason = f"dominant share {dominant_share:.3f} <= {DETERMINISTIC_BALANCE_DOMINANT_SHARE}"
     else:
         gating_passed = True
         eligible_counts = [len(values) for values in eligible_niches.values()]
@@ -398,18 +406,12 @@ def _apply_deterministic_balance(
         retention_ratio = output_count / total_rows if total_rows else 0.0
         if output_count < DETERMINISTIC_BALANCE_MIN_OUTPUT_ROWS:
             fallback = True
-            reason = (
-                f"balanced rows {output_count} below minimum {DETERMINISTIC_BALANCE_MIN_OUTPUT_ROWS}; reverting to original dataset"
-            )
+            reason = f"balanced rows {output_count} below minimum {DETERMINISTIC_BALANCE_MIN_OUTPUT_ROWS}; reverting to original dataset"
         elif retention_ratio < DETERMINISTIC_BALANCE_MIN_RETENTION_RATIO:
             fallback = True
-            reason = (
-                f"retention ratio {retention_ratio:.3f} below threshold {DETERMINISTIC_BALANCE_MIN_RETENTION_RATIO}; reverting to original dataset"
-            )
+            reason = f"retention ratio {retention_ratio:.3f} below threshold {DETERMINISTIC_BALANCE_MIN_RETENTION_RATIO}; reverting to original dataset"
         else:
-            reason = (
-                f"dominant share {dominant_share:.3f} > {DETERMINISTIC_BALANCE_DOMINANT_SHARE}"
-            )
+            reason = f"dominant share {dominant_share:.3f} > {DETERMINISTIC_BALANCE_DOMINANT_SHARE}"
         final_rows = original_rows if fallback else truncated_rows
     final_count = len(final_rows)
     retention_ratio = final_count / total_rows if total_rows else 0.0
@@ -417,28 +419,28 @@ def _apply_deterministic_balance(
     applied = gating_passed and not fallback and dropped_row_count > 0
     niche_counts_after = _serialize_niche_counts(_group_rows_by_niche(final_rows))
     metadata = {
-        'version': DETERMINISTIC_BALANCE_VERSION,
-        'seed': DETERMINISTIC_BALANCE_SEED,
-        'key_fields': list(DETERMINISTIC_BALANCE_KEY_FIELDS),
-        'thresholds': {
-            'min_total_rows': DETERMINISTIC_BALANCE_MIN_TOTAL_ROWS,
-            'min_niche_count': DETERMINISTIC_BALANCE_MIN_NICHE_COUNT,
-            'dominant_share': DETERMINISTIC_BALANCE_DOMINANT_SHARE,
-            'min_output_rows': DETERMINISTIC_BALANCE_MIN_OUTPUT_ROWS,
-            'min_retention_ratio': DETERMINISTIC_BALANCE_MIN_RETENTION_RATIO,
-            'cap_floor': DETERMINISTIC_BALANCE_CAP_FLOOR,
+        "version": DETERMINISTIC_BALANCE_VERSION,
+        "seed": DETERMINISTIC_BALANCE_SEED,
+        "key_fields": list(DETERMINISTIC_BALANCE_KEY_FIELDS),
+        "thresholds": {
+            "min_total_rows": DETERMINISTIC_BALANCE_MIN_TOTAL_ROWS,
+            "min_niche_count": DETERMINISTIC_BALANCE_MIN_NICHE_COUNT,
+            "dominant_share": DETERMINISTIC_BALANCE_DOMINANT_SHARE,
+            "min_output_rows": DETERMINISTIC_BALANCE_MIN_OUTPUT_ROWS,
+            "min_retention_ratio": DETERMINISTIC_BALANCE_MIN_RETENTION_RATIO,
+            "cap_floor": DETERMINISTIC_BALANCE_CAP_FLOOR,
         },
-        'applied': applied,
-        'reason': reason,
-        'input_row_count': total_rows,
-        'output_row_count': final_count,
-        'dropped_row_count': dropped_row_count,
-        'retention_ratio': retention_ratio,
-        'eligible_niche_count': eligible_count,
-        'cap_per_niche': cap_value if gating_passed else None,
-        'dominant_share_before': dominant_share,
-        'niche_counts_before': niche_counts_before,
-        'niche_counts_after': niche_counts_after,
+        "applied": applied,
+        "reason": reason,
+        "input_row_count": total_rows,
+        "output_row_count": final_count,
+        "dropped_row_count": dropped_row_count,
+        "retention_ratio": retention_ratio,
+        "eligible_niche_count": eligible_count,
+        "cap_per_niche": cap_value if gating_passed else None,
+        "dominant_share_before": dominant_share,
+        "niche_counts_before": niche_counts_before,
+        "niche_counts_after": niche_counts_after,
     }
     return final_rows, metadata
 
@@ -450,16 +452,35 @@ def train(
     compute_backend: str = BACKEND_PREFERENCE_AUTO,
     include_failures: bool = True,
 ) -> TrainResult:
+    train_started_at = monotonic()
     dataset_root = resolve_snapshot_root(Path(dataset_path))
     manifest = _load_manifest(dataset_root)
     rows = list(_load_dataset_rows(dataset_root))
+    raw_row_count = len(rows)
     rows, balance_meta = _apply_deterministic_balance(rows)
     model_id = model_id or _default_model_id()
     backend_preference = _normalize_backend_preference(compute_backend)
     resolved_backend, fallback_reason = _resolve_compute_backend(backend_preference)
     model_root = Path(output_root) / model_id
     model_root.mkdir(parents=True, exist_ok=True)
+    _train_phase_log(
+        "surrogate train %s phase=start "
+        "(snapshot=%s rows=%d raw_rows=%d backend_preference=%s backend_resolved=%s)",
+        model_id,
+        manifest.get("snapshot_id", ""),
+        len(rows),
+        raw_row_count,
+        backend_preference,
+        resolved_backend,
+    )
+    if fallback_reason:
+        logger.warning(
+            "surrogate train %s compute backend fallback: %s",
+            model_id,
+            fallback_reason,
+        )
 
+    feature_stage_started_at = monotonic()
     global_accumulators = {metric: _MetricAccumulator() for metric in METRIC_TARGETS}
     feature_accumulators = {feature: _MetricAccumulator() for feature in FEATURE_SIGNAL_KEYS}
     feature_metric_pairs = {
@@ -514,6 +535,12 @@ def train(
                 backend=resolved_backend,
             )
         feature_weights[metric] = weights_for_metric
+    _train_phase_log(
+        "surrogate train %s phase=feature_regression_complete (rows=%d elapsed=%.1fs)",
+        model_id,
+        len(rows),
+        max(0.0, monotonic() - feature_stage_started_at),
+    )
 
     trained_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     model_kwargs = {
@@ -536,6 +563,7 @@ def train(
         identity_cross_token_effects={},
         token_learner_backend=TOKEN_LEARNER_RESIDUAL_MEAN,
     )
+    token_stage_started_at = monotonic()
     baseline_predictions = base_model.predict_many(rows)
     (
         identity_effects,
@@ -549,15 +577,22 @@ def train(
         identity_cross_token_effects=cross_effects,
         token_learner_backend=token_learner_backend,
     )
+    _train_phase_log(
+        "surrogate train %s phase=token_effects_complete "
+        "(token_backend=%s token_fallback=%s elapsed=%.1fs)",
+        model_id,
+        token_learner_backend,
+        token_learner_fallback_reason or "none",
+        max(0.0, monotonic() - token_stage_started_at),
+    )
 
     classifier_model = None
     classifier_metrics = None
+    classifier_stage_started_at: float | None = None
     classifier_meta = {
         "classifier_enabled": include_failures,
         "classifier_status": "disabled" if not include_failures else "skipped",
-        "classifier_skip_reason": (
-            "include_failures disabled" if not include_failures else None
-        ),
+        "classifier_skip_reason": ("include_failures disabled" if not include_failures else None),
         "classifier_train_samples": 0,
         "classifier_label_distribution": {},
         "classifier_cv_requested_folds": 0,
@@ -566,6 +601,11 @@ def train(
         "classifier_cv_skip_reason": None,
     }
     if include_failures:
+        classifier_stage_started_at = monotonic()
+        _train_phase_log(
+            "surrogate train %s phase=classifier_start (include_failures=true)",
+            model_id,
+        )
         classifier_cv_requested = 5
         classifier_meta["classifier_cv_requested_folds"] = classifier_cv_requested
         try:
@@ -576,13 +616,13 @@ def train(
             classification_rows = [row for row in rows if row.get("gate_pass") is not None]
             classifier_meta["classifier_train_samples"] = len(classification_rows)
             if not classification_rows:
-                classifier_meta["classifier_skip_reason"] = (
-                    "no gate_pass labels available"
-                )
+                classifier_meta["classifier_skip_reason"] = "no gate_pass labels available"
             else:
                 labels = [1 if row.get("gate_pass") else 0 for row in classification_rows]
                 label_counts = Counter(labels)
-                classifier_meta["classifier_label_distribution"] = dict(sorted(label_counts.items()))
+                classifier_meta["classifier_label_distribution"] = dict(
+                    sorted(label_counts.items())
+                )
                 if len(label_counts) < 2:
                     classifier_meta["classifier_skip_reason"] = (
                         "single-class gate_pass labels: "
@@ -609,6 +649,12 @@ def train(
                     )
                     cv_scores: list[float] = []
                     if cv_used >= 2:
+                        _train_phase_log(
+                            "surrogate train %s phase=classifier_cv_start (folds=%d samples=%d)",
+                            model_id,
+                            cv_used,
+                            len(classification_rows),
+                        )
                         try:
                             cv_scores = cross_val_score(clf, X, y, cv=cv_used)
                             classifier_meta["classifier_cv_status"] = "ran"
@@ -649,9 +695,27 @@ def train(
             )
             classifier_meta["classifier_status"] = "skipped"
 
+    classifier_elapsed = (
+        max(0.0, monotonic() - classifier_stage_started_at)
+        if classifier_stage_started_at is not None
+        else 0.0
+    )
+    _train_phase_log(
+        "surrogate train %s phase=classifier_complete "
+        "(status=%s cv_status=%s samples=%d elapsed=%.1fs reason=%s)",
+        model_id,
+        classifier_meta.get("classifier_status"),
+        classifier_meta.get("classifier_cv_status"),
+        classifier_meta.get("classifier_train_samples"),
+        classifier_elapsed,
+        classifier_meta.get("classifier_skip_reason") or "none",
+    )
+
     model_path = model_root / _MODEL_FILENAME
     model_path.write_text(json.dumps(model.to_dict(), indent=2), encoding="utf-8")
 
+    evaluation_stage_started_at = monotonic()
+    _train_phase_log("surrogate train %s phase=evaluation_start", model_id)
     predictions = model.predict_many(rows)
     evaluation = evaluate_predictions(rows, predictions)
     metrics_payload = {
@@ -661,6 +725,12 @@ def train(
     }
     metrics_path = model_root / _METRICS_FILENAME
     metrics_path.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
+    _train_phase_log(
+        "surrogate train %s phase=evaluation_complete (rows=%d elapsed=%.1fs)",
+        model_id,
+        evaluation.row_count,
+        max(0.0, monotonic() - evaluation_stage_started_at),
+    )
 
     meta_payload = {
         "model_id": model_id,
@@ -686,6 +756,14 @@ def train(
 
     meta_path = model_root / _META_FILENAME
     meta_path.write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
+
+    _train_phase_log(
+        "surrogate train %s phase=completed (backend=%s token_backend=%s elapsed=%.1fs)",
+        model_id,
+        resolved_backend,
+        token_learner_backend,
+        max(0.0, monotonic() - train_started_at),
+    )
 
     return TrainResult(
         model_id=model_id,
@@ -1051,13 +1129,23 @@ def _learn_token_effects_torch_sparse(
     compute_backend: str,
 ) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
     import torch
+    import torch.nn.functional as functional
 
+    stage_started_at = monotonic()
     device = torch.device("cuda" if compute_backend == COMPUTE_BACKEND_CUDA else "cpu")
     identity_vocab, identity_rows = _build_token_vocab(rows, FEATURE_IDENTITY_TOKENS)
     cross_vocab, cross_rows = _build_token_vocab(rows, FEATURE_IDENTITY_CROSS_TOKENS)
+    _train_phase_log(
+        "surrogate token learner phase=start (backend=%s rows=%d identity_vocab=%d cross_vocab=%d)",
+        compute_backend,
+        len(rows),
+        len(identity_vocab),
+        len(cross_vocab),
+    )
     identity_effects: dict[str, dict[str, float]] = {}
     cross_effects: dict[str, dict[str, float]] = {}
     for metric in METRIC_TARGETS:
+        metric_started_at = monotonic()
         targets: list[float] = []
         row_indices: list[int] = []
         for row_idx, (row, prediction) in enumerate(zip(rows, predictions, strict=True)):
@@ -1069,7 +1157,43 @@ def _learn_token_effects_torch_sparse(
             row_indices.append(row_idx)
 
         if not row_indices:
+            _train_phase_log(
+                "surrogate token learner phase=metric_skipped (metric=%s reason=no_valid_rows)",
+                metric,
+            )
             continue
+
+        _train_phase_log(
+            "surrogate token learner phase=metric_start (metric=%s rows=%d)",
+            metric,
+            len(row_indices),
+        )
+
+        identity_flat: torch.Tensor | None = None
+        identity_offsets: torch.Tensor | None = None
+        if len(identity_vocab) > 0:
+            identity_values: list[int] = []
+            identity_offset_values: list[int] = [0]
+            for row_idx in row_indices:
+                indices = identity_rows[row_idx]
+                if indices:
+                    identity_values.extend(indices)
+                identity_offset_values.append(len(identity_values))
+            identity_flat = torch.tensor(identity_values, dtype=torch.long, device=device)
+            identity_offsets = torch.tensor(identity_offset_values, dtype=torch.long, device=device)
+
+        cross_flat: torch.Tensor | None = None
+        cross_offsets: torch.Tensor | None = None
+        if len(cross_vocab) > 0:
+            cross_values: list[int] = []
+            cross_offset_values: list[int] = [0]
+            for row_idx in row_indices:
+                indices = cross_rows[row_idx]
+                if indices:
+                    cross_values.extend(indices)
+                cross_offset_values.append(len(cross_values))
+            cross_flat = torch.tensor(cross_values, dtype=torch.long, device=device)
+            cross_offsets = torch.tensor(cross_offset_values, dtype=torch.long, device=device)
 
         identity_weights = torch.zeros(len(identity_vocab), dtype=torch.float32, device=device)
         identity_weights.requires_grad_(len(identity_vocab) > 0)
@@ -1082,26 +1206,48 @@ def _learn_token_effects_torch_sparse(
             continue
         optimizer = torch.optim.Adam(trainable, lr=0.05)
         target_tensor = torch.tensor(targets, dtype=torch.float32, device=device)
-        for _ in range(40):
+        optimizer_steps = 40
+        last_progress_log_at = metric_started_at
+        for step in range(optimizer_steps):
             optimizer.zero_grad()
-            predicted_rows: list[torch.Tensor] = []
-            for row_idx in row_indices:
-                value = torch.zeros((), dtype=torch.float32, device=device)
-                if len(identity_vocab) > 0:
-                    indices = identity_rows[row_idx]
-                    if indices:
-                        index_tensor = torch.tensor(indices, dtype=torch.long, device=device)
-                        value = value + identity_weights[index_tensor].sum()
-                if len(cross_vocab) > 0:
-                    indices = cross_rows[row_idx]
-                    if indices:
-                        index_tensor = torch.tensor(indices, dtype=torch.long, device=device)
-                        value = value + cross_weights[index_tensor].sum()
-                predicted_rows.append(value)
-            prediction_tensor = torch.stack(predicted_rows)
+            prediction_tensor = torch.zeros(len(row_indices), dtype=torch.float32, device=device)
+            if identity_flat is not None and identity_offsets is not None:
+                prediction_tensor = prediction_tensor + functional.embedding_bag(
+                    identity_flat,
+                    identity_weights.unsqueeze(1),
+                    identity_offsets,
+                    mode="sum",
+                    include_last_offset=True,
+                ).squeeze(1)
+            if cross_flat is not None and cross_offsets is not None:
+                prediction_tensor = prediction_tensor + functional.embedding_bag(
+                    cross_flat,
+                    cross_weights.unsqueeze(1),
+                    cross_offsets,
+                    mode="sum",
+                    include_last_offset=True,
+                ).squeeze(1)
             loss = torch.mean((prediction_tensor - target_tensor) ** 2)
             loss.backward()
             optimizer.step()
+
+            now = monotonic()
+            should_log_progress = (
+                step + 1 == optimizer_steps
+                or (step + 1) % 10 == 0
+                or (now - last_progress_log_at) >= 30.0
+            )
+            if should_log_progress:
+                _train_phase_log(
+                    "surrogate token learner phase=metric_progress "
+                    "(metric=%s step=%d/%d loss=%.6f elapsed=%.1fs)",
+                    metric,
+                    step + 1,
+                    optimizer_steps,
+                    float(loss.detach().item()),
+                    max(0.0, now - metric_started_at),
+                )
+                last_progress_log_at = now
 
         raw_identity = {
             token: float(identity_weights[index].item())
@@ -1119,6 +1265,19 @@ def _learn_token_effects_torch_sparse(
             identity_effects[metric] = selected_identity
         if selected_cross:
             cross_effects[metric] = selected_cross
+        _train_phase_log(
+            "surrogate token learner phase=metric_complete "
+            "(metric=%s identity_effects=%d cross_effects=%d elapsed=%.1fs)",
+            metric,
+            len(selected_identity),
+            len(selected_cross),
+            max(0.0, monotonic() - metric_started_at),
+        )
+
+    _train_phase_log(
+        "surrogate token learner phase=completed (elapsed=%.1fs)",
+        max(0.0, monotonic() - stage_started_at),
+    )
 
     return identity_effects, cross_effects
 

@@ -1,3 +1,5 @@
+.vestige*
+.tmp/
 ml_loops/
 .opencode/
 runs/

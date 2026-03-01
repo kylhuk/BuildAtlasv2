@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
+from time import monotonic
 from typing import Any, Callable, Literal, Mapping, Sequence
 
 from backend.app.api.evaluator import BuildEvaluator
@@ -33,7 +34,6 @@ from backend.engine.artifacts.store import (
     write_build_constraints,
 )
 from backend.engine.build_details import build_details_from_generation
-from backend.engine.surrogate.dataset import extract_feature_signals
 from backend.engine.constraints import (
     ConstraintSpec,
     constraint_artifact_payload,
@@ -49,8 +49,17 @@ from backend.engine.passives.builder import PassiveTreePlan, build_passive_tree_
 from backend.engine.scenarios.loader import ScenarioTemplate, list_templates
 from backend.engine.skills.catalog import GemPlan, SkillCatalog, load_default_skill_catalog
 from backend.engine.sockets.planner import SocketPlan, plan_sockets
+from backend.engine.surrogate.dataset import extract_feature_signals
 
 logger = logging.getLogger(__name__)
+
+
+def _phase_log(message: str, *args: object) -> None:
+    if logger.isEnabledFor(logging.INFO):
+        logger.info(message, *args)
+        return
+    logger.warning(message, *args)
+
 
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -1184,7 +1193,9 @@ def run_generation(
     if not templates:
         raise ValueError(f"no scenario templates for profile_id={profile_id}")
 
+    created_repo = repo is None
     repo = repo or ClickhouseRepository()
+    created_evaluator = evaluator is None
     evaluator = evaluator or BuildEvaluator(repo=repo, base_path=base_path)
     if run_mode == "optimizer":
         evaluator.require_worker_metrics_for_profile(profile_id)
@@ -1193,6 +1204,16 @@ def run_generation(
     assert repo is not None
     assert evaluator is not None
     session_id = run_id or uuid.uuid4().hex
+    run_started_at = monotonic()
+    synthesis_started_at = run_started_at
+    _phase_log(
+        "generation run %s starting (mode=%s count=%d profile=%s surrogate_enabled=%s)",
+        session_id,
+        run_mode,
+        count,
+        profile_id,
+        surrogate_enabled,
+    )
     candidates: list[Candidate] = []
     precheck_counts: dict[str, int] = {category: 0 for category in PRECHECK_CATEGORIES}
 
@@ -1494,9 +1515,36 @@ def run_generation(
         for candidate in selected_candidates:
             candidate.selected_for_evaluation = True
 
+    selection_finished_at = monotonic()
+    precheck_failed_count = len(candidates) - len(evaluable_candidates)
+    _phase_log(
+        "generation run %s phase=synthesis_complete "
+        "(processed=%d evaluable=%d precheck_failed=%d elapsed=%.1fs)",
+        session_id,
+        len(candidates),
+        len(evaluable_candidates),
+        precheck_failed_count,
+        max(0.0, selection_finished_at - synthesis_started_at),
+    )
+
     selected_count = sum(1 for candidate in candidates if candidate.selected_for_evaluation)
     surrogate_summary["counts"]["selected"] = selected_count
     surrogate_summary["counts"]["pruned"] = max(0, len(evaluable_candidates) - selected_count)
+    if surrogate_summary["status"] == "fallback":
+        logger.warning(
+            "generation run %s surrogate fallback engaged: %s",
+            session_id,
+            surrogate_summary.get("fallback_reason") or "unknown",
+        )
+    _phase_log(
+        "generation run %s phase=selection_complete "
+        "(selected=%d pruned=%d surrogate_status=%s elapsed=%.1fs)",
+        session_id,
+        surrogate_summary["counts"]["selected"],
+        surrogate_summary["counts"]["pruned"],
+        surrogate_summary["status"],
+        max(0.0, monotonic() - selection_finished_at),
+    )
 
     evaluation_rows: list[ScenarioMetricRow] = []
     evaluation_records: list[dict[str, Any]] = []
@@ -1504,6 +1552,19 @@ def run_generation(
     evaluation_successes = 0
     evaluation_failures = 0
     evaluation_errors = 0
+    evaluation_started_at = monotonic()
+    progress_step = max(1, selected_count // 5) if selected_count else 1
+    next_progress_count = progress_step
+    last_progress_log_at = evaluation_started_at
+
+    if selected_count == 0:
+        logger.warning("generation run %s has no candidates selected for evaluation", session_id)
+    else:
+        _phase_log(
+            "generation run %s starting PoB evaluation for %d candidate(s)",
+            session_id,
+            selected_count,
+        )
 
     for candidate in candidates:
         if not candidate.selected_for_evaluation:
@@ -1550,6 +1611,46 @@ def run_generation(
             evaluation_errors += 1
             evaluation_failures += 1
             candidate.evaluation_status = BuildStatus.failed.value
+            logger.warning(
+                "generation run %s candidate %s evaluation error code=%s message=%s",
+                session_id,
+                candidate.build_id,
+                candidate.evaluation_error["code"],
+                candidate.evaluation_error["message"],
+            )
+
+        now = monotonic()
+        should_log_progress = (
+            evaluation_attempted == selected_count
+            or evaluation_attempted >= next_progress_count
+            or (now - last_progress_log_at) >= 30.0
+        )
+        if should_log_progress:
+            _phase_log(
+                "generation run %s phase=evaluation_progress "
+                "(completed=%d/%d successes=%d failures=%d errors=%d elapsed=%.1fs)",
+                session_id,
+                evaluation_attempted,
+                selected_count,
+                evaluation_successes,
+                evaluation_failures,
+                evaluation_errors,
+                max(0.0, now - evaluation_started_at),
+            )
+            while next_progress_count <= evaluation_attempted:
+                next_progress_count += progress_step
+            last_progress_log_at = now
+
+    _phase_log(
+        "generation run %s phase=evaluation_complete "
+        "(attempted=%d successes=%d failures=%d errors=%d elapsed=%.1fs)",
+        session_id,
+        evaluation_attempted,
+        evaluation_successes,
+        evaluation_failures,
+        evaluation_errors,
+        max(0.0, monotonic() - evaluation_started_at),
+    )
 
     valid_generation_records: list[dict[str, Any]] = []
     generation_attempt_records: list[dict[str, Any]] = []
@@ -1672,6 +1773,14 @@ def run_generation(
                 }
             )
 
+    _phase_log(
+        "generation run %s phase=archive_complete (entries=%d archive_written=%s elapsed=%.1fs)",
+        session_id,
+        len(entries),
+        bool(archive_path),
+        max(0.0, monotonic() - evaluation_started_at),
+    )
+
     evaluation_stats: dict[str, int] = {
         "attempted": evaluation_attempted,
         "successes": evaluation_successes,
@@ -1790,6 +1899,12 @@ def run_generation(
             run_status,
         )
 
+    _phase_log(
+        "generation run %s phase=artifact_write_start (elapsed=%.1fs)",
+        session_id,
+        max(0.0, monotonic() - run_started_at),
+    )
+
     benchmark_payload = _benchmark_summary_from_rows(evaluation_rows)
     benchmark_path = _persist_run_artifact(
         session_id,
@@ -1841,7 +1956,18 @@ def run_generation(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
     )
     summary["paths"]["summary"] = str(summary_path)
-    logger.info("generation run %s written to %s", session_id, summary_path)
+    _phase_log(
+        "generation run %s phase=completed summary=%s elapsed=%.1fs",
+        session_id,
+        summary_path,
+        max(0.0, monotonic() - run_started_at),
+    )
+    if created_evaluator:
+        evaluator.close()
+    if created_repo and hasattr(repo, "close"):
+        close_repo = getattr(repo, "close")
+        if callable(close_repo):
+            close_repo()
     return summary
 
 

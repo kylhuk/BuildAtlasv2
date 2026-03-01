@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import xml.etree.ElementTree as ET
 import zlib
 from collections.abc import Mapping, Sequence
@@ -16,8 +17,10 @@ from backend.app.settings import settings
 from backend.engine.artifacts.store import read_build_artifacts, write_build_artifacts
 from backend.engine.evaluation.gates import evaluate_gates
 from backend.engine.evaluation.normalized import NormalizedMetrics, map_worker_output
-from backend.engine.scenarios.loader import list_templates
+from backend.engine.scenarios.loader import ScenarioTemplate, list_templates
 from backend.engine.worker_pool import WorkerPool, WorkerPoolError
+
+logger = logging.getLogger(__name__)
 
 _ALLOWED_STATUS_TRANSITIONS: Dict[BuildStatus, set[BuildStatus]] = {
     BuildStatus.imported: {BuildStatus.queued},
@@ -84,6 +87,12 @@ class BuildEvaluator:
             if self._pool is not None:
                 self._pool.close()
                 self._pool = None
+
+    def __del__(self) -> None:  # pragma: no cover - best effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def evaluate_build(self, build_id: str) -> tuple[BuildStatus, List[ScenarioMetricRow]]:
         build = self._repo.get_build(build_id)
@@ -461,9 +470,17 @@ class BuildEvaluator:
 
         pool = self._get_worker_pool()
         try:
-            responses = pool.evaluate_batch(payloads)
+            responses = pool.evaluate_batch(
+                payloads,
+                progress_label=f"build_id={build_id} scenarios={len(payloads)}",
+            )
         except WorkerPoolError as exc:
             if allow_failure:
+                logger.warning(
+                    "worker evaluation failed for build %s (allow_failure=true): %s",
+                    build_id,
+                    exc,
+                )
                 return {}
             raise APIError(
                 502,

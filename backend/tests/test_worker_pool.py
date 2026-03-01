@@ -286,6 +286,38 @@ def test_worker_pool_resolves_luajit_script_path_and_defaults_cwd() -> None:
         return responder
 
     module = MockSubprocessModule(responder_factory)
+    pool = WorkerPool(num_workers=1, subprocess_module=module)
+    try:
+        pool.evaluate_batch([{"value": "test"}])
+    finally:
+        pool.close()
+
+    project_root = Path(__file__).resolve().parents[2]
+    expected_worker_script = str(project_root / "pob/worker/worker.lua")
+    assert module.popen_args[0][0][0] == "luajit"
+    assert module.popen_args[0][0][1] == expected_worker_script
+    assert module.popen_kwargs[0].get("cwd") == str(project_root)
+
+
+
+def test_worker_pool_preserves_legacy_pob_cwd_when_using_pathofbuilding() -> None:
+    def responder_factory() -> Callable[[MockProcess, Dict[str, Any]], None]:
+        def responder(process: MockProcess, request: Dict[str, Any]) -> None:
+            process.stdout.push_line(
+                json.dumps(
+                    {
+                        "id": request["id"],
+                        "ok": True,
+                        "result": {
+                            "payload": request["params"],
+                        },
+                    }
+                )
+            )
+
+        return responder
+
+    module = MockSubprocessModule(responder_factory)
     pool = WorkerPool(
         num_workers=1,
         worker_cmd=["luajit", "PathOfBuilding/worker/worker.lua"],
@@ -297,14 +329,11 @@ def test_worker_pool_resolves_luajit_script_path_and_defaults_cwd() -> None:
     finally:
         pool.close()
 
-    expected_worker_script = str(
-        Path(__file__).resolve().parents[2] / "PathOfBuilding/worker/worker.lua"
-    )
     assert module.popen_args[0][0][0] == "luajit"
-    assert module.popen_args[0][0][1] == expected_worker_script
-    assert module.popen_kwargs[0].get("cwd") == str(
-        Path(__file__).resolve().parents[2] / "PathOfBuilding/src"
-    )
+    assert module.popen_args[0][0][1].endswith("PathOfBuilding/worker/worker.lua")
+    cwd_value = module.popen_kwargs[0].get("cwd")
+    assert cwd_value is not None
+    assert cwd_value.endswith("PathOfBuilding/src")
 
 
 def test_missing_id_response_triggers_protocol_error_restart() -> None:

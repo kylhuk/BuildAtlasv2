@@ -8,8 +8,8 @@ from typing import Any
 import pytest
 
 from backend.engine.surrogate import (
-    EvaluationResult,
     FEATURE_SCHEMA_VERSION,
+    EvaluationResult,
     SnapshotResult,
     TrainResult,
 )
@@ -57,7 +57,11 @@ def test_start_loop_executes_two_iterations(
     def fake_run_generation(**kwargs: object) -> dict[str, object]:
         assert kwargs.get("run_mode") == "optimizer"
         seed_calls.append(int(kwargs.get("seed_start")))
-        return {"run_id": kwargs.get("run_id"), "status": "completed"}
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "completed",
+            "evaluation": {"attempted": 1, "successes": 1, "failures": 0, "errors": 0},
+        }
 
     def fake_build_dataset_snapshot(
         *,
@@ -147,9 +151,9 @@ def test_start_loop_executes_two_iterations(
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["status"] == "completed"
     assert state["iteration"] == iterations
-    assert state["last_improvement"].get("improved") is True
-    assert state["last_model_id"] == "ml-loop-test-iter-0002"
-    assert str(state["last_model_path"]).endswith("ml-loop-test-iter-0002/model.json")
+    assert state["last_improvement"].get("improved") is False
+    assert state["last_model_id"] == "ml-loop-test-iter-0001"
+    assert str(state["last_model_path"]).endswith("ml-loop-test-iter-0001/model.json")
 
     iterations_path = loop_root / ml_loop.ITERATIONS_FILENAME
     lines = [
@@ -158,8 +162,9 @@ def test_start_loop_executes_two_iterations(
     assert len(lines) == iterations
     loaded_iterations = [json.loads(line) for line in lines]
     assert {entry["iteration"] for entry in loaded_iterations} == set(range(1, iterations + 1))
-    assert all(entry["model"]["promoted"] is True for entry in loaded_iterations)
-    assert loaded_iterations[-1]["model"]["promoted_model_id"] == "ml-loop-test-iter-0002"
+    assert loaded_iterations[0]["model"]["promoted"] is True
+    assert loaded_iterations[1]["model"]["promoted"] is False
+    assert loaded_iterations[-1]["model"]["promoted_model_id"] == "ml-loop-test-iter-0001"
 
     for iteration in range(1, iterations + 1):
         checkpoint = loop_root / ml_loop.CHECKPOINTS_DIR_NAME / f"iter-{iteration:04d}.json"
@@ -195,7 +200,11 @@ def test_start_loop_keeps_champion_when_challenger_regresses(
 
     def fake_run_generation(**kwargs: object) -> dict[str, object]:
         assert kwargs.get("run_mode") == "optimizer"
-        return {"run_id": kwargs.get("run_id"), "status": "completed"}
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "completed",
+            "evaluation": {"attempted": 1, "successes": 1, "failures": 0, "errors": 0},
+        }
 
     def fake_build_dataset_snapshot(
         *,
@@ -318,9 +327,7 @@ def test_start_loop_keeps_champion_when_challenger_regresses(
     assert records[1]["model"]["promoted_model_id"] == "champion-loop-iter-0001"
 
 
-def test_start_loop_resumes_with_next_seed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_start_loop_resumes_with_next_seed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     loop_id = "resume-loop"
     data_path = tmp_path / "data"
     loop_root = data_path / "ml_loops" / loop_id
@@ -328,7 +335,9 @@ def test_start_loop_resumes_with_next_seed(
     iterations_path = loop_root / ml_loop.ITERATIONS_FILENAME
     iterations_path.write_text('{"iteration": 1}\n', encoding="utf-8")
     state_path = loop_root / ml_loop.STATE_FILENAME
-    state = ml_loop._build_initial_state(loop_id, total_iterations=2, seed_start_base=1, seed_window_size=5)
+    state = ml_loop._build_initial_state(
+        loop_id, total_iterations=2, seed_start_base=1, seed_window_size=5
+    )
     state.update(
         {
             "iteration": 1,
@@ -364,7 +373,11 @@ def test_start_loop_resumes_with_next_seed(
 
     def fake_run_generation(**kwargs: object) -> dict[str, object]:
         seed_calls.append(int(kwargs.get("seed_start")))
-        return {"run_id": kwargs.get("run_id"), "status": "completed"}
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "completed",
+            "evaluation": {"attempted": 1, "successes": 1, "failures": 0, "errors": 0},
+        }
 
     def fake_build_dataset_snapshot(
         *,
@@ -475,7 +488,11 @@ def test_start_loop_records_failure_checkpoint_on_exception(
     )
 
     def fake_run_generation(**kwargs: object) -> dict[str, object]:
-        return {"run_id": kwargs.get("run_id"), "status": "completed"}
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "completed",
+            "evaluation": {"attempted": 1, "successes": 1, "failures": 0, "errors": 0},
+        }
 
     def fake_build_dataset_snapshot(
         *,
@@ -511,6 +528,243 @@ def test_start_loop_records_failure_checkpoint_on_exception(
     assert context.get("next_iteration_seed_start") == args.seed_start + args.count
 
 
+def test_start_loop_skips_when_generation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop_id = "generation-failure"
+    data_path = tmp_path / "data"
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        iterations=1,
+        count=4,
+        seed_start=2,
+        profile_id="pinnacle",
+        ruleset_id="ruleset-smoke",
+        scenario_version=None,
+        price_snapshot_id="price",
+        pob_commit=None,
+        constraints_file=None,
+        data_path=data_path,
+        surrogate_backend="cpu",
+    )
+
+    def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "failed",
+            "evaluation": {"attempted": 2, "successes": 0, "failures": 2, "errors": 0},
+            "status_reason": {
+                "code": "no_verified_evaluations",
+                "message": "no verified builds",
+            },
+        }
+
+    def fake_fail(*args: object, **kwargs: object) -> None:
+        pytest.fail("should not run after generation failure")
+
+    monkeypatch.setattr(ml_loop, "run_generation", fake_run_generation)
+    monkeypatch.setattr(ml_loop, "build_dataset_snapshot", fake_fail)
+    monkeypatch.setattr(ml_loop, "train", fake_fail)
+    monkeypatch.setattr(ml_loop, "load_dataset_rows", fake_fail)
+    monkeypatch.setattr(ml_loop, "load_model", fake_fail)
+    monkeypatch.setattr(ml_loop, "evaluate_predictions", fake_fail)
+
+    result = ml_loop.start_loop(args)
+    assert result == 0
+
+    state_path = data_path / "ml_loops" / loop_id / ml_loop.STATE_FILENAME
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "completed"
+    assert state["phase"] == "idle"
+    assert state["iteration"] == 1
+    assert state["last_generation_status"] == "failed"
+    assert state["last_generation_status_reason_code"] == "no_verified_evaluations"
+    assert state["last_generation_verified"] == 0
+    assert state["last_generation_attempted"] == 2
+    assert state["last_iteration_outcome"] == "skipped_generation_unhealthy"
+    assert state["skipped_iterations_total"] == 1
+    assert state["last_skipped_iteration"] == 1
+    assert state["last_skip_reason_code"] == "no_verified_evaluations"
+
+    loop_root = data_path / "ml_loops" / loop_id
+    records = [
+        json.loads(line)
+        for line in (loop_root / ml_loop.ITERATIONS_FILENAME)
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record["iteration"] == 1
+    assert record["iteration_outcome"] == "skipped_generation_unhealthy"
+    assert record["run_status"] == "failed"
+    assert record["skip_reason_code"] == "no_verified_evaluations"
+    assert record["snapshot"] is None
+    assert record["model"] is None
+    assert record["evaluation"] is None
+
+
+def test_start_loop_continues_after_unhealthy_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop_id = "generation-recovery"
+    data_path = tmp_path / "data"
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        iterations=2,
+        count=4,
+        seed_start=2,
+        profile_id="pinnacle",
+        ruleset_id="ruleset-smoke",
+        scenario_version=None,
+        price_snapshot_id="price",
+        pob_commit=None,
+        constraints_file=None,
+        data_path=data_path,
+        surrogate_backend="cpu",
+    )
+
+    rows = [{"full_dps": 1.0, "max_hit": 2.0, "utility_score": 3.0}]
+    last_snapshot_id: str | None = None
+    last_snapshot_root: Path | None = None
+    seed_calls: list[int] = []
+    generation_calls = 0
+    snapshot_calls = 0
+    train_calls = 0
+
+    def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        nonlocal generation_calls
+        assert kwargs.get("run_mode") == "optimizer"
+        generation_calls += 1
+        seed_calls.append(int(kwargs.get("seed_start")))
+        if generation_calls == 1:
+            return {
+                "run_id": kwargs.get("run_id"),
+                "status": "failed",
+                "evaluation": {"attempted": 2, "successes": 0, "failures": 2, "errors": 0},
+                "status_reason": {
+                    "code": "no_verified_evaluations",
+                    "message": "no verified builds",
+                },
+            }
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "completed",
+            "evaluation": {"attempted": 2, "successes": 2, "failures": 0, "errors": 0},
+        }
+
+    def fake_build_dataset_snapshot(
+        *,
+        data_path: Path | str,
+        output_root: Path | str,
+        snapshot_id: str,
+        exclude_stub_rows: bool,
+    ) -> SnapshotResult:
+        nonlocal snapshot_calls, last_snapshot_id, last_snapshot_root
+        snapshot_calls += 1
+        assert exclude_stub_rows is True
+        last_snapshot_id = snapshot_id
+        snapshot_root = Path(output_root) / snapshot_id
+        last_snapshot_root = snapshot_root
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        dataset_path = snapshot_root / "dataset.jsonl"
+        dataset_path.write_text("[]", encoding="utf-8")
+        manifest_path = snapshot_root / "manifest.json"
+        manifest_path.write_text("{}", encoding="utf-8")
+        return SnapshotResult(
+            snapshot_id=snapshot_id,
+            dataset_path=dataset_path,
+            manifest_path=manifest_path,
+            row_count=len(rows),
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+            dataset_hash="hash",
+        )
+
+    def fake_train(
+        *,
+        dataset_path: Path | str,
+        output_root: Path | str,
+        model_id: str,
+        compute_backend: str,
+    ) -> TrainResult:
+        nonlocal train_calls
+        train_calls += 1
+        assert last_snapshot_root is not None
+        assert Path(dataset_path) == last_snapshot_root
+        assert compute_backend == "cpu"
+        model_root = Path(output_root) / model_id
+        model_root.mkdir(parents=True, exist_ok=True)
+        model_path = model_root / "model.json"
+        model_path.write_text("{}", encoding="utf-8")
+        metrics_path = model_root / "metrics.json"
+        metrics_path.write_text("{}", encoding="utf-8")
+        meta_path = model_root / "meta.json"
+        meta_path.write_text("{}", encoding="utf-8")
+        return TrainResult(
+            model_id=model_id,
+            model_path=model_path,
+            metrics_path=metrics_path,
+            meta_path=meta_path,
+            dataset_snapshot_id=last_snapshot_id or "",
+            dataset_hash="hash",
+            row_count=len(rows),
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+        )
+
+    def fake_load_dataset_rows(dataset_path: Path | str) -> list[dict[str, float]]:
+        assert last_snapshot_root is not None
+        assert Path(dataset_path) == last_snapshot_root
+        return rows
+
+    def fake_load_model(*args: object, **kwargs: object) -> _FakeModel:
+        return _FakeModel()
+
+    def fake_evaluate_predictions(*args: object, **kwargs: object) -> EvaluationResult:
+        return EvaluationResult(
+            row_count=len(rows),
+            metric_mae={"full_dps": 0.0, "max_hit": 0.0, "utility_score": 0.0},
+            pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+        )
+
+    monkeypatch.setattr(ml_loop, "run_generation", fake_run_generation)
+    monkeypatch.setattr(ml_loop, "build_dataset_snapshot", fake_build_dataset_snapshot)
+    monkeypatch.setattr(ml_loop, "train", fake_train)
+    monkeypatch.setattr(ml_loop, "load_dataset_rows", fake_load_dataset_rows)
+    monkeypatch.setattr(ml_loop, "load_model", fake_load_model)
+    monkeypatch.setattr(ml_loop, "evaluate_predictions", fake_evaluate_predictions)
+
+    result = ml_loop.start_loop(args)
+    assert result == 0
+    assert seed_calls == [2, 6]
+    assert snapshot_calls == 1
+    assert train_calls == 1
+
+    loop_root = data_path / "ml_loops" / loop_id
+    state = json.loads((loop_root / ml_loop.STATE_FILENAME).read_text(encoding="utf-8"))
+    assert state["status"] == "completed"
+    assert state["iteration"] == 2
+    assert state["skipped_iterations_total"] == 1
+    assert state["last_skipped_iteration"] == 1
+    assert state["last_model_id"] == "generation-recovery-iter-0002"
+
+    records = [
+        json.loads(line)
+        for line in (loop_root / ml_loop.ITERATIONS_FILENAME)
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert len(records) == 2
+    assert records[0]["iteration"] == 1
+    assert records[0]["iteration_outcome"] == "skipped_generation_unhealthy"
+    assert records[0]["run_status"] == "failed"
+    assert records[0]["snapshot"] is None
+    assert records[1]["iteration"] == 2
+    assert records[1]["iteration_outcome"] == "completed"
+    assert records[1]["run_status"] == "completed"
+    assert records[1]["model"]["promoted"] is True
+
 
 def test_start_loop_endless_respects_stop_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -538,7 +792,11 @@ def test_start_loop_endless_respects_stop_request(
 
     def fake_run_generation(**kwargs: object) -> dict[str, object]:
         assert kwargs.get("run_mode") == "optimizer"
-        return {"run_id": kwargs.get("run_id"), "status": "completed"}
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "completed",
+            "evaluation": {"attempted": 1, "successes": 1, "failures": 0, "errors": 0},
+        }
 
     def fake_build_dataset_snapshot(
         *,
@@ -646,13 +904,30 @@ def test_start_loop_endless_respects_stop_request(
     assert record["iteration"] == 1
 
 
+def test_compute_improvement_requires_strict_gain() -> None:
+    current = EvaluationResult(
+        row_count=1,
+        metric_mae={"full_dps": 1.0, "max_hit": 1.0, "utility_score": 1.0},
+        pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+    )
+    previous = EvaluationResult(
+        row_count=1,
+        metric_mae={"full_dps": 1.0, "max_hit": 1.0, "utility_score": 1.0},
+        pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+    )
+    improvement = ml_loop._compute_improvement(current, previous)
+    assert improvement["improved"] is False
+
+
 def test_stop_loop_sets_stop_requested(tmp_path: Path) -> None:
     loop_id = "stop-loop"
     data_path = tmp_path / "data"
     loop_root = data_path / "ml_loops" / loop_id
     loop_root.mkdir(parents=True, exist_ok=True)
     state_path = loop_root / ml_loop.STATE_FILENAME
-    initial_state = ml_loop._build_initial_state(loop_id, total_iterations=5, seed_start_base=1, seed_window_size=5)
+    initial_state = ml_loop._build_initial_state(
+        loop_id, total_iterations=5, seed_start_base=1, seed_window_size=5
+    )
     ml_loop._write_state(state_path, initial_state)
 
     args = argparse.Namespace(loop_id=loop_id, data_path=data_path)
@@ -667,7 +942,7 @@ def test_stop_loop_sets_stop_requested(tmp_path: Path) -> None:
 def test_status_loop_reports_missing_state(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    args = argparse.Namespace(loop_id="missing-loop", data_path=tmp_path)
+    args = argparse.Namespace(loop_id="missing-loop", data_path=tmp_path, output_format="human")
     result = ml_loop.status_loop(args)
     assert result == 1
 
@@ -675,6 +950,197 @@ def test_status_loop_reports_missing_state(
     payload = json.loads(output)
     assert payload["error"] == "loop_not_found"
     assert payload["loop_id"] == "missing-loop"
+
+
+def test_status_loop_human_readable_iteration_comparison(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    loop_id = "status-human"
+    data_path = tmp_path / "data"
+    loop_root = data_path / "ml_loops" / loop_id
+    loop_root.mkdir(parents=True, exist_ok=True)
+    state_path = loop_root / ml_loop.STATE_FILENAME
+    state = ml_loop._build_initial_state(
+        loop_id,
+        total_iterations=None,
+        seed_start_base=1,
+        seed_window_size=5,
+    )
+    state.update(
+        {
+            "status": "running",
+            "phase": "train",
+            "iteration": 2,
+            "last_run_id": f"{loop_id}-iter-0002",
+            "last_snapshot_id": "iter-0002",
+            "last_model_id": f"{loop_id}-iter-0002",
+            "last_model_path": str(loop_root / "models" / f"{loop_id}-iter-0002" / "model.json"),
+            "last_generation_status": "completed",
+            "last_generation_attempted": 5,
+            "last_generation_verified": 3,
+            "last_generation_failures": 0,
+            "last_generation_errors": 0,
+        }
+    )
+    ml_loop._write_state(state_path, state)
+
+    iterations_path = loop_root / ml_loop.ITERATIONS_FILENAME
+    record_1 = {
+        "iteration": 1,
+        "run_status": "completed",
+        "generation": {
+            "status": "completed",
+            "status_reason_code": None,
+            "status_reason_message": None,
+            "attempted": 5,
+            "successes": 3,
+            "failures": 0,
+            "errors": 0,
+        },
+        "model": {
+            "model_id": f"{loop_id}-iter-0001",
+            "promoted": True,
+            "compute_backend_resolved": "cuda",
+            "token_learner_backend": "torch_sparse_sgd",
+        },
+        "evaluation": {
+            "current": {
+                "metric_mae": {"full_dps": 1.1, "max_hit": 0.7, "utility_score": 0.3},
+                "pass_probability": {"mean": 0.42},
+            },
+            "previous": None,
+            "improvement": {"improved": False},
+        },
+    }
+    record_2 = {
+        "iteration": 2,
+        "run_status": "completed",
+        "generation": {
+            "status": "completed",
+            "status_reason_code": None,
+            "status_reason_message": None,
+            "attempted": 5,
+            "successes": 3,
+            "failures": 0,
+            "errors": 0,
+        },
+        "model": {
+            "model_id": f"{loop_id}-iter-0002",
+            "promoted": True,
+            "compute_backend_resolved": "cuda",
+            "token_learner_backend": "torch_sparse_sgd",
+        },
+        "evaluation": {
+            "current": {
+                "metric_mae": {"full_dps": 0.9, "max_hit": 0.6, "utility_score": 0.2},
+                "pass_probability": {"mean": 0.50},
+            },
+            "previous": {
+                "metric_mae": {"full_dps": 1.1, "max_hit": 0.7, "utility_score": 0.3},
+                "pass_probability": {"mean": 0.42},
+            },
+            "improvement": {"improved": True},
+        },
+    }
+    iterations_path.write_text(
+        f"{json.dumps(record_1)}\n{json.dumps(record_2)}\n",
+        encoding="utf-8",
+    )
+
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        data_path=data_path,
+        output_format="human",
+        history=5,
+    )
+    result = ml_loop.status_loop(args)
+    assert result == 0
+
+    output = capsys.readouterr().out
+    assert "ML Loop Status: status-human" in output
+    assert "Latest vs Previous (latest - previous):" in output
+    assert "pass_prob_mean" in output
+    assert "+0.0800" in output
+    assert "full_dps_mae" in output
+    assert "-0.2000" in output
+    assert "Recent iterations:" in output
+    assert "Best pass_probability.mean so far:" in output
+    assert "Last generation: status=completed" in output
+    assert "verified=3/5" in output
+    assert "reason=N/A" in output
+    assert "run_status" in output
+    assert "verified/attempted" in output
+
+
+def test_status_loop_json_format_returns_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    loop_id = "status-json"
+    data_path = tmp_path / "data"
+    loop_root = data_path / "ml_loops" / loop_id
+    loop_root.mkdir(parents=True, exist_ok=True)
+    state_path = loop_root / ml_loop.STATE_FILENAME
+    state = ml_loop._build_initial_state(
+        loop_id, total_iterations=5, seed_start_base=1, seed_window_size=5
+    )
+    state.update({"phase": "idle", "iteration": 3})
+    ml_loop._write_state(state_path, state)
+
+    args = argparse.Namespace(loop_id=loop_id, data_path=data_path, output_format="json", history=5)
+    result = ml_loop.status_loop(args)
+    assert result == 0
+
+    output = capsys.readouterr().out.strip()
+    payload = json.loads(output)
+    assert payload["loop_id"] == loop_id
+    assert payload["iteration"] == 3
+    assert payload["phase"] == "idle"
+
+
+def test_status_loop_human_ignores_malformed_iteration_rows(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    loop_id = "status-malformed"
+    data_path = tmp_path / "data"
+    loop_root = data_path / "ml_loops" / loop_id
+    loop_root.mkdir(parents=True, exist_ok=True)
+    state_path = loop_root / ml_loop.STATE_FILENAME
+    state = ml_loop._build_initial_state(
+        loop_id, total_iterations=None, seed_start_base=1, seed_window_size=5
+    )
+    ml_loop._write_state(state_path, state)
+
+    valid_record = {
+        "iteration": 1,
+        "model": {"model_id": "status-malformed-iter-0001", "promoted": False},
+        "evaluation": {
+            "current": {
+                "metric_mae": {"full_dps": 1.0, "max_hit": 0.5, "utility_score": 0.2},
+                "pass_probability": {"mean": 0.33},
+            },
+            "previous": None,
+            "improvement": {"improved": False},
+        },
+    }
+    iterations_path = loop_root / ml_loop.ITERATIONS_FILENAME
+    iterations_path.write_text(
+        "{not-valid-json}\n" + json.dumps(valid_record) + "\n",
+        encoding="utf-8",
+    )
+
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        data_path=data_path,
+        output_format="human",
+        history=5,
+    )
+    result = ml_loop.status_loop(args)
+    assert result == 0
+
+    output = capsys.readouterr().out
+    assert "ML Loop Status: status-malformed" in output
+    assert "Recent iterations:" in output
+    assert " 1" in output
 
 
 def test_main_dispatches_status(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

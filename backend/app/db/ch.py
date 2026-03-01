@@ -172,6 +172,28 @@ class ClickhouseRepository:
     def __init__(self, client: ClickhouseClient | None = None) -> None:
         self._client = client or get_clickhouse_client()
 
+    def close(self) -> None:
+        client = self._client
+        close_fn = getattr(client, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+                return
+            except Exception:
+                pass
+        disconnect_fn = getattr(client, "disconnect", None)
+        if callable(disconnect_fn):
+            try:
+                disconnect_fn()
+            except Exception:
+                pass
+
+    def __del__(self) -> None:  # pragma: no cover - best effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def insert_build(self, payload: BuildInsertPayload) -> None:
         row = [
             payload.build_id,

@@ -198,6 +198,41 @@ def test_generation_run_summary(tmp_path: Path) -> None:
     assert ml_path.exists()
 
 
+def test_generation_logs_run_phases(tmp_path: Path, caplog) -> None:
+    repo = FakeRepository()
+    evaluator = _fake_evaluator(tmp_path, repo)
+
+    with caplog.at_level(logging.INFO, logger=generation_runner.__name__):
+        generation_runner.run_generation(
+            count=2,
+            seed_start=1,
+            ruleset_id=_ruleset_id(),
+            profile_id="pinnacle",
+            base_path=tmp_path,
+            repo=repo,
+            evaluator=evaluator,
+            metrics_generator=_verified_metrics_generator,
+            run_id="progress-log-run",
+        )
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == generation_runner.__name__ and "progress-log-run" in record.getMessage()
+    ]
+    assert any("starting (mode=" in message for message in messages)
+    assert any("phase=synthesis_complete" in message for message in messages)
+    assert any("phase=selection_complete" in message for message in messages)
+    assert any(
+        "starting PoB evaluation" in message
+        or "has no candidates selected for evaluation" in message
+        for message in messages
+    )
+    assert any("phase=evaluation_complete" in message for message in messages)
+    assert any("phase=archive_complete" in message for message in messages)
+    assert any("phase=artifact_write_start" in message for message in messages)
+
+
 def test_generation_fails_without_verified_metrics(tmp_path: Path) -> None:
     repo = FakeRepository()
     evaluator = _fake_evaluator(tmp_path, repo)
@@ -260,7 +295,8 @@ def test_generation_fails_without_verified_metrics(tmp_path: Path) -> None:
     attempt_records = summary["generation"]["attempt_records"]
     assert attempt_records
     # FL-01: Failed builds ARE now persisted (for ML training)
-    # Previously this was: assert all(record.get("persisted") is False for record in attempt_records)
+    # Previously this was:
+    # assert all(record.get("persisted") is False for record in attempt_records)
     # Now we keep failed builds for ML to learn from
     assert all(record.get("persisted") is True for record in attempt_records)
     # But they should have failed status
@@ -645,8 +681,6 @@ def test_surrogate_missing_model_fallback(tmp_path: Path) -> None:
     )
 
 
-
-
 def test_select_diverse_top_candidates_prioritizes_unique_niches() -> None:
     c1 = _build_candidate_for_selection(
         build_id="niche-1",
@@ -685,7 +719,6 @@ def test_select_diverse_top_candidates_prioritizes_unique_niches() -> None:
     assert [candidate.build_id for candidate in selected] == ["niche-1", "niche-2", "niche-3"]
 
 
-
 def test_select_diverse_top_candidates_fills_duplicates_when_unique_niches_are_exhausted() -> None:
     c1 = _build_candidate_for_selection(
         build_id="niche-1",
@@ -721,8 +754,12 @@ def test_select_diverse_top_candidates_fills_duplicates_when_unique_niches_are_e
     )
 
     selected = generation_runner._select_diverse_top_candidates([c1, c2, c3, c4], top_k=4)
-    assert [candidate.build_id for candidate in selected] == ["niche-1", "niche-2", "niche-3", "niche-1b"]
-
+    assert [candidate.build_id for candidate in selected] == [
+        "niche-1",
+        "niche-2",
+        "niche-3",
+        "niche-1b",
+    ]
 
 
 def test_select_diverse_top_candidates_uses_candidate_fields_when_identity_missing() -> None:

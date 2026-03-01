@@ -7,14 +7,19 @@ BACKEND_RUN ?= VIRTUAL_ENV= $(UV) --project $(BACKEND_DIR) run
 BACKEND_RUN_DEV ?= VIRTUAL_ENV= $(UV) --project $(BACKEND_DIR) run --extra dev
 ML_LOOP_ID ?= ml-loop
 ML_LOOP_ITERATIONS ?= 0
-ML_LOOP_COUNT ?= 20
+ML_LOOP_COUNT ?= 128
 ML_LOOP_DATA_PATH ?= .
+ML_LOOP_STATUS_FORMAT ?= human
 TORCH_CPU_PACKAGES ?= torch torchvision torchaudio
 TORCH_CUDA_PACKAGES ?= torch torchvision torchaudio
 TORCH_CUDA_INDEX_URL ?= https://download.pytorch.org/whl/cu118
 TORCH_CUDA_INDEX_ARG = $(if $(strip $(TORCH_CUDA_INDEX_URL)),--extra-index-url $(TORCH_CUDA_INDEX_URL))
 
-.PHONY: db-up db-down db-init db-check dev backend-dev ui-dev test backend-test ui-test lint backend-lint ui-lint fmt backend-fmt ui-fmt regen-baselines ml-loop-start ml-loop-stop ml-loop-status torch-install-cpu torch-install-cuda torch-verify
+.PHONY: clean db-up db-down db-init db-check dev backend-dev ui-dev test backend-test ui-test lint backend-lint ui-lint fmt backend-fmt ui-fmt regen-baselines ml-loop-start ml-loop-stop ml-loop-status torch-install-cpu torch-install-cuda torch-verify
+
+clean:
+	@echo "Removing ML run/build artifacts under $(ML_LOOP_DATA_PATH)"
+	rm -rf "$(ML_LOOP_DATA_PATH)/runs" "$(ML_LOOP_DATA_PATH)/ml_loops" "$(ML_LOOP_DATA_PATH)/data/builds"
 
 # ClickHouse lifecycle
 
@@ -69,7 +74,7 @@ ml-loop-stop:
 	$(BACKEND_RUN) python -m backend.tools.ml_loop stop --loop-id $(ML_LOOP_ID) --data-path $(ML_LOOP_DATA_PATH)
 
 ml-loop-status:
-	$(BACKEND_RUN) python -m backend.tools.ml_loop status --loop-id $(ML_LOOP_ID) --data-path $(ML_LOOP_DATA_PATH)
+	$(BACKEND_RUN) python -m backend.tools.ml_loop status --loop-id $(ML_LOOP_ID) --data-path $(ML_LOOP_DATA_PATH) --format $(ML_LOOP_STATUS_FORMAT)
 
 # Torch helpers (optional install)
 torch-install-cpu:

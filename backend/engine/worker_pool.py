@@ -1,27 +1,31 @@
 import concurrent.futures
 import itertools
 import json
+import logging
 import queue
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-DEFAULT_WORKER_CMD: Sequence[str] = ("luajit", "PathOfBuilding/worker/worker.lua")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_WORKER_CMD: Sequence[str] = ("luajit", "pob/worker/worker.lua")
 
 WORKER_TERMINATED_ERROR_CODE = -32000
 WORKER_PROTOCOL_ERROR_CODE = -32001
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_luajit_script_path(script_path: Path) -> Path:
     if script_path.is_absolute():
         return script_path
 
-    project_root = Path(__file__).resolve().parents[2]
     candidate_paths = [
         Path.cwd() / script_path,
-        project_root / script_path,
-        project_root / "backend" / script_path,
+        PROJECT_ROOT / script_path,
+        PROJECT_ROOT / "backend" / script_path,
     ]
     for candidate in candidate_paths:
         if candidate.is_file():
@@ -48,15 +52,22 @@ def _normalize_worker_invocation(
     ]
 
     resolved_cwd = worker_cwd
-    is_default_pob_script = (
+    is_legacy_pob_script = (
         resolved_script.name == "worker.lua"
         and resolved_script.parent.name == "worker"
         and resolved_script.parent.parent.name == "PathOfBuilding"
     )
-    if is_default_pob_script:
-        # Worker lua package loading expects PathOfBuilding/src as cwd.
-        if resolved_cwd is None:
+    is_new_pob_script = (
+        resolved_script.name == "worker.lua"
+        and resolved_script.parent.name == "worker"
+        and resolved_script.parent.parent.name == "pob"
+    )
+    if resolved_cwd is None:
+        if is_legacy_pob_script:
+            # Worker lua package loading expects PathOfBuilding/src as cwd.
             resolved_cwd = str(resolved_script.parent.parent / "src")
+        elif is_new_pob_script:
+            resolved_cwd = str(PROJECT_ROOT)
 
     return tuple(normalized_cmd), resolved_cwd
 
@@ -170,16 +181,27 @@ class WorkerProcess:
         if self._process is None:
             return
         self._stop_event.set()
+        process = self._process
         try:
-            if self._process.poll() is None:
-                self._process.terminate()
-                self._process.wait(timeout=wait_timeout)
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=wait_timeout)
         except Exception:
             try:
-                self._process.kill()
+                process.kill()
             except Exception:  # pragma: no cover - fallback path
                 pass
         finally:
+            try:
+                if process.stdin is not None:
+                    process.stdin.close()
+            except Exception:
+                pass
+            try:
+                if process.stdout is not None:
+                    process.stdout.close()
+            except Exception:
+                pass
             self._process = None
         if self._reader_thread is not None:
             self._reader_thread.join(timeout=wait_timeout)
@@ -310,19 +332,69 @@ class WorkerPool:
         self._next_worker = 0
         self._closing = threading.Event()
 
-    def evaluate_batch(self, payloads: Sequence[Any]) -> List[Dict[str, Any]]:
+    def evaluate_batch(
+        self,
+        payloads: Sequence[Any],
+        *,
+        progress_label: str | None = None,
+    ) -> List[Dict[str, Any]]:
         if self._closing.is_set():
             raise WorkerPoolClosedError("worker pool is closed")
         if not payloads:
             return []
         futures: List[concurrent.futures.Future] = []
-        for payload in payloads:
+        future_to_index: dict[concurrent.futures.Future, int] = {}
+        for index, payload in enumerate(payloads):
             worker_idx = self._assign_worker()
-            futures.append(self._executor.submit(self._send_with_retries, worker_idx, payload))
-        results: List[Dict[str, Any]] = []
-        for future in futures:
-            results.append(future.result())
-        return results
+            future = self._executor.submit(self._send_with_retries, worker_idx, payload)
+            futures.append(future)
+            future_to_index[future] = index
+        total = len(futures)
+        results: list[dict[str, Any] | None] = [None] * total
+        pending: set[concurrent.futures.Future] = set(futures)
+        completed = 0
+        batch_started_at = time.monotonic()
+        heartbeat_interval = max(5.0, min(30.0, self._request_timeout / 2.0))
+
+        while pending:
+            done, pending = concurrent.futures.wait(
+                pending,
+                timeout=heartbeat_interval,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done:
+                elapsed = max(0.0, time.monotonic() - batch_started_at)
+                label_prefix = f"{progress_label} " if progress_label else ""
+                logger.warning(
+                    "worker pool batch %sstill running (completed=%d/%d pending=%d elapsed=%.1fs)",
+                    label_prefix,
+                    completed,
+                    total,
+                    len(pending),
+                    elapsed,
+                )
+                continue
+            for future in done:
+                index = future_to_index[future]
+                results[index] = future.result()
+                completed += 1
+
+        if total > 1:
+            elapsed = max(0.0, time.monotonic() - batch_started_at)
+            label_prefix = f"{progress_label} " if progress_label else ""
+            logger.info(
+                "worker pool batch %scompleted (completed=%d elapsed=%.1fs)",
+                label_prefix,
+                total,
+                elapsed,
+            )
+
+        typed_results: List[Dict[str, Any]] = []
+        for result in results:
+            if result is None:
+                raise WorkerProtocolError("worker pool returned incomplete batch results")
+            typed_results.append(result)
+        return typed_results
 
     def close(self) -> None:
         if self._closing.is_set():

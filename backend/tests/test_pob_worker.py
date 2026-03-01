@@ -8,13 +8,11 @@ Tests verify that:
 4. Stats are accurately returned via JSON-RPC protocol
 """
 
-import json
-import pytest
 from pathlib import Path
-from typing import Dict, Any
 
-from backend.engine.worker_pool import WorkerPool, WorkerPoolError
+import pytest
 
+from backend.engine.worker_pool import WorkerPool
 
 # Path to test builds
 TEST_BUILD_DIR = (
@@ -31,7 +29,7 @@ class TestPoBWorker:
         """Create a WorkerPool with PoB LuaJIT worker."""
         pool = WorkerPool(
             num_workers=1,
-            worker_cmd=("luajit", "PathOfBuilding/worker/worker.lua"),
+            worker_cmd=("luajit", "pob/worker/worker.lua"),
             request_timeout=30.0,  # PoB calculations can take time
         )
         yield pool
@@ -174,7 +172,7 @@ class TestPoBCalculationAccuracy:
         """Create a WorkerPool with PoB LuaJIT worker."""
         pool = WorkerPool(
             num_workers=1,
-            worker_cmd=("luajit", "PathOfBuilding/worker/worker.lua"),
+            worker_cmd=("luajit", "pob/worker/worker.lua"),
             request_timeout=30.0,
         )
         yield pool
@@ -220,7 +218,7 @@ if __name__ == "__main__":
     print("Running PoB worker sanity check...")
     pool = WorkerPool(
         num_workers=1,
-        worker_cmd=("luajit", "PathOfBuilding/worker/worker.lua"),
+        worker_cmd=("luajit", "pob/worker/worker.lua"),
         request_timeout=30.0,
     )
 
@@ -235,7 +233,7 @@ if __name__ == "__main__":
         print(f"✓ Worker responded: {list(result.keys())}")
 
         if "result" in result:
-            print(f"✓ Calculation successful")
+            print("✓ Calculation successful")
             metrics = result["result"].get("metrics", {})
             dps = metrics.get("full_dps", 0)
             print(f"✓ DPS calculated: {dps}")
