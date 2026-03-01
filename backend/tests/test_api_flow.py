@@ -725,8 +725,9 @@ def test_ml_loop_status_endpoint_reads_latest_iteration(tmp_path) -> None:
         app.dependency_overrides.clear()
 
 
-
-def test_ml_loop_start_endpoint_spawns_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ml_loop_start_endpoint_spawns_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     ML_LOOP_REGISTRY.clear()
     client, _repo = _prepare_client(tmp_path)
     try:
@@ -739,19 +740,26 @@ def test_ml_loop_start_endpoint_spawns_process(tmp_path: Path, monkeypatch: pyte
             def poll(self) -> None:
                 return None
 
-        def fake_popen(cmd: list[str], stdout: subprocess.Popen | None = None, stderr: subprocess.Popen | None = None) -> FakeProcess:
+        def fake_popen(
+            cmd: list[str],
+            stdout: subprocess.Popen | None = None,
+            stderr: subprocess.Popen | None = None,
+        ) -> FakeProcess:
             calls.append(cmd)
             return FakeProcess()
 
         monkeypatch.setattr("backend.app.main.subprocess.Popen", fake_popen)
-        response = client.post("/ops/ml-loop-start", json={
-            "loop_id": "api-loop",
-            "count": 2,
-            "seed_start": 5,
-            "profile_id": "pinnacle",
-            "surrogate_backend": "cpu",
-            "endless": True,
-        })
+        response = client.post(
+            "/ops/ml-loop-start",
+            json={
+                "loop_id": "api-loop",
+                "count": 2,
+                "seed_start": 5,
+                "profile_id": "pinnacle",
+                "surrogate_backend": "cpu",
+                "endless": True,
+            },
+        )
         assert response.status_code == 200
         payload = response.json()
         assert payload["loop_id"] == "api-loop"
@@ -766,11 +774,13 @@ def test_ml_loop_start_endpoint_spawns_process(tmp_path: Path, monkeypatch: pyte
         app.dependency_overrides.clear()
 
 
-
-def test_ml_loop_stop_endpoint_defaults_to_last_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ml_loop_stop_endpoint_defaults_to_last_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     ML_LOOP_REGISTRY.clear()
     client, _repo = _prepare_client(tmp_path)
     try:
+
         class FakeProcess:
             def __init__(self) -> None:
                 self.pid = 4321
@@ -778,15 +788,20 @@ def test_ml_loop_stop_endpoint_defaults_to_last_loop(tmp_path: Path, monkeypatch
             def poll(self) -> None:
                 return None
 
-        monkeypatch.setattr("backend.app.main.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
-        start_response = client.post("/ops/ml-loop-start", json={
-            "loop_id": "stop-loop",
-            "count": 1,
-            "seed_start": 1,
-            "profile_id": "pinnacle",
-            "surrogate_backend": "cpu",
-            "endless": True,
-        })
+        monkeypatch.setattr(
+            "backend.app.main.subprocess.Popen", lambda *args, **kwargs: FakeProcess()
+        )
+        start_response = client.post(
+            "/ops/ml-loop-start",
+            json={
+                "loop_id": "stop-loop",
+                "count": 1,
+                "seed_start": 1,
+                "profile_id": "pinnacle",
+                "surrogate_backend": "cpu",
+                "endless": True,
+            },
+        )
         assert start_response.status_code == 200
 
         run_calls: list[list[str]] = []

@@ -10,12 +10,14 @@ predictions as ground truth.
 
 from __future__ import annotations
 
+import hashlib
 import json
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from math import exp
+from math import exp, floor
 from pathlib import Path
-from statistics import mean, pstdev
+from statistics import mean, median, pstdev
 from typing import Any, Iterable, Mapping, Sequence
 
 from backend.engine.surrogate.dataset import (
@@ -50,6 +52,19 @@ CROSS_TOKEN_EFFECT_LIMIT = 256
 _TOKEN_SHRINKAGE_PRIOR = 5.0
 TOKEN_LEARNER_RESIDUAL_MEAN = "residual_mean"
 TOKEN_LEARNER_TORCH_SPARSE = "torch_sparse_sgd"
+
+DETERMINISTIC_BALANCE_VERSION = "1.0"
+DETERMINISTIC_BALANCE_SEED = 0
+DETERMINISTIC_BALANCE_KEY_FIELDS = ("class", "main_skill_package")
+DETERMINISTIC_BALANCE_MIN_TOTAL_ROWS = 50
+DETERMINISTIC_BALANCE_MIN_NICHE_COUNT = 5
+DETERMINISTIC_BALANCE_DOMINANT_SHARE = 0.55
+DETERMINISTIC_BALANCE_CAP_FLOOR = 20
+DETERMINISTIC_BALANCE_MEDIAN_MULTIPLIER = 2.0
+DETERMINISTIC_BALANCE_MIN_OUTPUT_ROWS = 30
+DETERMINISTIC_BALANCE_MIN_RETENTION_RATIO = 0.6
+DETERMINISTIC_BALANCE_HASH_SALT = "ep-v4-balance-v1"
+DETERMINISTIC_BALANCE_UNKNOWN_LABEL = _MISSING_SKILL
 
 
 @dataclass(frozen=True)
@@ -289,15 +304,156 @@ class SurrogateModel:
         return _sigmoid(normalized)
 
 
+def _normalize_niche_label(value: Any) -> str:
+    if value is None:
+        return DETERMINISTIC_BALANCE_UNKNOWN_LABEL
+    normalized = str(value).strip()
+    return normalized.lower() if normalized else DETERMINISTIC_BALANCE_UNKNOWN_LABEL
+
+
+def _niche_key_from_row(row: Mapping[str, Any]) -> tuple[str, str]:
+    return (
+        _normalize_niche_label(row.get('class')),
+        _normalize_niche_label(row.get('main_skill_package')),
+    )
+
+
+def _serialize_niche_key(key: tuple[str, str]) -> str:
+    return f"{key[0]}|{key[1]}"
+
+
+def _group_rows_by_niche(
+    rows: Sequence[Mapping[str, Any]]
+) -> dict[tuple[str, str], list[Mapping[str, Any]]]:
+    groups: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        key = _niche_key_from_row(row)
+        groups.setdefault(key, []).append(row)
+    return groups
+
+
+def _serialize_niche_counts(
+    counts: Mapping[tuple[str, str], Sequence[Mapping[str, Any]]]
+) -> dict[str, int]:
+    return {
+        _serialize_niche_key(key): len(values)
+        for key, values in sorted(counts.items())
+    }
+
+
+def _balance_row_rank(row: Mapping[str, Any]) -> int:
+    build_id = str(row.get('build_id') or '')
+    scenario_id = str(row.get('scenario_id') or '')
+    balance_str = f"{build_id}|{scenario_id}|{DETERMINISTIC_BALANCE_HASH_SALT}"
+    digest = hashlib.sha256(balance_str.encode('utf-8')).hexdigest()
+    return int(digest, 16)
+
+
+def _apply_deterministic_balance(
+    rows: Sequence[Mapping[str, Any]]
+) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
+    original_rows = list(rows)
+    total_rows = len(original_rows)
+    counts = _group_rows_by_niche(original_rows)
+    niche_counts_before = _serialize_niche_counts(counts)
+    eligible_niches = {
+        key: values
+        for key, values in counts.items()
+        if len(values) >= DETERMINISTIC_BALANCE_MIN_NICHE_COUNT
+    }
+    eligible_count = len(eligible_niches)
+    dominant_count = max((len(group) for group in counts.values()), default=0)
+    dominant_share = (dominant_count / total_rows) if total_rows else 0.0
+    final_rows = original_rows
+    gating_passed = False
+    fallback = False
+    cap_value: int | None = None
+    reason = ''
+    if total_rows < DETERMINISTIC_BALANCE_MIN_TOTAL_ROWS:
+        reason = (
+            f"total rows {total_rows} below minimum {DETERMINISTIC_BALANCE_MIN_TOTAL_ROWS}"
+        )
+    elif eligible_count < 2:
+        reason = f"eligible niches {eligible_count} below minimum 2"
+    elif dominant_share <= DETERMINISTIC_BALANCE_DOMINANT_SHARE:
+        reason = (
+            f"dominant share {dominant_share:.3f} <= {DETERMINISTIC_BALANCE_DOMINANT_SHARE}"
+        )
+    else:
+        gating_passed = True
+        eligible_counts = [len(values) for values in eligible_niches.values()]
+        median_value = median(eligible_counts)
+        cap_value = max(
+            DETERMINISTIC_BALANCE_CAP_FLOOR,
+            floor(median_value * DETERMINISTIC_BALANCE_MEDIAN_MULTIPLIER),
+        )
+        truncated_rows: list[Mapping[str, Any]] = []
+        for key, group in counts.items():
+            if key in eligible_niches and len(group) > cap_value:
+                selected = sorted(group, key=_balance_row_rank)[:cap_value]
+            else:
+                selected = list(group)
+            truncated_rows.extend(selected)
+        output_count = len(truncated_rows)
+        retention_ratio = output_count / total_rows if total_rows else 0.0
+        if output_count < DETERMINISTIC_BALANCE_MIN_OUTPUT_ROWS:
+            fallback = True
+            reason = (
+                f"balanced rows {output_count} below minimum {DETERMINISTIC_BALANCE_MIN_OUTPUT_ROWS}; reverting to original dataset"
+            )
+        elif retention_ratio < DETERMINISTIC_BALANCE_MIN_RETENTION_RATIO:
+            fallback = True
+            reason = (
+                f"retention ratio {retention_ratio:.3f} below threshold {DETERMINISTIC_BALANCE_MIN_RETENTION_RATIO}; reverting to original dataset"
+            )
+        else:
+            reason = (
+                f"dominant share {dominant_share:.3f} > {DETERMINISTIC_BALANCE_DOMINANT_SHARE}"
+            )
+        final_rows = original_rows if fallback else truncated_rows
+    final_count = len(final_rows)
+    retention_ratio = final_count / total_rows if total_rows else 0.0
+    dropped_row_count = total_rows - final_count
+    applied = gating_passed and not fallback and dropped_row_count > 0
+    niche_counts_after = _serialize_niche_counts(_group_rows_by_niche(final_rows))
+    metadata = {
+        'version': DETERMINISTIC_BALANCE_VERSION,
+        'seed': DETERMINISTIC_BALANCE_SEED,
+        'key_fields': list(DETERMINISTIC_BALANCE_KEY_FIELDS),
+        'thresholds': {
+            'min_total_rows': DETERMINISTIC_BALANCE_MIN_TOTAL_ROWS,
+            'min_niche_count': DETERMINISTIC_BALANCE_MIN_NICHE_COUNT,
+            'dominant_share': DETERMINISTIC_BALANCE_DOMINANT_SHARE,
+            'min_output_rows': DETERMINISTIC_BALANCE_MIN_OUTPUT_ROWS,
+            'min_retention_ratio': DETERMINISTIC_BALANCE_MIN_RETENTION_RATIO,
+            'cap_floor': DETERMINISTIC_BALANCE_CAP_FLOOR,
+        },
+        'applied': applied,
+        'reason': reason,
+        'input_row_count': total_rows,
+        'output_row_count': final_count,
+        'dropped_row_count': dropped_row_count,
+        'retention_ratio': retention_ratio,
+        'eligible_niche_count': eligible_count,
+        'cap_per_niche': cap_value if gating_passed else None,
+        'dominant_share_before': dominant_share,
+        'niche_counts_before': niche_counts_before,
+        'niche_counts_after': niche_counts_after,
+    }
+    return final_rows, metadata
+
+
 def train(
     dataset_path: Path | str,
     output_root: Path | str,
     model_id: str | None = None,
     compute_backend: str = BACKEND_PREFERENCE_AUTO,
+    include_failures: bool = True,
 ) -> TrainResult:
     dataset_root = resolve_snapshot_root(Path(dataset_path))
     manifest = _load_manifest(dataset_root)
     rows = list(_load_dataset_rows(dataset_root))
+    rows, balance_meta = _apply_deterministic_balance(rows)
     model_id = model_id or _default_model_id()
     backend_preference = _normalize_backend_preference(compute_backend)
     resolved_backend, fallback_reason = _resolve_compute_backend(backend_preference)
@@ -394,6 +550,105 @@ def train(
         token_learner_backend=token_learner_backend,
     )
 
+    classifier_model = None
+    classifier_metrics = None
+    classifier_meta = {
+        "classifier_enabled": include_failures,
+        "classifier_status": "disabled" if not include_failures else "skipped",
+        "classifier_skip_reason": (
+            "include_failures disabled" if not include_failures else None
+        ),
+        "classifier_train_samples": 0,
+        "classifier_label_distribution": {},
+        "classifier_cv_requested_folds": 0,
+        "classifier_cv_used_folds": 0,
+        "classifier_cv_status": "skipped",
+        "classifier_cv_skip_reason": None,
+    }
+    if include_failures:
+        classifier_cv_requested = 5
+        classifier_meta["classifier_cv_requested_folds"] = classifier_cv_requested
+        try:
+            import numpy as np
+            from sklearn.ensemble import RandomForestClassifier
+            from sklearn.model_selection import cross_val_score
+
+            classification_rows = [row for row in rows if row.get("gate_pass") is not None]
+            classifier_meta["classifier_train_samples"] = len(classification_rows)
+            if not classification_rows:
+                classifier_meta["classifier_skip_reason"] = (
+                    "no gate_pass labels available"
+                )
+            else:
+                labels = [1 if row.get("gate_pass") else 0 for row in classification_rows]
+                label_counts = Counter(labels)
+                classifier_meta["classifier_label_distribution"] = dict(sorted(label_counts.items()))
+                if len(label_counts) < 2:
+                    classifier_meta["classifier_skip_reason"] = (
+                        "single-class gate_pass labels: "
+                        + ", ".join(f"{label}={count}" for label, count in label_counts.items())
+                    )
+                else:
+                    feature_cols = list(FEATURE_SIGNAL_KEYS)
+                    X = np.array(
+                        [[row.get(f, 0) or 0 for f in feature_cols] for row in classification_rows]
+                    )
+                    y = np.array(labels)
+
+                    clf = RandomForestClassifier(n_estimators=50, max_depth=10, random_state=42)
+                    clf.fit(X, y)
+
+                    classifier_model = "RandomForestClassifier"
+                    classifier_meta["classifier_status"] = "trained"
+
+                    min_class_count = min(label_counts.values())
+                    cv_used = min(
+                        classifier_cv_requested,
+                        len(classification_rows),
+                        min_class_count,
+                    )
+                    cv_scores: list[float] = []
+                    if cv_used >= 2:
+                        try:
+                            cv_scores = cross_val_score(clf, X, y, cv=cv_used)
+                            classifier_meta["classifier_cv_status"] = "ran"
+                            classifier_meta["classifier_cv_skip_reason"] = None
+                        except Exception as exc:  # pragma: no cover - defensive guard
+                            classifier_meta["classifier_cv_status"] = "skipped"
+                            classifier_meta["classifier_cv_skip_reason"] = (
+                                f"cv error: {exc.__class__.__name__}"
+                            )
+                        finally:
+                            classifier_meta["classifier_cv_used_folds"] = cv_used
+                    else:
+                        classifier_meta["classifier_cv_status"] = "skipped"
+                        classifier_meta["classifier_cv_skip_reason"] = (
+                            "insufficient labeled samples for requested cv"
+                        )
+                        classifier_meta["classifier_cv_used_folds"] = cv_used
+
+                    import pickle
+
+                    classifier_path = model_root / "classifier.pkl"
+                    with open(classifier_path, "wb") as f:
+                        pickle.dump(clf, f)
+
+                    classifier_metrics = {
+                        "accuracy": float(clf.score(X, y)),
+                        "train_samples": len(X),
+                    }
+                    if classifier_meta["classifier_cv_status"] == "ran":
+                        classifier_metrics["cv_mean"] = float(np.mean(cv_scores))
+                        classifier_metrics["cv_std"] = float(np.std(cv_scores))
+        except ImportError:
+            classifier_meta["classifier_skip_reason"] = "sklearn unavailable"
+            classifier_meta["classifier_status"] = "skipped"
+        except Exception as exc:
+            classifier_meta["classifier_skip_reason"] = (
+                f"classifier processing failed: {exc.__class__.__name__}"
+            )
+            classifier_meta["classifier_status"] = "skipped"
+
     model_path = model_root / _MODEL_FILENAME
     model_path.write_text(json.dumps(model.to_dict(), indent=2), encoding="utf-8")
 
@@ -423,6 +678,12 @@ def train(
         "trained_at_utc": trained_at,
         "source_snapshot_path": str(dataset_root),
     }
+    meta_payload.update(classifier_meta)
+    meta_payload["deterministic_balance"] = balance_meta
+    if classifier_model and classifier_metrics:
+        meta_payload["classifier"] = classifier_model
+        meta_payload["classifier_metrics"] = classifier_metrics
+
     meta_path = model_root / _META_FILENAME
     meta_path.write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
 

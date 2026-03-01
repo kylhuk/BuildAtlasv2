@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import xml.etree.ElementTree as ET
 import zlib
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass, replace
@@ -11,6 +12,7 @@ from typing import Any, Dict, List
 from backend.app.api.errors import APIError
 from backend.app.api.models import BuildStatus
 from backend.app.db.ch import ClickhouseRepository, ScenarioMetricRow
+from backend.app.settings import settings
 from backend.engine.artifacts.store import read_build_artifacts, write_build_artifacts
 from backend.engine.evaluation.gates import evaluate_gates
 from backend.engine.evaluation.normalized import NormalizedMetrics, map_worker_output
@@ -33,15 +35,55 @@ class BuildEvaluator:
         *,
         profiles_requiring_non_stub_metrics: Sequence[str] | None = None,
         profiles_requiring_worker_metrics: Sequence[str] | None = None,
+        worker_cmd: str | None = None,
+        worker_args: str | None = None,
+        worker_cwd: str | None = None,
+        worker_pool_size: int | None = None,
     ) -> None:
         self._repo = repo
         self._base_path = base_path
+
+        # Worker configuration (from settings or provided)
+        self._worker_cmd = worker_cmd or settings.pob_worker_cmd
+        raw_args = (worker_args or settings.pob_worker_args).split()
+        project_root = Path(__file__).resolve().parents[3]
+        if self._worker_cmd in {"luajit", "luajit.exe"} and raw_args:
+            script_path = project_root / raw_args[0]
+            if script_path.exists() and script_path.is_file():
+                raw_args[0] = str(script_path)
+        self._worker_args = raw_args
+        self._worker_pool_size = worker_pool_size or settings.pob_worker_pool_size
+        # Make worker_cwd absolute to ensure it works regardless of parent process working directory
+        worker_cwd_value = worker_cwd if worker_cwd is not None else settings.pob_worker_cwd
+        if worker_cwd_value:
+            worker_cwd_value = str(project_root / worker_cwd_value)
+        self._worker_cwd = worker_cwd_value.strip() if worker_cwd_value is not None else None
+
         self._profiles_requiring_non_stub_metrics: set[str] = set()
         if profiles_requiring_non_stub_metrics:
             self.register_profiles_requiring_non_stub_metrics(profiles_requiring_non_stub_metrics)
         self._profiles_requiring_worker_metrics: set[str] = set()
         if profiles_requiring_worker_metrics:
             self.register_profiles_requiring_worker_metrics(profiles_requiring_worker_metrics)
+        self._pool: WorkerPool | None = None
+        self._pool_lock = __import__("threading").Lock()
+
+    def _get_worker_pool(self) -> WorkerPool:
+        with self._pool_lock:
+            if self._pool is None:
+                self._pool = WorkerPool(
+                    num_workers=self._worker_pool_size,
+                    worker_cmd=(self._worker_cmd, *self._worker_args),
+                    worker_cwd=(self._worker_cwd or None),
+                    request_timeout=25.0,
+                )
+            return self._pool
+
+    def close(self) -> None:
+        with self._pool_lock:
+            if self._pool is not None:
+                self._pool.close()
+                self._pool = None
 
     def evaluate_build(self, build_id: str) -> tuple[BuildStatus, List[ScenarioMetricRow]]:
         build = self._repo.get_build(build_id)
@@ -117,6 +159,17 @@ class BuildEvaluator:
                     "gate_thresholds": gate_thresholds,
                 }
             )
+        # FL-03: Add gate_pass to raw_metrics for ML training
+        # Compute gate_pass for each scenario and add to the metrics
+        for template in templates:
+            payload = raw_metrics_map.get(template.scenario_id)
+            if payload is not None and isinstance(payload, dict):
+                normalized = map_worker_output(payload)
+                normalized = adjust_metrics_for_profile(template.profile_id, normalized)
+                gate_eval = evaluate_gates(normalized, template.gate_thresholds)
+                payload["gate_pass"] = gate_eval.gate_pass
+                payload["gate_fail_reasons"] = list(gate_eval.gate_fail_reasons)
+
         write_build_artifacts(
             build_id,
             xml=artifacts.xml,
@@ -263,6 +316,25 @@ class BuildEvaluator:
         worker_required = self._profile_requires_worker_metrics(profile_id)
         fallback_metrics = self._map_raw_metrics(artifacts.raw_metrics)
         filtered_metrics, stub_only = self._filter_stub_metrics(fallback_metrics)
+        scenario_ids = {template.scenario_id for template in templates}
+
+        if not worker_required and "mapping_t16" in scenario_ids and not filtered_metrics:
+            xml_metrics = self._extract_mapping_playerstats_metrics(artifacts)
+            if xml_metrics is not None:
+                return {"mapping_t16": xml_metrics}
+            if not stub_only and scenario_ids == {"mapping_t16"}:
+                raise APIError(
+                    400,
+                    "missing_metrics",
+                    "playerstat metrics unavailable for mapping_t16 scenario",
+                    details={
+                        "build_id": build_id,
+                        "profile_id": profile_id,
+                        "scenario_id": "mapping_t16",
+                        "reason": "missing_player_stats",
+                    },
+                )
+
         if worker_required:
             worker_metrics = self._collect_worker_metrics(
                 build_id,
@@ -272,7 +344,9 @@ class BuildEvaluator:
                 allow_failure=True,
             )
             if worker_metrics:
-                filtered_worker_metrics, worker_stub_only = self._filter_stub_metrics(worker_metrics)
+                filtered_worker_metrics, worker_stub_only = self._filter_stub_metrics(
+                    worker_metrics
+                )
                 if filtered_worker_metrics:
                     return filtered_worker_metrics
                 if worker_stub_only:
@@ -366,10 +440,10 @@ class BuildEvaluator:
         build_id: str,
         build: dict[str, Any],
         artifacts: Any,
-        templates: List[Any],
-        *,
-        allow_failure: bool,
+        templates: list[ScenarioTemplate],
+        allow_failure: bool = False,
     ) -> dict[str, Any]:
+        """Evaluate build via worker pool and collect raw metrics."""
         xml_payload = self._extract_xml_payload(artifacts)
         if not xml_payload:
             return {}
@@ -385,7 +459,7 @@ class BuildEvaluator:
                 }
             )
 
-        pool = WorkerPool(num_workers=1, request_timeout=25.0)
+        pool = self._get_worker_pool()
         try:
             responses = pool.evaluate_batch(payloads)
         except WorkerPoolError as exc:
@@ -397,8 +471,6 @@ class BuildEvaluator:
                 f"worker evaluation failed for build {build_id}",
                 details=str(exc),
             ) from exc
-        finally:
-            pool.close()
 
         evaluated_at = datetime.now(timezone.utc).isoformat()
         mapped: dict[str, Any] = {}
@@ -457,6 +529,75 @@ class BuildEvaluator:
         if decoded_share_code and "<" in decoded_share_code:
             return decoded_share_code
         return None
+
+    def _extract_mapping_playerstats_metrics(self, artifacts: Any) -> dict[str, Any] | None:
+        xml_payload = self._extract_xml_payload(artifacts)
+        if not xml_payload:
+            return None
+
+        stats: dict[str, float] = {}
+        for node in self._iter_player_stats(xml_payload):
+            stat_name = str(node.get("stat") or "").strip().lower()
+            value = self._parse_player_stat_value(node.get("value"))
+            if not stat_name or value is None:
+                continue
+            stats[stat_name] = value
+
+        full_dps = stats.get("fulldps")
+        max_hit = stats.get("maximumhittaken")
+        if full_dps is None or max_hit is None:
+            return None
+
+        return {
+            "source": "pob_xml_playerstats",
+            "metrics": {
+                "full_dps": full_dps,
+                "max_hit": max_hit,
+            },
+            "defense": {
+                "armour": stats.get("armour"),
+                "evasion": stats.get("evasion"),
+                "resists": {
+                    "fire": stats.get("fireresist"),
+                    "cold": stats.get("coldresist"),
+                    "lightning": stats.get("lightningresist"),
+                    "chaos": stats.get("chaosresist"),
+                },
+            },
+            "resources": {
+                "life": stats.get("life"),
+                "mana": stats.get("mana"),
+            },
+            "reservation": {
+                "reserved_percent": stats.get("reservedpercent"),
+                "available_percent": stats.get("availablepercent"),
+            },
+            "attributes": {
+                "strength": stats.get("str"),
+                "dexterity": stats.get("dex"),
+                "intelligence": stats.get("int"),
+            },
+            "warnings": [],
+        }
+
+    def _iter_player_stats(self, xml_payload: str) -> Sequence[Any]:
+        try:
+            root = ET.fromstring(xml_payload)
+        except ET.ParseError:
+            return []
+        return [node for node in root.findall(".//PlayerStat") if isinstance(node.tag, str)]
+
+    @staticmethod
+    def _parse_player_stat_value(raw_value: Any) -> float | None:
+        if raw_value is None:
+            return None
+        value_str = str(raw_value).strip()
+        if not value_str:
+            return None
+        try:
+            return float(value_str)
+        except ValueError:
+            return None
 
     def _decode_share_code(self, code_payload: str) -> str | None:
         if not code_payload:

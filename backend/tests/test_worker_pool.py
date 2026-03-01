@@ -3,6 +3,7 @@ import queue
 import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import pytest
@@ -86,6 +87,8 @@ class MockSubprocessModule:
     ) -> None:
         self._factory = responder_factory
         self.instances: List[MockProcess] = []
+        self.popen_args: List[tuple[Any, ...]] = []
+        self.popen_kwargs: List[Dict[str, Any]] = []
 
     # pragma: no cover - simplifies signature
     def Popen(  # noqa: N802
@@ -93,6 +96,8 @@ class MockSubprocessModule:
         *args: Any,
         **kwargs: Any,
     ) -> MockProcess:
+        self.popen_args.append(tuple(args))
+        self.popen_kwargs.append(dict(kwargs))
         responder = self._factory()
         process = MockProcess(responder)
         self.instances.append(process)
@@ -231,6 +236,75 @@ def test_malformed_response_triggers_protocol_error_restart() -> None:
     finally:
         pool.close()
     assert len(module.instances) >= 2
+
+
+def test_worker_pool_forwards_worker_cwd_to_subprocess() -> None:
+    def responder_factory() -> Callable[[MockProcess, Dict[str, Any]], None]:
+        def responder(process: MockProcess, request: Dict[str, Any]) -> None:
+            process.stdout.push_line(
+                json.dumps(
+                    {
+                        "id": request["id"],
+                        "ok": True,
+                        "result": {"value": request["params"]["value"]},
+                    }
+                )
+            )
+
+        return responder
+
+    module = MockSubprocessModule(responder_factory)
+    pool = WorkerPool(
+        num_workers=1,
+        worker_cmd=["luajit", "worker.lua"],
+        worker_cwd="/tmp/pob-src",
+        subprocess_module=module,
+    )
+    try:
+        pool.evaluate_batch([{"value": "test"}])
+    finally:
+        pool.close()
+
+    assert module.popen_kwargs[0].get("cwd") == "/tmp/pob-src"
+
+
+def test_worker_pool_resolves_luajit_script_path_and_defaults_cwd() -> None:
+    def responder_factory() -> Callable[[MockProcess, Dict[str, Any]], None]:
+        def responder(process: MockProcess, request: Dict[str, Any]) -> None:
+            process.stdout.push_line(
+                json.dumps(
+                    {
+                        "id": request["id"],
+                        "ok": True,
+                        "result": {
+                            "payload": request["params"],
+                        },
+                    }
+                )
+            )
+
+        return responder
+
+    module = MockSubprocessModule(responder_factory)
+    pool = WorkerPool(
+        num_workers=1,
+        worker_cmd=["luajit", "PathOfBuilding/worker/worker.lua"],
+        request_timeout=0.5,
+        subprocess_module=module,
+    )
+    try:
+        pool.evaluate_batch([{"value": "test"}])
+    finally:
+        pool.close()
+
+    expected_worker_script = str(
+        Path(__file__).resolve().parents[2] / "PathOfBuilding/worker/worker.lua"
+    )
+    assert module.popen_args[0][0][0] == "luajit"
+    assert module.popen_args[0][0][1] == expected_worker_script
+    assert module.popen_kwargs[0].get("cwd") == str(
+        Path(__file__).resolve().parents[2] / "PathOfBuilding/src"
+    )
 
 
 def test_missing_id_response_triggers_protocol_error_restart() -> None:

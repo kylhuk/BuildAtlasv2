@@ -18,5 +18,14 @@ services:
       timeout: 5s
       retries: 5
 
+  # PoB worker image (spawned by backend, not run as service)
+  pob-worker:
+    build:
+      context: ./PathOfBuilding
+      dockerfile: worker/Dockerfile
+    image: pob-worker:latest
+    profiles:
+      - build-only  # Don't start as service, just build the image
+
 volumes:
   clickhouse_data:

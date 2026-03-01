@@ -11,6 +11,7 @@ from backend.app.db.ch import BuildInsertPayload
 from backend.engine.archive import load_archive_artifact
 from backend.engine.artifacts.store import read_build_artifacts
 from backend.engine.generation import runner as generation_runner
+from backend.engine.genome import GenomeV0
 from backend.engine.items.templates import (
     ItemTemplatePlan,
     RepairReport,
@@ -69,7 +70,11 @@ class FakeRepository:
 
 
 def _fake_evaluator(tmp_path: Path, repo: FakeRepository) -> BuildEvaluator:
-    return BuildEvaluator(repo=repo, base_path=tmp_path)
+    return BuildEvaluator(
+        repo=repo,
+        base_path=tmp_path,
+        worker_args="pob_worker/mock_worker.lua",
+    )
 
 
 def _ruleset_id() -> str:
@@ -111,6 +116,41 @@ def _verified_metrics_generator(seed: int, templates: list[Any]) -> dict[str, An
     payload = generation_runner._default_metrics_generator(seed, templates)
     _strip_stub_warnings(payload)
     return payload
+
+
+def _build_candidate_for_selection(
+    *,
+    build_id: str,
+    seed: int,
+    class_name: str,
+    main_skill: str,
+    ascendancy: str = "Chieftain",
+    defense_archetype: str = "armour",
+    identity: dict[str, str] | None = None,
+) -> generation_runner.Candidate:
+    genome = GenomeV0(
+        seed=seed,
+        class_name=class_name,
+        ascendancy=ascendancy,
+        main_skill_package=main_skill,
+        defense_archetype=defense_archetype,
+        budget_tier="endgame",
+        profile_id="pinnacle",
+    )
+    build_details_payload = {"identity": identity} if identity is not None else {}
+    return generation_runner.Candidate(
+        seed=seed,
+        build_id=build_id,
+        main_skill_package=main_skill,
+        class_name=class_name,
+        ascendancy=ascendancy,
+        budget_tier="endgame",
+        failures=[],
+        metrics_payload={},
+        genome=genome,
+        code_payload="",
+        build_details_payload=build_details_payload,
+    )
 
 
 def test_generation_run_summary(tmp_path: Path) -> None:
@@ -193,21 +233,23 @@ def test_generation_fails_without_verified_metrics(tmp_path: Path) -> None:
                 )
         return payload
 
-    summary = generation_runner.run_generation(
-        count=1,
-        seed_start=13,
-        ruleset_id=_ruleset_id(),
-        profile_id="pinnacle",
-        base_path=tmp_path,
-        repo=repo,
-        evaluator=evaluator,
-        run_id="stub-run",
-        metrics_generator=failing_metrics_generator,
-    )
+    with patch.object(evaluator, "_collect_worker_metrics", return_value={}):
+        summary = generation_runner.run_generation(
+            count=1,
+            seed_start=13,
+            ruleset_id=_ruleset_id(),
+            profile_id="pinnacle",
+            base_path=tmp_path,
+            repo=repo,
+            evaluator=evaluator,
+            run_id="stub-run",
+            metrics_generator=failing_metrics_generator,
+        )
 
     assert summary["status"] == "failed"
     reason = summary.get("status_reason")
     assert reason and reason.get("code") == "no_verified_evaluations"
+
     assert summary["evaluation"]["successes"] == 0
     assert summary["evaluation"]["failures"] == summary["evaluation"]["attempted"]
     assert summary["evaluation"]["errors"] == 0
@@ -217,11 +259,13 @@ def test_generation_fails_without_verified_metrics(tmp_path: Path) -> None:
     assert summary["generation"]["records"] == []
     attempt_records = summary["generation"]["attempt_records"]
     assert attempt_records
-    assert all(record.get("persisted") is False for record in attempt_records)
-    assert repo._builds == {}
-    for record in attempt_records:
-        build_dir = tmp_path / "data" / "builds" / record["build_id"]
-        assert not build_dir.exists()
+    # FL-01: Failed builds ARE now persisted (for ML training)
+    # Previously this was: assert all(record.get("persisted") is False for record in attempt_records)
+    # Now we keep failed builds for ML to learn from
+    assert all(record.get("persisted") is True for record in attempt_records)
+    # But they should have failed status
+    assert all(record.get("gate_pass") is False for record in attempt_records)
+    # Note: repo._builds will NOT be empty anymore since we persist failures
 
 
 def test_uber_optimizer_requires_non_stub_metrics(tmp_path: Path) -> None:
@@ -422,17 +466,17 @@ def test_constraints_metadata_recorded_and_persisted(tmp_path: Path) -> None:
         side_effect=worker_metrics_stub,
     ):
         summary = generation_runner.run_generation(
-        count=2,
-        seed_start=10,
-        ruleset_id=_ruleset_id(),
-        profile_id="pinnacle",
-        base_path=tmp_path,
-        repo=repo,
-        evaluator=evaluator,
-        constraints=_budget_constraint_spec(),
-        metrics_generator=_metrics_with_cost,
-        run_id="constraint-run",
-    )
+            count=2,
+            seed_start=10,
+            ruleset_id=_ruleset_id(),
+            profile_id="pinnacle",
+            base_path=tmp_path,
+            repo=repo,
+            evaluator=evaluator,
+            constraints=_budget_constraint_spec(),
+            metrics_generator=_metrics_with_cost,
+            run_id="constraint-run",
+        )
 
     records = summary["generation"]["records"]
     assert len(records) == 2
@@ -599,6 +643,113 @@ def test_surrogate_missing_model_fallback(tmp_path: Path) -> None:
     assert summary["evaluation"]["attempted"] == (
         summary["generation"]["processed"] - total_prechecks
     )
+
+
+
+
+def test_select_diverse_top_candidates_prioritizes_unique_niches() -> None:
+    c1 = _build_candidate_for_selection(
+        build_id="niche-1",
+        seed=1,
+        class_name="Marauder",
+        main_skill="sunder",
+        ascendancy="Chieftain",
+        identity={"class": "Marauder", "main_skill": "sunder"},
+    )
+    c2 = _build_candidate_for_selection(
+        build_id="niche-1b",
+        seed=2,
+        class_name="Marauder",
+        main_skill="sunder",
+        ascendancy="Juggernaut",
+        identity={"class": "Marauder", "main_skill": "sunder"},
+    )
+    c3 = _build_candidate_for_selection(
+        build_id="niche-2",
+        seed=3,
+        class_name="Ranger",
+        main_skill="tornado_shot",
+        ascendancy="Deadeye",
+        identity={"class": "Ranger", "main_skill": "tornado_shot"},
+    )
+    c4 = _build_candidate_for_selection(
+        build_id="niche-3",
+        seed=4,
+        class_name="Witch",
+        main_skill="essence_drain",
+        ascendancy="Elementalist",
+        identity={"class": "Witch", "main_skill": "essence_drain"},
+    )
+
+    selected = generation_runner._select_diverse_top_candidates([c1, c2, c3, c4], top_k=3)
+    assert [candidate.build_id for candidate in selected] == ["niche-1", "niche-2", "niche-3"]
+
+
+
+def test_select_diverse_top_candidates_fills_duplicates_when_unique_niches_are_exhausted() -> None:
+    c1 = _build_candidate_for_selection(
+        build_id="niche-1",
+        seed=1,
+        class_name="Marauder",
+        main_skill="sunder",
+        ascendancy="Chieftain",
+        identity={"class": "Marauder", "main_skill": "sunder"},
+    )
+    c2 = _build_candidate_for_selection(
+        build_id="niche-1b",
+        seed=2,
+        class_name="Marauder",
+        main_skill="sunder",
+        ascendancy="Juggernaut",
+        identity={"class": "Marauder", "main_skill": "sunder"},
+    )
+    c3 = _build_candidate_for_selection(
+        build_id="niche-2",
+        seed=3,
+        class_name="Ranger",
+        main_skill="tornado_shot",
+        ascendancy="Deadeye",
+        identity={"class": "Ranger", "main_skill": "tornado_shot"},
+    )
+    c4 = _build_candidate_for_selection(
+        build_id="niche-3",
+        seed=4,
+        class_name="Witch",
+        main_skill="essence_drain",
+        ascendancy="Elementalist",
+        identity={"class": "Witch", "main_skill": "essence_drain"},
+    )
+
+    selected = generation_runner._select_diverse_top_candidates([c1, c2, c3, c4], top_k=4)
+    assert [candidate.build_id for candidate in selected] == ["niche-1", "niche-2", "niche-3", "niche-1b"]
+
+
+
+def test_select_diverse_top_candidates_uses_candidate_fields_when_identity_missing() -> None:
+    c1 = _build_candidate_for_selection(
+        build_id="missing-1",
+        seed=5,
+        class_name="Ranger",
+        main_skill="tornado_shot",
+        ascendancy="Deadeye",
+        identity=None,
+    )
+    c2 = _build_candidate_for_selection(
+        build_id="missing-2",
+        seed=6,
+        class_name="Marauder",
+        main_skill="sunder",
+        ascendancy="Juggernaut",
+        identity=None,
+    )
+
+    selected = generation_runner._select_diverse_top_candidates([c1, c2], top_k=2)
+    assert [candidate.build_id for candidate in selected] == ["missing-1", "missing-2"]
+    niches = {
+        (candidate.class_name.lower(), candidate.main_skill_package.lower())
+        for candidate in selected
+    }
+    assert niches == {("ranger", "tornado_shot"), ("marauder", "sunder")}
 
 
 def test_optimizer_mode_tracks_parents(tmp_path: Path) -> None:

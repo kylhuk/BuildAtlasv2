@@ -6,8 +6,8 @@ UV ?= uv
 BACKEND_RUN ?= VIRTUAL_ENV= $(UV) --project $(BACKEND_DIR) run
 BACKEND_RUN_DEV ?= VIRTUAL_ENV= $(UV) --project $(BACKEND_DIR) run --extra dev
 ML_LOOP_ID ?= ml-loop
-ML_LOOP_ITERATIONS ?= 1
-ML_LOOP_COUNT ?= 10
+ML_LOOP_ITERATIONS ?= 0
+ML_LOOP_COUNT ?= 20
 ML_LOOP_DATA_PATH ?= .
 TORCH_CPU_PACKAGES ?= torch torchvision torchaudio
 TORCH_CUDA_PACKAGES ?= torch torchvision torchaudio

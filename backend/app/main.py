@@ -403,7 +403,14 @@ def get_build_evaluator(
     repo: ClickhouseRepository = Depends(get_repository),
     base_path: Path = Depends(get_artifact_base_path),
 ) -> BuildEvaluator:
-    return BuildEvaluator(repo=repo, base_path=base_path)
+    return BuildEvaluator(
+        repo=repo,
+        base_path=base_path,
+        worker_cmd=settings.pob_worker_cmd,
+        worker_args=settings.pob_worker_args,
+        worker_cwd=settings.pob_worker_cwd,
+        worker_pool_size=settings.pob_worker_pool_size,
+    )
 
 
 @app.get("/health")

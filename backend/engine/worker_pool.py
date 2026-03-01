@@ -4,12 +4,89 @@ import json
 import queue
 import subprocess
 import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-DEFAULT_WORKER_CMD: Sequence[str] = ("lua", "pob/worker/worker.lua")
+DEFAULT_WORKER_CMD: Sequence[str] = ("luajit", "PathOfBuilding/worker/worker.lua")
 
 WORKER_TERMINATED_ERROR_CODE = -32000
 WORKER_PROTOCOL_ERROR_CODE = -32001
+
+
+def _resolve_luajit_script_path(script_path: Path) -> Path:
+    if script_path.is_absolute():
+        return script_path
+
+    project_root = Path(__file__).resolve().parents[2]
+    candidate_paths = [
+        Path.cwd() / script_path,
+        project_root / script_path,
+        project_root / "backend" / script_path,
+    ]
+    for candidate in candidate_paths:
+        if candidate.is_file():
+            return candidate
+    return script_path
+
+
+def _normalize_worker_invocation(
+    worker_cmd: Sequence[str], worker_cwd: str | None
+) -> tuple[tuple[str, ...], str | None]:
+    if len(worker_cmd) < 2:
+        return tuple(worker_cmd), worker_cwd
+
+    command_name = worker_cmd[0]
+    if command_name not in {"luajit", "luajit.exe"}:
+        return tuple(worker_cmd), worker_cwd
+
+    script = Path(worker_cmd[1])
+    resolved_script = _resolve_luajit_script_path(script)
+    normalized_cmd = [
+        str(worker_cmd[0]),
+        str(resolved_script),
+        *[str(arg) for arg in worker_cmd[2:]],
+    ]
+
+    resolved_cwd = worker_cwd
+    is_default_pob_script = (
+        resolved_script.name == "worker.lua"
+        and resolved_script.parent.name == "worker"
+        and resolved_script.parent.parent.name == "PathOfBuilding"
+    )
+    if is_default_pob_script:
+        # Worker lua package loading expects PathOfBuilding/src as cwd.
+        if resolved_cwd is None:
+            resolved_cwd = str(resolved_script.parent.parent / "src")
+
+    return tuple(normalized_cmd), resolved_cwd
+
+
+def _is_worker_log_line(line: str) -> bool:
+    log_prefixes = (
+        # Original PoB worker prefixes
+        "Loading",
+        "Unicode support detected",
+        "Removing legacy",
+        "Startup time:",
+        "Uniques loaded",
+        "Rares loaded",
+        "Processing tree",
+        "PoB",  # PoB LuaJIT worker status lines (started, exiting, etc.)
+        # Backend PoB worker initialization debug lines
+        "Pre-initialized",
+        "HeadlessWrapper",
+        "Applying",
+        "Global",
+        "Captured",
+        "mainObject",
+        "Calling",
+        "After",
+        "No ",
+        "Workaround",
+        "ERROR",
+        "loadBuildFromXML",
+    )
+    return any(line.startswith(prefix) for prefix in log_prefixes)
 
 
 class WorkerPoolError(Exception):
@@ -39,11 +116,13 @@ class WorkerProcess:
         request_timeout: float,
         subprocess_module: Optional[Any] = None,
         worker_id: int = 0,
+        worker_cwd: str | None = None,
     ) -> None:
         self._cmd = tuple(cmd)
         self._request_timeout = request_timeout
         self._subprocess = subprocess_module or subprocess
         self.worker_id = worker_id
+        self._worker_cwd = worker_cwd
         self._id_counter = itertools.count(1)
         self._lock = threading.Lock()
         self._pending: Dict[int, queue.Queue] = {}
@@ -83,7 +162,8 @@ class WorkerProcess:
             if code == WORKER_PROTOCOL_ERROR_CODE:
                 raise WorkerProtocolError(message)
             if code == WORKER_TERMINATED_ERROR_CODE:
-                raise WorkerCrashedError(message)
+                if message == "worker terminated":
+                    raise WorkerCrashedError(message)
         return response
 
     def close(self, wait_timeout: float = 1.0) -> None:
@@ -118,6 +198,7 @@ class WorkerProcess:
             stdin=self._subprocess.PIPE,
             stdout=self._subprocess.PIPE,
             stderr=self._subprocess.DEVNULL,
+            cwd=self._worker_cwd,
             text=True,
             bufsize=1,
         )
@@ -166,6 +247,9 @@ class WorkerProcess:
             try:
                 decoded = json.loads(line)
             except json.JSONDecodeError as exc:
+                # LuaJIT worker startup may emit plain-text status logs on stdout.
+                if _is_worker_log_line(line):
+                    continue
                 self._notify_pending_protocol_error(f"malformed json response: {exc}")
                 break
             request_id = decoded.get("id")
@@ -202,10 +286,12 @@ class WorkerPool:
         worker_cmd: Optional[Sequence[str]] = None,
         request_timeout: float = 5.0,
         subprocess_module: Optional[Any] = None,
+        worker_cwd: str | None = None,
     ) -> None:
         if num_workers < 1:
             raise ValueError("num_workers must be at least 1")
-        self._worker_cmd = tuple(worker_cmd or DEFAULT_WORKER_CMD)
+        base_cmd = tuple(worker_cmd or DEFAULT_WORKER_CMD)
+        self._worker_cmd, self._worker_cwd = _normalize_worker_invocation(base_cmd, worker_cwd)
         self._request_timeout = request_timeout
         self._subprocess = subprocess_module or subprocess
         self._workers: List[WorkerProcess] = [
@@ -214,6 +300,7 @@ class WorkerPool:
                 request_timeout=self._request_timeout,
                 subprocess_module=self._subprocess,
                 worker_id=i,
+                worker_cwd=self._worker_cwd,
             )
             for i in range(num_workers)
         ]
@@ -272,6 +359,7 @@ class WorkerPool:
                 request_timeout=self._request_timeout,
                 subprocess_module=self._subprocess,
                 worker_id=idx,
+                worker_cwd=self._worker_cwd,
             )
             self._workers[idx] = new_worker
             return new_worker

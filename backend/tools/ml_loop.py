@@ -88,6 +88,41 @@ def _load_state(state_path: Path) -> dict[str, Any]:
     return payload
 
 
+def _seed_window_and_base(state: Mapping[str, Any], args: argparse.Namespace) -> tuple[int, int]:
+    seed_start_base = state.get("seed_start_base")
+    if not isinstance(seed_start_base, int):
+        seed_start_base = args.seed_start
+    seed_window_size = state.get("seed_window_size")
+    if not isinstance(seed_window_size, int):
+        seed_window_size = args.count
+    return seed_start_base, seed_window_size
+
+
+def _ensure_seed_metadata(state_path: Path, state: dict[str, Any], args: argparse.Namespace) -> None:
+    seed_start_base, seed_window_size = _seed_window_and_base(state, args)
+    updates: dict[str, Any] = {}
+    if state.get("seed_start_base") is None:
+        updates["seed_start_base"] = seed_start_base
+    if state.get("seed_window_size") is None:
+        updates["seed_window_size"] = seed_window_size
+    if state.get("next_iteration_seed_start") is None:
+        iterations_done = max(0, state.get("iteration", 0))
+        updates["next_iteration_seed_start"] = seed_start_base + iterations_done * seed_window_size
+    if updates:
+        _persist_state(state_path, state, **updates)
+
+
+def _resolve_iteration_seed_start(
+    state: Mapping[str, Any], iteration: int, args: argparse.Namespace
+) -> int:
+    next_seed = state.get("next_iteration_seed_start")
+    if isinstance(next_seed, int):
+        return next_seed
+    seed_start_base, seed_window_size = _seed_window_and_base(state, args)
+    offset = max(0, iteration - 1)
+    return seed_start_base + offset * seed_window_size
+
+
 def _persist_state(state_path: Path, state: dict[str, Any], **updates: Any) -> dict[str, Any]:
     if updates:
         state.update(updates)
@@ -96,7 +131,12 @@ def _persist_state(state_path: Path, state: dict[str, Any], **updates: Any) -> d
     return state
 
 
-def _build_initial_state(loop_id: str, total_iterations: int | None) -> dict[str, Any]:
+def _build_initial_state(
+    loop_id: str,
+    total_iterations: int | None,
+    seed_start_base: int,
+    seed_window_size: int,
+) -> dict[str, Any]:
     now = _now()
     return {
         "schema_version": STATE_SCHEMA_VERSION,
@@ -114,8 +154,15 @@ def _build_initial_state(loop_id: str, total_iterations: int | None) -> dict[str
         "last_model_id": None,
         "last_model_path": None,
         "last_improvement": None,
+        "seed_start_base": seed_start_base,
+        "seed_window_size": seed_window_size,
+        "last_iteration_seed_start": None,
+        "next_iteration_seed_start": seed_start_base,
+        "failed_iteration": None,
+        "failed_phase": None,
+        "failed_at_utc": None,
+        "last_failure_checkpoint_path": None,
     }
-
 
 def _append_iteration_record(path: Path, record: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -132,6 +179,42 @@ def _count_completed_iterations(iterations_path: Path) -> int:
             count += 1
     return count
 
+
+def _failure_checkpoint_path(loop_root: Path, iteration: int) -> Path:
+    name = f"iter-{iteration:04d}.failure.json"
+    return loop_root / CHECKPOINTS_DIR_NAME / name
+
+
+def _write_failure_checkpoint(
+    loop_root: Path,
+    iteration: int,
+    phase: str,
+    error: str,
+    seed_start: int | None,
+    run_id: str | None,
+    state: Mapping[str, Any],
+    timestamp: str,
+) -> Path:
+    path = _failure_checkpoint_path(loop_root, iteration)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {
+        "iteration": iteration,
+        "phase": phase,
+        "error": error,
+        "seed_start": seed_start,
+        "run_id": run_id,
+        "timestamp_utc": timestamp,
+        "state_context": {
+            "last_run_id": state.get("last_run_id"),
+            "last_snapshot_id": state.get("last_snapshot_id"),
+            "last_model_id": state.get("last_model_id"),
+            "last_model_path": state.get("last_model_path"),
+            "last_iteration_seed_start": state.get("last_iteration_seed_start"),
+            "next_iteration_seed_start": state.get("next_iteration_seed_start"),
+        },
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
 
 def _iteration_checkpoint_path(loop_root: Path, iteration: int) -> Path:
     name = f"iter-{iteration:04d}.json"
@@ -283,22 +366,32 @@ def start_loop(args: argparse.Namespace) -> int:
 
     completed_iterations = _count_completed_iterations(iterations_path)
     start_iteration = completed_iterations + 1
-    if state_path.exists():
+    state_exists = state_path.exists()
+    if state_exists:
         state = _load_state(state_path)
-        if total_iterations is not None and total_iterations <= completed_iterations:
-            _persist_state(
-                state_path,
-                state,
-                status="completed",
-                phase="idle",
-                iteration=completed_iterations,
-                total_iterations=total_iterations,
-                stop_requested=False,
-                last_error=None,
-            )
-            summary_state = _load_state(state_path)
-            print(json.dumps(_build_summary_payload(summary_state)))
-            return 0
+    else:
+        state = _build_initial_state(loop_id, total_iterations, args.seed_start, args.count)
+        _write_state(state_path, state)
+
+    _ensure_seed_metadata(state_path, state, args)
+    state = _load_state(state_path)
+
+    if total_iterations is not None and total_iterations <= completed_iterations:
+        _persist_state(
+            state_path,
+            state,
+            status="completed",
+            phase="idle",
+            iteration=completed_iterations,
+            total_iterations=total_iterations,
+            stop_requested=False,
+            last_error=None,
+        )
+        summary_state = _load_state(state_path)
+        print(json.dumps(_build_summary_payload(summary_state)))
+        return 0
+
+    if state_exists:
         _persist_state(
             state_path,
             state,
@@ -309,13 +402,12 @@ def start_loop(args: argparse.Namespace) -> int:
             stop_requested=False,
             last_error=None,
         )
-    else:
-        state = _build_initial_state(loop_id, total_iterations)
-        _write_state(state_path, state)
 
     stop_triggered = False
     current_iteration = 0
     iteration = start_iteration
+    current_run_id: str | None = None
+    iteration_seed_start: int | None = None
     try:
         while True:
             if total_iterations is not None and iteration > total_iterations:
@@ -326,14 +418,24 @@ def start_loop(args: argparse.Namespace) -> int:
                 stop_triggered = True
                 _persist_state(state_path, state, status="stopped", phase="stopped")
                 break
-            _persist_state(state_path, state, phase="generation", iteration=iteration)
-            run_id = f"{loop_id}-iter-{iteration:04d}"
+            iteration_seed_start = _resolve_iteration_seed_start(state, iteration, args)
+            _, seed_window_size = _seed_window_and_base(state, args)
+            next_seed_start = iteration_seed_start + seed_window_size
+            _persist_state(
+                state_path,
+                state,
+                phase="generation",
+                iteration=iteration,
+                last_iteration_seed_start=iteration_seed_start,
+                next_iteration_seed_start=next_seed_start,
+            )
+            current_run_id = f"{loop_id}-iter-{iteration:04d}"
             run_summary = run_generation(
                 count=args.count,
-                seed_start=args.seed_start,
+                seed_start=iteration_seed_start,
                 ruleset_id=ruleset_id,
                 profile_id=args.profile_id,
-                run_id=run_id,
+                run_id=current_run_id,
                 base_path=data_root,
                 constraints=constraints,
                 run_mode="optimizer",
@@ -438,19 +540,37 @@ def start_loop(args: argparse.Namespace) -> int:
         return 0
     except Exception as exc:
         logger.exception("ml loop %s failed at iteration %s", loop_id, current_iteration)
+        failure_timestamp = _now()
+        failure_phase = "failed"
+        failure_state: dict[str, Any]
         if state_path.exists():
             failure_state = _load_state(state_path)
-            _persist_state(
-                state_path,
-                failure_state,
-                status="failed",
-                phase=failure_state.get("phase", "failed"),
-                last_error=str(exc),
-            )
-            summary_state = _load_state(state_path)
+            failure_phase = failure_state.get("phase") or failure_phase
         else:
-            summary_state = _build_initial_state(loop_id, total_iterations)
-            summary_state.update({"status": "failed", "phase": "failed", "last_error": str(exc)})
+            failure_state = _build_initial_state(loop_id, total_iterations, args.seed_start, args.count)
+            _write_state(state_path, failure_state)
+        failure_checkpoint = _write_failure_checkpoint(
+            loop_root=loop_root,
+            iteration=current_iteration,
+            phase=failure_phase,
+            error=str(exc),
+            seed_start=iteration_seed_start,
+            run_id=current_run_id,
+            state=failure_state,
+            timestamp=failure_timestamp,
+        )
+        _persist_state(
+            state_path,
+            failure_state,
+            status="failed",
+            phase=failure_phase,
+            last_error=str(exc),
+            failed_iteration=current_iteration,
+            failed_phase=failure_phase,
+            failed_at_utc=failure_timestamp,
+            last_failure_checkpoint_path=str(failure_checkpoint),
+        )
+        summary_state = _load_state(state_path)
         print(json.dumps(_build_summary_payload(summary_state)))
         return 1
 

@@ -142,6 +142,7 @@ class Candidate:
     selection_reason: str | None = None
     selected_for_evaluation: bool = False
     evaluation_status: str | None = None
+    gate_pass: bool | None = None
     evaluation_error: dict[str, Any] | None = None
     verified_metrics_payload: Mapping[str, Any] | None = None
     stage_label: str = "random_seed"
@@ -962,17 +963,72 @@ def _item_completeness_precheck_failed(build_details_payload: Mapping[str, Any])
     return True
 
 
-def _candidate_identity_label(candidate: Candidate, field: str) -> str:
+def _normalize_identity_label_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    return normalized or None
+
+
+def _candidate_identity_label(
+    candidate: Candidate,
+    fields: str | Sequence[str],
+    candidate_attr: str | None = None,
+) -> str:
+    if isinstance(fields, str):
+        field_iter: Sequence[str] = (fields,)
+    else:
+        field_iter = fields
     build_details_payload = candidate.build_details_payload
     if isinstance(build_details_payload, Mapping):
         identity = build_details_payload.get("identity")
         if isinstance(identity, Mapping):
-            value = identity.get(field)
-            if value is not None:
-                normalized = str(value).strip().lower()
+            for field in field_iter:
+                normalized = _normalize_identity_label_value(identity.get(field))
                 if normalized:
                     return normalized
+    if candidate_attr:
+        attr_value = getattr(candidate, candidate_attr, None)
+        normalized = _normalize_identity_label_value(attr_value)
+        if normalized:
+            return normalized
     return "unknown"
+
+
+def _candidate_niche_key(candidate: Candidate) -> tuple[str, str]:
+    class_label = _candidate_identity_label(
+        candidate,
+        ("class", "class_name"),
+        candidate_attr="class_name",
+    )
+    main_skill_label = _candidate_identity_label(
+        candidate,
+        ("main_skill", "main_skill_package"),
+        candidate_attr="main_skill_package",
+    )
+    return class_label, main_skill_label
+
+
+def _candidate_skill_label(candidate: Candidate) -> str:
+    return _candidate_identity_label(
+        candidate,
+        ("main_skill", "main_skill_package"),
+        candidate_attr="main_skill_package",
+    )
+
+
+def _candidate_ascendancy_label(candidate: Candidate) -> str:
+    return _candidate_identity_label(candidate, "ascendancy", candidate_attr="ascendancy")
+
+
+def _candidate_defense_label(candidate: Candidate) -> str:
+    label = _candidate_identity_label(candidate, "defense_archetype")
+    if label != "unknown":
+        return label
+    return (
+        _normalize_identity_label_value(getattr(candidate.genome, "defense_archetype", None))
+        or "unknown"
+    )
 
 
 def _select_diverse_top_candidates(
@@ -991,23 +1047,29 @@ def _select_diverse_top_candidates(
     selected: list[Candidate] = []
     selected_build_ids: set[str] = set()
 
-    for candidate in ranked_candidates:
-        if len(selected) >= top_k:
-            break
-        skill = _candidate_identity_label(candidate, "main_skill")
-        ascendancy = _candidate_identity_label(candidate, "ascendancy")
-        defense = _candidate_identity_label(candidate, "defense_archetype")
-        if skill_counts.get(skill, 0) >= skill_cap:
-            continue
-        if ascendancy_counts.get(ascendancy, 0) >= ascendancy_cap:
-            continue
-        if defense_counts.get(defense, 0) >= defense_cap:
-            continue
-        selected.append(candidate)
-        selected_build_ids.add(candidate.build_id)
+    def _increment_counts(candidate: Candidate) -> None:
+        skill = _candidate_skill_label(candidate)
+        ascendancy = _candidate_ascendancy_label(candidate)
+        defense = _candidate_defense_label(candidate)
         skill_counts[skill] = skill_counts.get(skill, 0) + 1
         ascendancy_counts[ascendancy] = ascendancy_counts.get(ascendancy, 0) + 1
         defense_counts[defense] = defense_counts.get(defense, 0) + 1
+
+    def _select_candidate(candidate: Candidate) -> None:
+        selected.append(candidate)
+        selected_build_ids.add(candidate.build_id)
+        _increment_counts(candidate)
+
+    selected_niches: set[tuple[str, str]] = set()
+
+    for candidate in ranked_candidates:
+        if len(selected) >= top_k:
+            break
+        niche = _candidate_niche_key(candidate)
+        if niche in selected_niches:
+            continue
+        _select_candidate(candidate)
+        selected_niches.add(niche)
 
     if len(selected) >= top_k:
         return selected
@@ -1017,8 +1079,26 @@ def _select_diverse_top_candidates(
             break
         if candidate.build_id in selected_build_ids:
             continue
-        selected.append(candidate)
-        selected_build_ids.add(candidate.build_id)
+        skill = _candidate_skill_label(candidate)
+        ascendancy = _candidate_ascendancy_label(candidate)
+        defense = _candidate_defense_label(candidate)
+        if skill_counts.get(skill, 0) >= skill_cap:
+            continue
+        if ascendancy_counts.get(ascendancy, 0) >= ascendancy_cap:
+            continue
+        if defense_counts.get(defense, 0) >= defense_cap:
+            continue
+        _select_candidate(candidate)
+
+    if len(selected) >= top_k:
+        return selected
+
+    for candidate in ranked_candidates:
+        if len(selected) >= top_k:
+            break
+        if candidate.build_id in selected_build_ids:
+            continue
+        _select_candidate(candidate)
 
     return selected
 
@@ -1028,6 +1108,7 @@ def _build_generation_record(
     build_id: str,
     precheck_failures: list[str],
     evaluation_status: str | None,
+    gate_pass: bool | None,
     evaluation_error: dict[str, Any] | None,
     stage_label: str,
     source: str,
@@ -1040,6 +1121,7 @@ def _build_generation_record(
         "build_id": build_id,
         "precheck_failures": precheck_failures,
         "evaluation_status": evaluation_status,
+        "gate_pass": gate_pass,
         "evaluation_error": evaluation_error,
         "stage_label": stage_label,
         "source": source,
@@ -1431,6 +1513,8 @@ def run_generation(
             _persist_candidate(candidate)
             status, rows = evaluator.evaluate_build(candidate.build_id)
             candidate.evaluation_status = status.value
+            if rows:
+                candidate.gate_pass = all(getattr(row, "gate_pass", True) for row in rows)
             candidate.verified_metrics_payload = _metrics_payload_from_scenario_rows(rows)
             evaluation_rows.extend(rows)
             if status is BuildStatus.evaluated:
@@ -1443,7 +1527,6 @@ def run_generation(
                     )
             else:
                 evaluation_failures += 1
-                _cleanup_candidate(candidate)
             evaluation_records.append(
                 {
                     "build_id": candidate.build_id,
@@ -1466,7 +1549,7 @@ def run_generation(
             )
             evaluation_errors += 1
             evaluation_failures += 1
-            _cleanup_candidate(candidate)
+            candidate.evaluation_status = BuildStatus.failed.value
 
     valid_generation_records: list[dict[str, Any]] = []
     generation_attempt_records: list[dict[str, Any]] = []
@@ -1511,6 +1594,7 @@ def run_generation(
             candidate.build_id,
             candidate.failures,
             candidate.evaluation_status,
+            candidate.gate_pass,
             candidate.evaluation_error,
             candidate.stage_label,
             candidate.source,

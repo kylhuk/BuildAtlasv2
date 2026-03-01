@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import builtins
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping, Sequence, cast
 
 import pytest
 
@@ -13,6 +15,7 @@ import backend.engine.surrogate.model as surrogate_model
 
 from backend.engine.surrogate.dataset import (
     FEATURE_ITEM_SLOT_COUNT,
+    FEATURE_SCHEMA_VERSION,
     FEATURE_SIGNAL_KEYS,
     FEATURE_IDENTITY_TOKENS,
     FEATURE_IDENTITY_CROSS_TOKENS,
@@ -21,8 +24,10 @@ from backend.engine.surrogate.dataset import (
 from backend.engine.surrogate.model import (
     MODEL_BACKEND,
     MODEL_VERSION,
+    TrainResult,
     evaluate_predictions,
     load_model,
+    _apply_deterministic_balance,
     train,
 )
 
@@ -47,7 +52,7 @@ def _create_build(
         _write_json(build_dir / "build_details.json", build_details)
 
 
-def _build_metrics(full_dps: float, max_hit: float, utility_score: float) -> Mapping[str, object]:
+def _build_metrics(full_dps: float, max_hit: float, utility_score: float) -> dict[str, Any]:
     return {
         "alpha": {
             "metrics": {
@@ -279,6 +284,33 @@ def _create_snapshot(tmp_path: Path):
     return build_dataset_snapshot(data_root, output_root, "snapshot-test")
 
 
+def _create_gate_snapshot(tmp_path: Path, gate_labels: Sequence[bool | None]):
+    data_root = tmp_path / "data"
+    builds_root = data_root / "builds"
+    genome_base = {
+        "schema_version": "v0",
+        "class": "Marauder",
+        "ascendancy": "Chieftain",
+        "defense_archetype": "armour",
+        "budget_tier": "endgame",
+        "profile_id": "gate-snapshot",
+    }
+
+    for idx, gate_pass in enumerate(gate_labels, start=1):
+        metrics = _build_metrics(1500.0 + idx * 100.0, 2200, 1.0)
+        scenario = cast(dict[str, Any], metrics["alpha"])
+        scenario["gate_pass"] = gate_pass
+        _create_build(
+            builds_root,
+            f"gate-build-{idx}",
+            {**genome_base, "seed": idx, "main_skill_package": "sunder"},
+            metrics,
+        )
+
+    output_root = data_root / "datasets" / "ep-v4"
+    return build_dataset_snapshot(data_root, output_root, "gate-snapshot")
+
+
 def _read_rows(snapshot_root: Path) -> list[Mapping[str, object]]:
     dataset_path = snapshot_root / "dataset.jsonl"
     return [
@@ -286,6 +318,169 @@ def _read_rows(snapshot_root: Path) -> list[Mapping[str, object]]:
         for line in dataset_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def _read_meta(result: TrainResult) -> Mapping[str, object]:
+    return json.loads(result.meta_path.read_text(encoding="utf-8"))
+
+
+
+def _make_balancing_row(
+    index: int,
+    class_name: str,
+    main_skill: str,
+) -> dict[str, object]:
+    row: dict[str, object] = {
+        "build_id": f"{class_name}-{main_skill}-{index}",
+        "scenario_id": f"scenario-{main_skill}",
+        "class": class_name,
+        "ascendancy": "Chieftain",
+        "main_skill_package": main_skill,
+        "defense_archetype": "armour",
+        "budget_tier": "endgame",
+        "profile_id": "pinnacle",
+        "full_dps": 1000.0 + float(index),
+        "max_hit": 1500.0 + float(index),
+        "utility_score": 1.0,
+    }
+    for feature in FEATURE_SIGNAL_KEYS:
+        row[feature] = float(index % 3)
+    row[FEATURE_IDENTITY_TOKENS] = []
+    row[FEATURE_IDENTITY_CROSS_TOKENS] = []
+    return row
+
+
+def _build_niche_rows(spec: Sequence[tuple[str, str, int]]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    counter = 0
+    for class_name, skill, count in spec:
+        for _ in range(count):
+            rows.append(_make_balancing_row(counter, class_name, skill))
+            counter += 1
+    return rows
+
+
+def _write_dataset_snapshot_with_rows(
+    root: Path,
+    rows: Sequence[Mapping[str, Any]],
+    snapshot_id: str,
+) -> Path:
+    snapshot_root = root / snapshot_id
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+    dataset_path = snapshot_root / "dataset.jsonl"
+    hasher = hashlib.sha256()
+    with dataset_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            line = json.dumps(row, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            handle.write(line + "\n")
+            hasher.update(line.encode("utf-8"))
+            hasher.update(b"\n")
+    manifest = {
+        "snapshot_id": snapshot_id,
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "row_count": len(rows),
+        "dataset_hash": hasher.hexdigest(),
+        "source_root_path": str(snapshot_root),
+        "generated_at_utc": "2025-01-01T00:00:00Z",
+    }
+    manifest_path = snapshot_root / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return snapshot_root
+
+
+def test_deterministic_balance_noop_for_small_dataset() -> None:
+    rows = _build_niche_rows([("Marauder", "sunder", 40)])
+    balanced, meta = surrogate_model._apply_deterministic_balance(rows)
+
+    assert balanced == rows
+    assert meta["applied"] is False
+    assert "total rows" in meta["reason"]
+    assert meta["input_row_count"] == 40
+    assert meta["output_row_count"] == 40
+    assert meta["eligible_niche_count"] == 1
+
+
+def test_deterministic_balance_caps_dominant_niche() -> None:
+    rows = _build_niche_rows(
+        [
+            ("Marauder", "sunder", 40),
+            ("Ranger", "tornado_shot", 10),
+            ("Witch", "essence_drain", 10),
+        ]
+    )
+    balanced, meta = surrogate_model._apply_deterministic_balance(rows)
+
+    assert meta["applied"] is True
+    assert meta["cap_per_niche"] == 20
+    assert meta["eligible_niche_count"] == 3
+    assert meta["niche_counts_after"]["marauder|sunder"] == 20
+    assert meta["output_row_count"] == 40
+    assert meta["dropped_row_count"] == 20
+    assert meta["retention_ratio"] == pytest.approx(40 / 60)
+    assert "dominant share" in meta["reason"]
+
+
+def test_deterministic_balance_deterministic_across_runs() -> None:
+    rows = _build_niche_rows(
+        [
+            ("Marauder", "sunder", 40),
+            ("Ranger", "tornado_shot", 10),
+            ("Witch", "essence_drain", 10),
+        ]
+    )
+    balanced_a, meta_a = surrogate_model._apply_deterministic_balance(rows)
+    balanced_b, meta_b = surrogate_model._apply_deterministic_balance(rows)
+
+    assert balanced_a == balanced_b
+    assert meta_a == meta_b
+
+
+def test_deterministic_balance_fallback_on_low_retention() -> None:
+    rows = _build_niche_rows(
+        [
+            ("Marauder", "sunder", 50),
+            ("Ranger", "tornado_shot", 5),
+            ("Witch", "essence_drain", 5),
+            ("Shadow", "blade_vortex", 5),
+            ("Templar", "winter_orb", 5),
+        ]
+    )
+    balanced, meta = surrogate_model._apply_deterministic_balance(rows)
+
+    assert meta["applied"] is False
+    assert meta["output_row_count"] == len(rows)
+    assert meta["dropped_row_count"] == 0
+    assert meta["retention_ratio"] == 1.0
+    assert "retention ratio" in meta["reason"]
+    assert meta["niche_counts_before"] == meta["niche_counts_after"]
+    assert meta["eligible_niche_count"] == 5
+
+
+def test_train_records_deterministic_balance_rows(tmp_path: Path) -> None:
+    rows = _build_niche_rows(
+        [
+            ("Marauder", "sunder", 40),
+            ("Ranger", "tornado_shot", 10),
+            ("Witch", "essence_drain", 10),
+        ]
+    )
+    snapshot_root = _write_dataset_snapshot_with_rows(
+        tmp_path / "data", rows, "balanced-train"
+    )
+    output_root = tmp_path / "models" / "ep-v4"
+    result = train(snapshot_root, output_root, model_id="balanced-train-model")
+
+    meta = _read_meta(result)
+    balance_meta = meta["deterministic_balance"]
+    assert balance_meta["applied"] is True
+    assert balance_meta["input_row_count"] == len(rows)
+    assert balance_meta["output_row_count"] == 40
+    assert balance_meta["niche_counts_after"]["marauder|sunder"] == 20
+
+    metrics = json.loads(result.metrics_path.read_text(encoding="utf-8"))
+    assert metrics["row_count"] == balance_meta["output_row_count"]
+    assert result.row_count == metrics["row_count"]
+    assert "dominant share" in balance_meta["reason"]
 
 
 def test_train_creates_artifacts(tmp_path: Path) -> None:
@@ -489,3 +684,180 @@ def test_train_rejects_invalid_backend(tmp_path: Path) -> None:
             model_id="bad-backend-model",
             compute_backend="invalid",
         )
+
+
+def test_train_classifier_skips_when_gate_labels_missing(tmp_path: Path) -> None:
+    pytest.importorskip("sklearn")
+    snapshot = _create_snapshot(tmp_path)
+    output_root = tmp_path / "models" / "ep-v4"
+    result = train(snapshot.dataset_path.parent, output_root, model_id="classifier-no-labels")
+
+    meta = _read_meta(result)
+    assert meta["classifier_enabled"] is True
+    assert meta["classifier_status"] == "skipped"
+    assert meta["classifier_skip_reason"] == "no gate_pass labels available"
+    assert meta["classifier_train_samples"] == 0
+    assert meta["classifier_label_distribution"] == {}
+
+
+def test_train_classifier_skips_with_single_class_labels(tmp_path: Path) -> None:
+    pytest.importorskip("sklearn")
+    snapshot = _create_gate_snapshot(tmp_path, [True, True, True])
+    output_root = tmp_path / "models" / "ep-v4"
+    result = train(snapshot.dataset_path.parent, output_root, model_id="classifier-single-class")
+
+    meta = _read_meta(result)
+    assert meta["classifier_status"] == "skipped"
+    assert meta["classifier_skip_reason"] == "single-class gate_pass labels: 1=3"
+    assert meta["classifier_train_samples"] == 3
+    assert meta["classifier_label_distribution"] == {1: 3}
+
+
+def test_train_classifier_runs_without_cv_when_low_count(tmp_path: Path) -> None:
+    pytest.importorskip("sklearn")
+    snapshot = _create_gate_snapshot(tmp_path, [True, False, True])
+    output_root = tmp_path / "models" / "ep-v4"
+    result = train(snapshot.dataset_path.parent, output_root, model_id="classifier-low-count")
+
+    meta = _read_meta(result)
+    assert meta["classifier_status"] == "trained"
+    assert meta["classifier_cv_status"] == "skipped"
+    assert meta["classifier_cv_skip_reason"] == "insufficient labeled samples for requested cv"
+    assert meta["classifier_cv_used_folds"] == 1
+    assert meta["classifier_train_samples"] == 3
+    assert meta["classifier_cv_requested_folds"] == 5
+    assert meta["classifier_label_distribution"] == {0: 1, 1: 2}
+    assert "classifier" in meta
+    assert "classifier_metrics" in meta
+    classifier_metrics = cast(Mapping[str, Any], meta["classifier_metrics"])
+    assert classifier_metrics["train_samples"] == 3
+
+
+def test_train_classifier_runs_cv_when_enough_labels(tmp_path: Path) -> None:
+    pytest.importorskip("sklearn")
+    labels = [True, False, True, False, True, False]
+    snapshot = _create_gate_snapshot(tmp_path, labels)
+    output_root = tmp_path / "models" / "ep-v4"
+    result = train(
+        snapshot.dataset_path.parent,
+        output_root,
+        model_id="classifier-happy",
+    )
+
+    meta = _read_meta(result)
+    assert meta["classifier_status"] == "trained"
+    assert meta["classifier_cv_status"] == "ran"
+    assert meta["classifier_cv_used_folds"] == 3
+    assert meta["classifier_cv_requested_folds"] == 5
+    assert meta["classifier_train_samples"] == len(labels)
+    assert meta["classifier_label_distribution"] == {0: 3, 1: 3}
+    assert "classifier" in meta
+    assert "classifier_metrics" in meta
+    classifier_metrics = cast(Mapping[str, Any], meta["classifier_metrics"])
+    assert classifier_metrics["train_samples"] == len(labels)
+    assert "cv_mean" in classifier_metrics
+    assert "cv_std" in classifier_metrics
+
+
+def test_pass_probability_contract_with_classifier(tmp_path: Path) -> None:
+    pytest.importorskip("sklearn")
+    labels = [True, False, True, False, True, False]
+    snapshot = _create_gate_snapshot(tmp_path, labels)
+    output_root = tmp_path / "models" / "ep-v4"
+    result = train(
+        snapshot.dataset_path.parent,
+        output_root,
+        model_id="classifier-pass-prob",
+    )
+
+    model = load_model(result.model_path.parent)
+    rows = _read_rows(snapshot.dataset_path.parent)
+    predictions = model.predict_many(rows[:2])
+
+    assert predictions
+    for prediction in predictions:
+        pass_prob = prediction["pass_probability"]
+        assert isinstance(pass_prob, (float, int))
+        assert 0.0 <= pass_prob <= 1.0
+
+
+def test_train_classifier_handles_cross_val_score_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sklearn = pytest.importorskip("sklearn")
+    snapshot = _create_gate_snapshot(tmp_path, [True, False, True, False])
+    output_root = tmp_path / "models" / "ep-v4"
+
+    def _fake_cross_val_score(*args, **kwargs):
+        _ = (args, kwargs)
+        raise ValueError("forced cv failure")
+
+    monkeypatch.setattr(sklearn.model_selection, "cross_val_score", _fake_cross_val_score)
+
+    result = train(
+        snapshot.dataset_path.parent,
+        output_root,
+        model_id="classifier-cv-error",
+    )
+
+    meta = _read_meta(result)
+    assert meta["classifier_status"] == "trained"
+    assert meta["classifier_cv_status"] == "skipped"
+    assert meta["classifier_cv_skip_reason"] == "cv error: ValueError"
+    assert meta["classifier_cv_used_folds"] == 2
+    assert "classifier" in meta
+    assert "classifier_metrics" in meta
+    classifier_metrics = cast(Mapping[str, Any], meta["classifier_metrics"])
+    assert "cv_mean" not in classifier_metrics
+    assert "cv_std" not in classifier_metrics
+
+
+def test_train_classifier_marks_sklearn_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = _create_gate_snapshot(tmp_path, [True, False, True, False])
+    output_root = tmp_path / "models" / "ep-v4"
+
+    original_import = builtins.__import__
+
+    def _import_without_sklearn(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.startswith("sklearn"):
+            raise ImportError("sklearn disabled for test")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _import_without_sklearn)
+
+    result = train(
+        snapshot.dataset_path.parent,
+        output_root,
+        model_id="classifier-sklearn-missing",
+    )
+
+    meta = _read_meta(result)
+    assert meta["classifier_enabled"] is True
+    assert meta["classifier_status"] == "skipped"
+    assert meta["classifier_skip_reason"] == "sklearn unavailable"
+    assert meta["classifier_cv_status"] == "skipped"
+    assert "classifier" not in meta
+    assert "classifier_metrics" not in meta
+
+
+def test_train_classifier_disabled_when_include_failures_false(tmp_path: Path) -> None:
+    snapshot = _create_snapshot(tmp_path)
+    output_root = tmp_path / "models" / "ep-v4"
+    result = train(
+        snapshot.dataset_path.parent,
+        output_root,
+        model_id="classifier-disabled",
+        include_failures=False,
+    )
+
+    meta = _read_meta(result)
+    assert meta["classifier_enabled"] is False
+    assert meta["classifier_status"] == "disabled"
+    assert meta["classifier_skip_reason"] == "include_failures disabled"
+    assert meta["classifier_cv_requested_folds"] == 0
+    assert "classifier" not in meta
+    assert "classifier_metrics" not in meta

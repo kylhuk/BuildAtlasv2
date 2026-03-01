@@ -229,6 +229,9 @@ def _build_row(
         "mana": _numeric(resources_section, "mana"),
         "reserved_percent": _numeric(reservation_section, "reserved_percent"),
         "available_percent": _numeric(reservation_section, "available_percent"),
+        # FL-03: Include gate_pass for ML training
+        "gate_pass": scenario_data.get("gate_pass"),
+        "gate_fail_reasons": scenario_data.get("gate_fail_reasons", []),
     }
 
     for resist in _RESIST_KEYS:
