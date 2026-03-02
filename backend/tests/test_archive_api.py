@@ -1,9 +1,11 @@
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from backend.app.main import app, get_artifact_base_path
 from backend.engine.archive import ArchiveStore, DescriptorAxisSpec, load_archive_artifact, persist_archive
+from backend.engine.archive.store import ARCHIVE_ARTIFACT_SCHEMA_VERSION
 
 
 def test_archive_endpoints(tmp_path: Path) -> None:
@@ -66,6 +68,43 @@ def test_default_axes_persist_transform_metadata(tmp_path: Path) -> None:
     axes = {axis["name"]: axis for axis in artifact["axes"]}
     assert axes["damage"]["transform"] == "log10"
     assert axes["max_hit"]["transform"] == "log10"
+
+
+
+def test_load_archive_artifact_normalizes_missing_axis_transform(tmp_path: Path) -> None:
+    run_id = "legacy-transform"
+    artifact_dir = tmp_path / "runs" / run_id
+    artifact_dir.mkdir(parents=True)
+    payload = {
+        "schema_version": ARCHIVE_ARTIFACT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "created_at": "2025-01-01T00:00:00Z",
+        "axes": [
+            {
+                "name": "legacy_axis",
+                "metric_key": "legacy_metric",
+                "bins": 3,
+                "min_value": 0.0,
+                "max_value": 10.0,
+            }
+        ],
+        "metrics": {
+            "bins_filled": 0,
+            "total_bins": 0,
+            "coverage": 0.0,
+            "qd_score": 0.0,
+        },
+        "bins": [],
+    }
+    artifact_path = artifact_dir / "archive.json"
+    artifact_path.write_text(json.dumps(payload), encoding="utf-8")
+    before = artifact_path.read_text()
+    artifact = load_archive_artifact(run_id, base_path=tmp_path)
+    after = artifact_path.read_text()
+    assert before == after
+    axis_entry = artifact["axes"][0]
+    assert axis_entry["transform"] == "identity"
+
 
 
 def test_archive_frontier_endpoint(tmp_path: Path) -> None:

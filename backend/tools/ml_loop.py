@@ -570,6 +570,7 @@ def start_loop(args: argparse.Namespace) -> int:
     pool_multiplier = _resolve_pool_multiplier(args)
     generate_count = evaluation_budget * pool_multiplier
     args.generate_count = generate_count
+    default_surrogate_top_k = evaluation_budget
     endless_mode = args.iterations == 0
     total_iterations = None if endless_mode else args.iterations
     data_root = Path(args.data_path)
@@ -604,9 +605,18 @@ def start_loop(args: argparse.Namespace) -> int:
         if candidate_pool_size_arg and int(candidate_pool_size_arg) > 0
         else generate_count
     )
-    surrogate_top_k_cli = _coerce_int(getattr(args, "surrogate_top_k", None))
-    if surrogate_top_k_cli is not None and surrogate_top_k_cli <= 0:
-        surrogate_top_k_cli = None
+    surrogate_top_k_arg = getattr(args, "surrogate_top_k", None)
+    surrogate_top_k_cli_value = _coerce_int(surrogate_top_k_arg)
+    surrogate_top_k_disable_requested = (
+        surrogate_top_k_arg is not None
+        and surrogate_top_k_cli_value is not None
+        and surrogate_top_k_cli_value <= 0
+    )
+    surrogate_top_k_override = (
+        surrogate_top_k_cli_value
+        if surrogate_top_k_cli_value is not None and surrogate_top_k_cli_value > 0
+        else None
+    )
     surrogate_exploration_pct = min(
         0.5,
         max(0.0, float(getattr(args, "surrogate_exploration_pct", 0.10))),
@@ -706,9 +716,12 @@ def start_loop(args: argparse.Namespace) -> int:
             surrogate_top_k_value: int | None = None
             surrogate_predictor = None
             if active_surrogate_model_path:
-                surrogate_top_k_value = (
-                    surrogate_top_k_cli if surrogate_top_k_cli is not None else 128
-                )
+                if surrogate_top_k_disable_requested:
+                    surrogate_top_k_value = None
+                elif surrogate_top_k_override is not None:
+                    surrogate_top_k_value = surrogate_top_k_override
+                else:
+                    surrogate_top_k_value = default_surrogate_top_k
                 try:
                     surrogate_model = load_model(active_surrogate_model_path)
                 except Exception as exc:
@@ -1330,10 +1343,7 @@ def _render_status_human(
     summary_lines.append("Recent iterations:")
     metric_headers = " ".join(f"mae.{metric}" for metric in METRIC_TARGETS)
     summary_lines.append(
-        (
-            "iter  run_status   verified/attempted  promoted improved "
-            f"pass_mean  {metric_headers}"
-        )
+        (f"iter  run_status   verified/attempted  promoted improved pass_mean  {metric_headers}")
     )
     tail = records[-max(1, history) :]
     for record in tail:
@@ -1467,7 +1477,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--surrogate-top-k",
         type=int,
         default=None,
-        help="Number of surrogate-ranked candidates to keep when a surrogate is available (default=128)",
+        help="Number of surrogate-ranked candidates to keep when a surrogate is available (default=resolved evaluation budget; <=0 disables pruning)",
     )
     start_parser.add_argument(
         "--surrogate-exploration-pct",

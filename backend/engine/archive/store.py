@@ -288,6 +288,11 @@ def load_archive_artifact(run_id: str, base_path: Path | None = None) -> dict[st
     version = payload.get("schema_version")
     if version != ARCHIVE_ARTIFACT_SCHEMA_VERSION:
         raise ValueError("unsupported archive schema version")
+    axes = payload.get("axes")
+    if isinstance(axes, list):
+        for axis_entry in axes:
+            if isinstance(axis_entry, dict) and "transform" not in axis_entry:
+                axis_entry["transform"] = "identity"
     return payload
 
 

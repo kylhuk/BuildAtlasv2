@@ -21,6 +21,10 @@ clean:
 	@echo "Removing ML run/build artifacts under $(ML_LOOP_DATA_PATH)"
 	rm -rf "$(ML_LOOP_DATA_PATH)/runs" "$(ML_LOOP_DATA_PATH)/ml_loops" "$(ML_LOOP_DATA_PATH)/data/builds"
 
+soft-clean:
+	@echo "Soft-cleaning, deleting /runs and /ml_loops. Keeping /data/builds"
+	rm -rf "$(ML_LOOP_DATA_PATH)/runs" "$(ML_LOOP_DATA_PATH)/ml_loops" 
+
 # ClickHouse lifecycle
 
 db-up:

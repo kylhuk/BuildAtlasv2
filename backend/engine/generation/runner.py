@@ -1698,10 +1698,25 @@ def run_generation(
             if is_degenerate:
                 surrogate_summary["status"] = "fallback"
                 surrogate_summary["fallback_reason"] = "degenerate_predictions"
-                selected_candidates = evaluable_candidates[:]
+                pruned_candidates: list[Candidate] = []
+                if top_k is None:
+                    selected_candidates = evaluable_candidates[:]
+                else:
+                    selection_limit = min(top_k, len(evaluable_candidates))
+                    rng = random.Random(seed_start)
+                    selected_candidates = rng.sample(evaluable_candidates, selection_limit)
+                    selected_ids = {candidate.build_id for candidate in selected_candidates}
+                    pruned_candidates = [
+                        candidate
+                        for candidate in evaluable_candidates
+                        if candidate.build_id not in selected_ids
+                    ]
                 for candidate in selected_candidates:
                     candidate.selected_for_evaluation = True
                     candidate.selection_reason = "surrogate_degenerate"
+                if top_k is not None:
+                    for candidate in pruned_candidates:
+                        candidate.selection_reason = "surrogate_pruned"
             else:
                 ranker = random.Random(seed_start)
                 ranked_candidates = [

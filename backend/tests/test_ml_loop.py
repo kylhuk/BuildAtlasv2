@@ -27,9 +27,21 @@ class _FakeModel:
         ]
 
 
-@pytest.mark.parametrize("iterations", [2])
+@pytest.mark.parametrize(
+    ("iterations", "surrogate_top_k", "expected_surrogate_top_k", "expect_pruned"),
+    [
+        (2, None, 3, True),
+        (2, 0, None, False),
+        (2, 5, 5, True),
+    ],
+)
 def test_start_loop_executes_two_iterations(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, iterations: int
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    iterations: int,
+    surrogate_top_k: int | None,
+    expected_surrogate_top_k: int | None,
+    expect_pruned: bool,
 ) -> None:
     loop_id = "ml-loop-test"
     data_path = tmp_path / "data"
@@ -46,12 +58,16 @@ def test_start_loop_executes_two_iterations(
         constraints_file=None,
         data_path=data_path,
         surrogate_backend="cpu",
+        surrogate_top_k=surrogate_top_k,
     )
+
+    evaluation_budget = args.count
 
     rows = [{"full_dps": 1.0, "max_hit": 2.0, "utility_score": 3.0}]
     last_snapshot_id: str | None = None
     seed_calls: list[int] = []
     surrogate_enabled_calls: list[bool] = []
+    surrogate_summaries: list[dict[str, Any]] = []
 
     last_snapshot_root: Path | None = None
     run_count = 0
@@ -76,16 +92,28 @@ def test_start_loop_executes_two_iterations(
             assert kwargs.get("surrogate_top_k") is None
         else:
             assert surrogate_enabled
-            assert kwargs.get("surrogate_top_k") == 128
+            assert kwargs.get("surrogate_top_k") == expected_surrogate_top_k
+            if isinstance(expected_surrogate_top_k, int):
+                candidate_pool_for_assert = kwargs.get("candidate_pool_size")
+                assert isinstance(candidate_pool_for_assert, int)
+                assert candidate_pool_for_assert > expected_surrogate_top_k
             assert kwargs.get("surrogate_exploration_pct") == 0.10
+        selected_count = kwargs.get("surrogate_top_k")
+        if not isinstance(selected_count, int):
+            selected_count = count_value
+        candidate_pool_size = kwargs.get("candidate_pool_size")
+        pruned_count = 0
+        if isinstance(candidate_pool_size, int) and isinstance(selected_count, int):
+            pruned_count = max(0, candidate_pool_size - selected_count)
         surrogate_summary = {
             "enabled": surrogate_enabled,
             "status": "active" if surrogate_enabled else "disabled",
             "counts": {
-                "selected": kwargs.get("surrogate_top_k") or count_value,
-                "pruned": 0,
+                "selected": selected_count,
+                "pruned": pruned_count,
             },
         }
+        surrogate_summaries.append(surrogate_summary)
         return {
             "run_id": kwargs.get("run_id"),
             "status": "completed",
@@ -179,6 +207,15 @@ def test_start_loop_executes_two_iterations(
 
     assert seed_calls == [1, 13]
     assert surrogate_enabled_calls == [False, True]
+    assert len(surrogate_summaries) == 2
+    second_counts = surrogate_summaries[1].get("counts", {})
+    assert isinstance(second_counts, dict)
+    second_pruned = second_counts.get("pruned")
+    assert isinstance(second_pruned, int)
+    if expect_pruned:
+        assert second_pruned > 0
+    else:
+        assert second_pruned == 0
 
     loop_root = data_path / "ml_loops" / loop_id
     state_path = loop_root / ml_loop.STATE_FILENAME
