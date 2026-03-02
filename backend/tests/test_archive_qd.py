@@ -54,3 +54,29 @@ def test_emitters_and_allocator():
     assert novelty_selected[0].bin_key <= novelty_selected[1].bin_key
 
     assert emitters[2].select(entries, allocation["uncertainty"]) == []
+
+
+
+def test_default_descriptor_axes_use_log_damage_and_max_hit():
+    store = ArchiveStore()
+    assert store.axes[0].metric_key == "full_dps"
+    assert store.axes[0].transform == "log10"
+    assert store.axes[1].metric_key == "max_hit"
+    assert store.axes[1].transform == "log10"
+
+
+def test_high_dps_values_fill_multiple_damage_bins():
+    store = ArchiveStore()
+    constant_max_hit = 1200.0
+    dps_values = [5000.0, 20000.0, 1e7]
+    for idx, dps in enumerate(dps_values):
+        assert store.insert(
+            f"build-{idx}",
+            score=float(idx),
+            descriptor=(dps, constant_max_hit),
+        )
+    entries = store.entries()
+    assert len(entries) == len(dps_values)
+    damage_bins = {entry.bin_key.split("-")[0] for entry in entries}
+    assert len(damage_bins) == len(dps_values)
+

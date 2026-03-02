@@ -5,14 +5,17 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from math import prod
+from math import log10, prod
 from pathlib import Path
-from typing import Any, Sequence, Tuple
+from typing import Any, Literal, Sequence, Tuple
 
 from backend.app.settings import settings
 
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 ARCHIVE_ARTIFACT_SCHEMA_VERSION = 1
+
+AxisTransform = Literal["identity", "log10"]
+LOG10_MIN_INPUT = 1e-9
 
 
 def _coerce_float(value: Any) -> float | None:
@@ -29,15 +32,19 @@ class DescriptorAxisSpec:
     bins: int
     min_value: float
     max_value: float
+    transform: AxisTransform = "identity"
 
     def __post_init__(self) -> None:
         if self.bins < 1:
             raise ValueError("bins must be positive")
+        if self.transform not in ("identity", "log10"):
+            raise ValueError("unknown axis transform")
 
     def index_for_value(self, value: float) -> int:
         if self.max_value <= self.min_value:
             return 0
-        clamped = max(self.min_value, min(self.max_value, value))
+        transformed = self._transform_value(value)
+        clamped = max(self.min_value, min(self.max_value, transformed))
         ratio = (clamped - self.min_value) / (self.max_value - self.min_value)
         index = int(ratio * self.bins)
         if index >= self.bins:
@@ -51,13 +58,34 @@ class DescriptorAxisSpec:
             "bins": self.bins,
             "min_value": self.min_value,
             "max_value": self.max_value,
+            "transform": self.transform,
         }
+
+    def _transform_value(self, value: float) -> float:
+        if self.transform == "log10":
+            return log10(max(value, LOG10_MIN_INPUT))
+        return value
 
 
 DEFAULT_DESCRIPTOR_AXES: Tuple[DescriptorAxisSpec, ...] = (
-    DescriptorAxisSpec("damage", "full_dps", bins=8, min_value=0.0, max_value=4000.0),
-    DescriptorAxisSpec("utility", "utility_score", bins=5, min_value=0.0, max_value=200.0),
+    DescriptorAxisSpec(
+        "damage",
+        "full_dps",
+        bins=8,
+        min_value=0.0,
+        max_value=8.0,
+        transform="log10",
+    ),
+    DescriptorAxisSpec(
+        "max_hit",
+        "max_hit",
+        bins=5,
+        min_value=0.0,
+        max_value=8.0,
+        transform="log10",
+    ),
 )
+
 
 
 @dataclass(frozen=True)

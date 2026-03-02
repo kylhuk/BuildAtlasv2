@@ -9,7 +9,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from statistics import median
+from statistics import median, pstdev
 from time import monotonic
 from typing import Any, Callable, Literal, Mapping, Sequence
 
@@ -70,7 +70,7 @@ DEFAULT_POINT_BUDGETS: dict[str, int] = {
     "endgame": 90,
 }
 SURROGATE_PREDICTION_SCHEMA_VERSION = 1
-
+DEGENERATE_FULL_DPS_STDDEV_THRESHOLD = 1e-6
 
 PRECHECK_CATEGORIES: tuple[str, ...] = (
     "socket_precheck_failed",
@@ -397,6 +397,21 @@ def _log_degenerate_surrogate_predictions(run_id: str, candidates: Sequence[Cand
     )
 
 
+
+
+def _surrogate_predictions_degenerate(candidates: Sequence[Candidate]) -> bool:
+    values = [
+        candidate.predicted_full_dps if candidate.predicted_full_dps is not None else 0.0
+        for candidate in candidates
+    ]
+    if not values:
+        return False
+    unique_values = {value for value in values}
+    if len(unique_values) <= 1:
+        return True
+    stddev = pstdev(values)
+    return stddev <= DEGENERATE_FULL_DPS_STDDEV_THRESHOLD
+
 def _surrogate_prediction_components(
     candidate: Candidate,
 ) -> tuple[float, float | None, float | None]:
@@ -458,12 +473,29 @@ def _select_surrogate_optimizer_elites(
     return selected
 
 
+
+
+def _is_surrogate_model_payload(payload: Mapping[str, Any]) -> bool:
+    required_keys = {
+        'feature_schema_version',
+        'feature_weights',
+        'global_metrics',
+        'main_skill_metrics',
+        'backend',
+    }
+    return all(key in payload for key in required_keys)
+
 def _load_surrogate_predictor(
     path: Path,
 ) -> tuple[str | None, Callable[[Sequence[dict[str, Any]]], Sequence[Any]]]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    payload_model_id = payload.get("model_id") or payload.get("id")
     base_name = path.name
+    payload_model_id: str | None = None
+    payload: Mapping[str, Any] | None = None
+    if path.is_file():
+        loaded_payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded_payload, Mapping):
+            payload = loaded_payload
+            payload_model_id = payload.get("model_id") or payload.get("id")
 
     def _mapping_predictor(
         mapping: Mapping[str, float],
@@ -480,16 +512,22 @@ def _load_surrogate_predictor(
 
         return predictor
 
-    mapping_payload = payload.get("predictions")
-    if not isinstance(mapping_payload, Mapping):
-        mapping_payload = payload.get("scores")
-    if isinstance(mapping_payload, Mapping):
-        model_id = payload_model_id or base_name
-        return model_id, _mapping_predictor(mapping_payload)
+    if payload is not None:
+        mapping_payload = payload.get("predictions")
+        if not isinstance(mapping_payload, Mapping):
+            mapping_payload = payload.get("scores")
+        if isinstance(mapping_payload, Mapping):
+            model_id = payload_model_id or base_name
+            return model_id, _mapping_predictor(mapping_payload)
+        if _is_surrogate_model_payload(payload):
+            model = load_model(path)
+            model_id = payload_model_id or getattr(model, "model_id", None) or base_name
+            return model_id, model.predict_many
 
     model = load_model(path)
     model_id = payload_model_id or getattr(model, "model_id", None) or base_name
     return model_id, model.predict_many
+
 
 
 SocketPlanner = Callable[[SkillCatalog, GenomeV0], SocketPlan]
@@ -1655,52 +1693,61 @@ def run_generation(
                 candidate.pass_probability = probability
                 candidate.predicted_full_dps = candidate.predicted_metrics.get("full_dps", 0.0)
             _log_degenerate_surrogate_predictions(session_id, evaluable_candidates)
-            ranker = random.Random(seed_start)
-            ranked_candidates = [
-                (
-                    candidate,
-                    _surrogate_rank_key(candidate, tie_breaker=ranker.random()),
-                )
-                for candidate in evaluable_candidates
-            ]
-            ranked_candidates.sort(key=lambda item: item[1])
-            scored_candidates = [candidate for candidate, _ in ranked_candidates]
-            if top_k is None:
-                top_candidates = scored_candidates
-                remaining = []
-            else:
-                top_candidates = _select_diverse_top_candidates(
-                    scored_candidates,
-                    top_k=top_k,
-                )
-                selected_ids = {candidate.build_id for candidate in top_candidates}
-                remaining = [
-                    candidate
-                    for candidate in scored_candidates
-                    if candidate.build_id not in selected_ids
-                ]
-            exploration_candidates: list[Candidate] = []
-            if remaining and exploration_pct > 0:
-                target = int(len(remaining) * exploration_pct)
-                if target == 0:
-                    target = 1
-                exploration_count = min(target, len(remaining))
-                rng = random.Random(seed_start)
-                exploration_candidates = rng.sample(remaining, exploration_count)
-            for candidate in top_candidates:
-                candidate.selected_for_evaluation = True
-                candidate.selection_reason = "surrogate_top"
-            for candidate in exploration_candidates:
-                candidate.selected_for_evaluation = True
-                candidate.selection_reason = "surrogate_exploration"
-            pruned_candidates = [
-                candidate for candidate in remaining if candidate not in exploration_candidates
-            ]
-            for candidate in pruned_candidates:
-                candidate.selection_reason = "surrogate_pruned"
-            selected_candidates = top_candidates + exploration_candidates
             surrogate_summary["model_id"] = predictor_model_id
-            surrogate_summary["status"] = "active"
+            is_degenerate = _surrogate_predictions_degenerate(evaluable_candidates)
+            if is_degenerate:
+                surrogate_summary["status"] = "fallback"
+                surrogate_summary["fallback_reason"] = "degenerate_predictions"
+                selected_candidates = evaluable_candidates[:]
+                for candidate in selected_candidates:
+                    candidate.selected_for_evaluation = True
+                    candidate.selection_reason = "surrogate_degenerate"
+            else:
+                ranker = random.Random(seed_start)
+                ranked_candidates = [
+                    (
+                        candidate,
+                        _surrogate_rank_key(candidate, tie_breaker=ranker.random()),
+                    )
+                    for candidate in evaluable_candidates
+                ]
+                ranked_candidates.sort(key=lambda item: item[1])
+                scored_candidates = [candidate for candidate, _ in ranked_candidates]
+                if top_k is None:
+                    top_candidates = scored_candidates
+                    remaining = []
+                else:
+                    top_candidates = _select_diverse_top_candidates(
+                        scored_candidates,
+                        top_k=top_k,
+                    )
+                    selected_ids = {candidate.build_id for candidate in top_candidates}
+                    remaining = [
+                        candidate
+                        for candidate in scored_candidates
+                        if candidate.build_id not in selected_ids
+                    ]
+                exploration_candidates: list[Candidate] = []
+                if remaining and exploration_pct > 0:
+                    target = int(len(remaining) * exploration_pct)
+                    if target == 0:
+                        target = 1
+                    exploration_count = min(target, len(remaining))
+                    rng = random.Random(seed_start)
+                    exploration_candidates = rng.sample(remaining, exploration_count)
+                for candidate in top_candidates:
+                    candidate.selected_for_evaluation = True
+                    candidate.selection_reason = "surrogate_top"
+                for candidate in exploration_candidates:
+                    candidate.selected_for_evaluation = True
+                    candidate.selection_reason = "surrogate_exploration"
+                pruned_candidates = [
+                    candidate for candidate in remaining if candidate not in exploration_candidates
+                ]
+                for candidate in pruned_candidates:
+                    candidate.selection_reason = "surrogate_pruned"
+                selected_candidates = top_candidates + exploration_candidates
+                surrogate_summary["status"] = "active"
             for candidate in evaluable_candidates:
                 candidate.surrogate_prediction_payload = _prediction_payload(
                     candidate,

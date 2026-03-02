@@ -54,38 +54,38 @@ def test_start_loop_executes_two_iterations(
     surrogate_enabled_calls: list[bool] = []
 
     last_snapshot_root: Path | None = None
+    run_count = 0
 
     def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        nonlocal run_count
+        run_count += 1
         assert kwargs.get("run_mode") == "standard"
         assert kwargs.get("count") == 12
         assert kwargs.get("candidate_pool_size") == 12
-        assert kwargs.get("surrogate_top_k") == 3
-        assert kwargs.get("surrogate_exploration_pct") == 0.10
         assert kwargs.get("optimizer_iterations") == 3
         assert kwargs.get("optimizer_elite_count") == 16
         seed_start = kwargs.get("seed_start")
         assert isinstance(seed_start, int)
         seed_calls.append(seed_start)
         count_value = kwargs.get("count")
-        top_k_value = kwargs.get("surrogate_top_k")
         assert isinstance(count_value, int)
-        assert isinstance(top_k_value, int)
         surrogate_enabled = bool(kwargs.get("surrogate_enabled"))
         surrogate_enabled_calls.append(surrogate_enabled)
-        if surrogate_enabled:
-            pruned = count_value - top_k_value
-            assert pruned > 0
-            surrogate_summary = {
-                "enabled": True,
-                "status": "active",
-                "counts": {"selected": top_k_value, "pruned": pruned},
-            }
+        if run_count == 1:
+            assert not surrogate_enabled
+            assert kwargs.get("surrogate_top_k") is None
         else:
-            surrogate_summary = {
-                "enabled": False,
-                "status": "disabled",
-                "counts": {"selected": count_value, "pruned": 0},
-            }
+            assert surrogate_enabled
+            assert kwargs.get("surrogate_top_k") == 128
+            assert kwargs.get("surrogate_exploration_pct") == 0.10
+        surrogate_summary = {
+            "enabled": surrogate_enabled,
+            "status": "active" if surrogate_enabled else "disabled",
+            "counts": {
+                "selected": kwargs.get("surrogate_top_k") or count_value,
+                "pruned": 0,
+            },
+        }
         return {
             "run_id": kwargs.get("run_id"),
             "status": "completed",
@@ -163,7 +163,7 @@ def test_start_loop_executes_two_iterations(
     def fake_evaluate_predictions(*args: object, **kwargs: object) -> EvaluationResult:
         return EvaluationResult(
             row_count=len(rows),
-            metric_mae={"full_dps": 0.0, "max_hit": 0.0, "utility_score": 0.0},
+            metric_mae={"full_dps": 0.0, "max_hit": 0.0},
             pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
         )
 
@@ -325,12 +325,12 @@ def test_start_loop_keeps_champion_when_challenger_regresses(
         if tag == "champion-loop-iter-0002":
             return EvaluationResult(
                 row_count=1,
-                metric_mae={"full_dps": 1.2, "max_hit": 0.2, "utility_score": 0.2},
+                metric_mae={"full_dps": 1.2, "max_hit": 0.2},
                 pass_probability={"mean": 0.4, "std": 0.0, "min": 0.4, "max": 0.4},
             )
         return EvaluationResult(
             row_count=1,
-            metric_mae={"full_dps": 1.0, "max_hit": 0.1, "utility_score": 0.1},
+            metric_mae={"full_dps": 1.0, "max_hit": 0.1},
             pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
         )
 
@@ -488,7 +488,7 @@ def test_start_loop_resumes_with_next_seed(tmp_path: Path, monkeypatch: pytest.M
     def fake_evaluate_predictions(*args: object, **kwargs: object) -> EvaluationResult:
         return EvaluationResult(
             row_count=len(rows),
-            metric_mae={"full_dps": 0.0, "max_hit": 0.0, "utility_score": 0.0},
+            metric_mae={"full_dps": 0.0, "max_hit": 0.0},
             pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
         )
 
@@ -675,7 +675,7 @@ def test_start_loop_retries_snapshot_without_profile_filter_when_empty(
     def fake_evaluate_predictions(*args: object, **kwargs: object) -> EvaluationResult:
         return EvaluationResult(
             row_count=len(rows),
-            metric_mae={"full_dps": 0.0, "max_hit": 0.0, "utility_score": 0.0},
+            metric_mae={"full_dps": 0.0, "max_hit": 0.0},
             pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
         )
 
@@ -891,7 +891,7 @@ def test_start_loop_continues_after_unhealthy_generation(
     def fake_evaluate_predictions(*args: object, **kwargs: object) -> EvaluationResult:
         return EvaluationResult(
             row_count=len(rows),
-            metric_mae={"full_dps": 0.0, "max_hit": 0.0, "utility_score": 0.0},
+            metric_mae={"full_dps": 0.0, "max_hit": 0.0},
             pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
         )
 
@@ -1035,7 +1035,7 @@ def test_start_loop_endless_respects_stop_request(
     def fake_evaluate_predictions(*args: object, **kwargs: object) -> EvaluationResult:
         return EvaluationResult(
             row_count=len(rows),
-            metric_mae={"full_dps": 0.0, "max_hit": 0.0, "utility_score": 0.0},
+            metric_mae={"full_dps": 0.0, "max_hit": 0.0},
             pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
         )
 
@@ -1082,14 +1082,14 @@ def test_start_loop_endless_respects_stop_request(
 def test_compute_improvement_uses_pass_log1p_and_classifier_brier() -> None:
     current = EvaluationResult(
         row_count=1,
-        metric_mae={"full_dps": 1.0, "max_hit": 1.0, "utility_score": 1.0},
+        metric_mae={"full_dps": 1.0, "max_hit": 1.0},
         metric_mae_log1p_pass={"full_dps": 0.40, "max_hit": 0.30},
         classifier_metrics={"brier": 0.20},
         pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
     )
     previous = EvaluationResult(
         row_count=1,
-        metric_mae={"full_dps": 1.0, "max_hit": 1.0, "utility_score": 1.0},
+        metric_mae={"full_dps": 1.0, "max_hit": 1.0},
         metric_mae_log1p_pass={"full_dps": 0.52, "max_hit": 0.41},
         classifier_metrics={"brier": 0.24},
         pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
@@ -1103,14 +1103,14 @@ def test_compute_improvement_uses_pass_log1p_and_classifier_brier() -> None:
 def test_compute_improvement_requires_epsilon_gap() -> None:
     current = EvaluationResult(
         row_count=1,
-        metric_mae={"full_dps": 1.0, "max_hit": 1.0, "utility_score": 1.0},
+        metric_mae={"full_dps": 1.0, "max_hit": 1.0},
         metric_mae_log1p_pass={"full_dps": 0.50, "max_hit": 0.50},
         classifier_metrics={"brier": 0.20},
         pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
     )
     previous = EvaluationResult(
         row_count=1,
-        metric_mae={"full_dps": 1.0, "max_hit": 1.0, "utility_score": 1.0},
+        metric_mae={"full_dps": 1.0, "max_hit": 1.0},
         metric_mae_log1p_pass={"full_dps": 0.50, "max_hit": 0.50},
         classifier_metrics={"brier": 0.20},
         pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
@@ -1122,7 +1122,7 @@ def test_compute_improvement_requires_epsilon_gap() -> None:
 def test_compute_improvement_records_classifier_skip_reason_for_single_class() -> None:
     current = EvaluationResult(
         row_count=1,
-        metric_mae={"full_dps": 0.9, "max_hit": 0.5, "utility_score": 0.2},
+        metric_mae={"full_dps": 0.9, "max_hit": 0.5},
         metric_mae_log1p_pass={"full_dps": 0.35, "max_hit": 0.25},
         classifier_metrics={
             "brier": 0.15,
@@ -1134,7 +1134,7 @@ def test_compute_improvement_records_classifier_skip_reason_for_single_class() -
     )
     previous = EvaluationResult(
         row_count=1,
-        metric_mae={"full_dps": 1.1, "max_hit": 0.7, "utility_score": 0.3},
+        metric_mae={"full_dps": 1.1, "max_hit": 0.7},
         metric_mae_log1p_pass={"full_dps": 0.40, "max_hit": 0.30},
         classifier_metrics={"brier": 0.18},
         pass_probability={"mean": 0.35, "std": 0.0, "min": 0.35, "max": 0.35},
@@ -1232,7 +1232,7 @@ def test_status_loop_human_readable_iteration_comparison(
         },
         "evaluation": {
             "current": {
-                "metric_mae": {"full_dps": 1.1, "max_hit": 0.7, "utility_score": 0.3},
+                "metric_mae": {"full_dps": 1.1, "max_hit": 0.7},
                 "pass_probability": {"mean": 0.42},
             },
             "previous": None,
@@ -1259,11 +1259,11 @@ def test_status_loop_human_readable_iteration_comparison(
         },
         "evaluation": {
             "current": {
-                "metric_mae": {"full_dps": 0.9, "max_hit": 0.6, "utility_score": 0.2},
+                "metric_mae": {"full_dps": 0.9, "max_hit": 0.6},
                 "pass_probability": {"mean": 0.50},
             },
             "previous": {
-                "metric_mae": {"full_dps": 1.1, "max_hit": 0.7, "utility_score": 0.3},
+                "metric_mae": {"full_dps": 1.1, "max_hit": 0.7},
                 "pass_probability": {"mean": 0.42},
             },
             "improvement": {"improved": True},
@@ -1347,7 +1347,7 @@ def test_status_loop_human_reports_classifier_skip_reason_and_best_pass(
         },
         "evaluation": {
             "current": {
-                "metric_mae": {"full_dps": 1.0, "max_hit": 0.5, "utility_score": 0.2},
+                "metric_mae": {"full_dps": 1.0, "max_hit": 0.5},
                 "pass_probability": {"mean": 0.42},
             },
             "previous": None,
@@ -1374,7 +1374,7 @@ def test_status_loop_human_reports_classifier_skip_reason_and_best_pass(
         },
         "evaluation": {
             "current": {
-                "metric_mae": {"full_dps": 0.8, "max_hit": 0.4, "utility_score": 0.15},
+                "metric_mae": {"full_dps": 0.8, "max_hit": 0.4},
                 "pass_probability": {"mean": 0.55},
                 "classifier_metrics": {
                     "brier": 0.12,
@@ -1384,7 +1384,7 @@ def test_status_loop_human_reports_classifier_skip_reason_and_best_pass(
                 },
             },
             "previous": {
-                "metric_mae": {"full_dps": 1.0, "max_hit": 0.5, "utility_score": 0.2},
+                "metric_mae": {"full_dps": 1.0, "max_hit": 0.5},
                 "pass_probability": {"mean": 0.42},
                 "classifier_metrics": {"brier": 0.18},
             },
@@ -1457,7 +1457,7 @@ def test_status_loop_human_ignores_malformed_iteration_rows(
         "model": {"model_id": "status-malformed-iter-0001", "promoted": False},
         "evaluation": {
             "current": {
-                "metric_mae": {"full_dps": 1.0, "max_hit": 0.5, "utility_score": 0.2},
+                "metric_mae": {"full_dps": 1.0, "max_hit": 0.5},
                 "pass_probability": {"mean": 0.33},
             },
             "previous": None,

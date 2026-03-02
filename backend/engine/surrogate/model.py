@@ -32,14 +32,13 @@ from backend.engine.surrogate.dataset import (
 
 MODEL_BACKEND = "ep-v4-baseline"
 MODEL_VERSION = "0.2.0"
-METRIC_TARGETS = ("full_dps", "max_hit", "utility_score")
+METRIC_TARGETS = ("full_dps", "max_hit")
 PASS_METRIC = "full_dps"
 TARGET_TRANSFORM_IDENTITY = "identity"
 TARGET_TRANSFORM_LOG1P = "log1p"
 DEFAULT_TARGET_TRANSFORMS: Mapping[str, str] = {
     "full_dps": TARGET_TRANSFORM_LOG1P,
     "max_hit": TARGET_TRANSFORM_LOG1P,
-    "utility_score": TARGET_TRANSFORM_IDENTITY,
 }
 BACKEND_PREFERENCE_AUTO = "auto"
 BACKEND_PREFERENCE_CPU = "cpu"

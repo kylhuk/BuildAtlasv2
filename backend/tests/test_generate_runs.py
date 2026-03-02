@@ -742,6 +742,37 @@ def test_surrogate_degenerate_predictions_warn(tmp_path: Path, caplog) -> None:
     assert any("candidates" in message for message in warning_messages)
 
 
+def test_surrogate_degenerate_predictions_fallback(tmp_path: Path) -> None:
+    repo = FakeRepository()
+    evaluator = _fake_evaluator(tmp_path, repo)
+
+    def constant_predictor(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [{"metrics": {"full_dps": 5.0}, "pass_probability": None} for _ in rows]
+
+    summary = generation_runner.run_generation(
+        count=3,
+        seed_start=40,
+        ruleset_id=_ruleset_id(),
+        profile_id="pinnacle",
+        base_path=tmp_path,
+        repo=repo,
+        evaluator=evaluator,
+        surrogate_enabled=True,
+        surrogate_predictor=constant_predictor,
+        surrogate_top_k=2,
+        surrogate_exploration_pct=0.0,
+        metrics_generator=_verified_metrics_generator,
+        run_id="degenerate-fallback",
+    )
+
+    surrogate = summary["surrogate"]
+    assert surrogate["status"] == "fallback"
+    assert surrogate["fallback_reason"] == "degenerate_predictions"
+    assert surrogate["counts"]["pruned"] == 0
+    assert surrogate["counts"]["selected"] == surrogate["counts"]["candidates"]
+    assert surrogate["counts"]["selected"] == summary["evaluation"]["attempted"]
+
+
 def test_surrogate_missing_model_fallback(tmp_path: Path) -> None:
     repo = FakeRepository()
     evaluator = _fake_evaluator(tmp_path, repo)

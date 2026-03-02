@@ -274,6 +274,83 @@ def test_load_surrogate_predictor_legacy_mapping(tmp_path: Path) -> None:
     assert scores == [12.5, 2.0]
 
 
+def test_load_surrogate_predictor_legacy_scores_mapping(tmp_path: Path) -> None:
+    payload = {
+        "model_id": "legacy-scores",
+        "scores": {"mace": 2.5},
+        "default": 1.0,
+    }
+    path = tmp_path / "legacy-surrogate-scores.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    model_id, predictor = _load_surrogate_predictor(path)
+
+    assert model_id == "legacy-scores"
+    scores = list(predictor([{"main_skill_package": "mace"}, {"main_skill_package": "other"}]))
+    assert scores == [2.5, 1.0]
+
+
+def test_load_surrogate_predictor_surrogate_model_payload(tmp_path: Path) -> None:
+    payload = {
+        "model_id": "surrogate-latest",
+        "dataset_snapshot_id": "snapshot",
+        "feature_schema_version": "1.0",
+        "global_metrics": {
+            "full_dps": {"mean": 50.0, "std": 1.0, "min": 10.0, "max": 80.0, "count": 1},
+            "max_hit": {"mean": 200.0, "std": 1.0, "min": 150.0, "max": 250.0, "count": 1},
+            "utility_score": {"mean": 1.0, "std": 0.1, "min": 0.0, "max": 2.0, "count": 1},
+        },
+        "main_skill_metrics": {
+            "mapping_t16|alpha|arc": {
+                "full_dps": 120.0,
+                "max_hit": 300.0,
+                "utility_score": 2.0,
+            }
+        },
+        "feature_stats": {},
+        "feature_weights": {},
+        "identity_token_effects": {},
+        "identity_cross_token_effects": {},
+        "pass_metric": "full_dps",
+        "backend": "ep-v4-baseline",
+        "backend_version": "0.1.0",
+        "compute_backend": "cpu",
+        "token_learner_backend": "torch_sparse_sgd",
+        "trained_at_utc": "2025-01-01T00:00:00Z",
+        "target_transforms": {
+            "full_dps": "identity",
+            "max_hit": "identity",
+            "utility_score": "identity",
+        },
+    }
+    path = tmp_path / "surrogate-model.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    model_id, predictor = _load_surrogate_predictor(path)
+
+    assert model_id == "surrogate-latest"
+    rows = [
+        {
+            "scenario_id": "mapping_t16",
+            "profile_id": "alpha",
+            "main_skill_package": "arc",
+        },
+        {
+            "scenario_id": "mapping_t16",
+            "profile_id": "alpha",
+            "main_skill_package": "other",
+        },
+    ]
+    predictions = list(predictor(rows))
+    assert len(predictions) == len(rows)
+    assert all("metrics" in prediction for prediction in predictions)
+    full_dps_values = [prediction["metrics"]["full_dps"] for prediction in predictions]
+    assert len(set(full_dps_values)) > 1
+    assert any(value != 0.0 for value in full_dps_values)
+    assert full_dps_values[1] == 50.0
+    assert full_dps_values[0] > full_dps_values[1]
+
+
 def test_select_surrogate_elites_ignores_missing_pass_probability() -> None:
     high = _make_optimizer_candidate(
         build_id="high",

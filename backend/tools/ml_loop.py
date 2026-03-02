@@ -29,6 +29,7 @@ from backend.engine.surrogate import (
     load_model,
     train,
 )
+from backend.engine.surrogate.model import METRIC_TARGETS
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -603,12 +604,9 @@ def start_loop(args: argparse.Namespace) -> int:
         if candidate_pool_size_arg and int(candidate_pool_size_arg) > 0
         else generate_count
     )
-    surrogate_top_k_arg = getattr(args, "surrogate_top_k", None)
-    resolved_surrogate_top_k = (
-        int(surrogate_top_k_arg)
-        if surrogate_top_k_arg and int(surrogate_top_k_arg) > 0
-        else evaluation_budget
-    )
+    surrogate_top_k_cli = _coerce_int(getattr(args, "surrogate_top_k", None))
+    if surrogate_top_k_cli is not None and surrogate_top_k_cli <= 0:
+        surrogate_top_k_cli = None
     surrogate_exploration_pct = min(
         0.5,
         max(0.0, float(getattr(args, "surrogate_exploration_pct", 0.10))),
@@ -705,6 +703,33 @@ def start_loop(args: argparse.Namespace) -> int:
             )
             generation_started_at = monotonic()
             active_surrogate_model_path = state.get("last_model_path")
+            surrogate_top_k_value: int | None = None
+            surrogate_predictor = None
+            if active_surrogate_model_path:
+                surrogate_top_k_value = (
+                    surrogate_top_k_cli if surrogate_top_k_cli is not None else 128
+                )
+                try:
+                    surrogate_model = load_model(active_surrogate_model_path)
+                except Exception as exc:
+                    logger.warning(
+                        "ml loop %s iteration %d surrogate model load failed for %s; falling back to path-based loading: %s",
+                        loop_id,
+                        iteration,
+                        active_surrogate_model_path,
+                        exc,
+                    )
+                else:
+                    predictor_callable = surrogate_model.predict_many
+
+                    def _surrogate_predictor_wrapper(rows, *, _predictor=predictor_callable):
+                        return _predictor(rows)
+
+                    predictor_name = getattr(surrogate_model, "model_id", None)
+                    _surrogate_predictor_wrapper.__name__ = (
+                        predictor_name if predictor_name else "surrogate_predictor"
+                    )
+                    surrogate_predictor = _surrogate_predictor_wrapper
             run_summary = run_generation(
                 count=generate_count,
                 seed_start=iteration_seed_start,
@@ -716,8 +741,9 @@ def start_loop(args: argparse.Namespace) -> int:
                 run_mode="standard",
                 surrogate_enabled=bool(active_surrogate_model_path),
                 surrogate_model_path=active_surrogate_model_path,
+                surrogate_predictor=surrogate_predictor,
                 candidate_pool_size=resolved_candidate_pool_size,
-                surrogate_top_k=resolved_surrogate_top_k,
+                surrogate_top_k=surrogate_top_k_value,
                 surrogate_exploration_pct=surrogate_exploration_pct,
                 optimizer_iterations=optimizer_iterations,
                 optimizer_elite_count=optimizer_elite_count,
@@ -1264,7 +1290,7 @@ def _render_status_human(
         ("pass_prob_mean", prev_pass_mean, curr_pass_mean, pass_delta, pass_better)
     )
 
-    for metric in ("full_dps", "max_hit", "utility_score"):
+    for metric in METRIC_TARGETS:
         prev_value = _numeric(previous_metric_mae.get(metric))
         curr_value = _numeric(current_metric_mae.get(metric))
         delta = (
@@ -1302,10 +1328,11 @@ def _render_status_human(
 
     summary_lines.append("")
     summary_lines.append("Recent iterations:")
+    metric_headers = " ".join(f"mae.{metric}" for metric in METRIC_TARGETS)
     summary_lines.append(
         (
             "iter  run_status   verified/attempted  promoted improved "
-            "pass_mean  mae.full_dps mae.max_hit mae.utility_score"
+            f"pass_mean  {metric_headers}"
         )
     )
     tail = records[-max(1, history) :]
@@ -1324,16 +1351,16 @@ def _render_status_human(
         row_skip_reason = _classifier_skip_reason_from_payload(current)
         row_pass_mean = _numeric(pass_probability.get("mean"))
         row_pass_display = None if row_skip_reason else row_pass_mean
+        metric_values = " ".join(
+            f"{_format_float(_numeric(metrics.get(metric))):>12}" for metric in METRIC_TARGETS
+        )
         summary_lines.append(
             f"{record.get('iteration', '?'):>4} "
             f"{run_status_value:>11} "
             f"{verified_attempted_value:>19} "
             f"{_format_bool(model.get('promoted')):>9} "
             f"{_format_bool(improvement.get('improved')):>8} "
-            f"{_format_float(row_pass_display):>9} "
-            f"{_format_float(_numeric(metrics.get('full_dps'))):>12} "
-            f"{_format_float(_numeric(metrics.get('max_hit'))):>11} "
-            f"{_format_float(_numeric(metrics.get('utility_score'))):>17}"
+            f"{_format_float(row_pass_display):>9} {metric_values}"
         )
 
     best_record = max(records, key=lambda record: _record_pass_mean(record) or -1.0)
@@ -1440,7 +1467,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--surrogate-top-k",
         type=int,
         default=None,
-        help="Number of surrogate-ranked candidates to keep (default=evaluation budget)",
+        help="Number of surrogate-ranked candidates to keep when a surrogate is available (default=128)",
     )
     start_parser.add_argument(
         "--surrogate-exploration-pct",
