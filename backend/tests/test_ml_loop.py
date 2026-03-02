@@ -51,16 +51,46 @@ def test_start_loop_executes_two_iterations(
     rows = [{"full_dps": 1.0, "max_hit": 2.0, "utility_score": 3.0}]
     last_snapshot_id: str | None = None
     seed_calls: list[int] = []
+    surrogate_enabled_calls: list[bool] = []
 
     last_snapshot_root: Path | None = None
 
     def fake_run_generation(**kwargs: object) -> dict[str, object]:
-        assert kwargs.get("run_mode") == "optimizer"
-        seed_calls.append(int(kwargs.get("seed_start")))
+        assert kwargs.get("run_mode") == "standard"
+        assert kwargs.get("count") == 12
+        assert kwargs.get("candidate_pool_size") == 12
+        assert kwargs.get("surrogate_top_k") == 3
+        assert kwargs.get("surrogate_exploration_pct") == 0.10
+        assert kwargs.get("optimizer_iterations") == 3
+        assert kwargs.get("optimizer_elite_count") == 16
+        seed_start = kwargs.get("seed_start")
+        assert isinstance(seed_start, int)
+        seed_calls.append(seed_start)
+        count_value = kwargs.get("count")
+        top_k_value = kwargs.get("surrogate_top_k")
+        assert isinstance(count_value, int)
+        assert isinstance(top_k_value, int)
+        surrogate_enabled = bool(kwargs.get("surrogate_enabled"))
+        surrogate_enabled_calls.append(surrogate_enabled)
+        if surrogate_enabled:
+            pruned = count_value - top_k_value
+            assert pruned > 0
+            surrogate_summary = {
+                "enabled": True,
+                "status": "active",
+                "counts": {"selected": top_k_value, "pruned": pruned},
+            }
+        else:
+            surrogate_summary = {
+                "enabled": False,
+                "status": "disabled",
+                "counts": {"selected": count_value, "pruned": 0},
+            }
         return {
             "run_id": kwargs.get("run_id"),
             "status": "completed",
             "evaluation": {"attempted": 1, "successes": 1, "failures": 0, "errors": 0},
+            "surrogate": surrogate_summary,
         }
 
     def fake_build_dataset_snapshot(
@@ -69,9 +99,12 @@ def test_start_loop_executes_two_iterations(
         output_root: Path | str,
         snapshot_id: str,
         exclude_stub_rows: bool,
+        profile_id: str | None = None,
+        scenario_id: str | None = None,
     ) -> SnapshotResult:
         nonlocal last_snapshot_id, last_snapshot_root
         assert exclude_stub_rows is True
+        assert profile_id == "pinnacle"
         last_snapshot_id = snapshot_id
         snapshot_root = Path(output_root) / snapshot_id
         last_snapshot_root = snapshot_root
@@ -95,6 +128,7 @@ def test_start_loop_executes_two_iterations(
         output_root: Path | str,
         model_id: str,
         compute_backend: str,
+        **_: object,
     ) -> TrainResult:
         assert last_snapshot_root is not None
         assert Path(dataset_path) == last_snapshot_root
@@ -143,7 +177,8 @@ def test_start_loop_executes_two_iterations(
     result = ml_loop.start_loop(args)
     assert result == 0
 
-    assert seed_calls == [1, 4]
+    assert seed_calls == [1, 13]
+    assert surrogate_enabled_calls == [False, True]
 
     loop_root = data_path / "ml_loops" / loop_id
     state_path = loop_root / ml_loop.STATE_FILENAME
@@ -199,7 +234,7 @@ def test_start_loop_keeps_champion_when_challenger_regresses(
     last_snapshot_root: Path | None = None
 
     def fake_run_generation(**kwargs: object) -> dict[str, object]:
-        assert kwargs.get("run_mode") == "optimizer"
+        assert kwargs.get("run_mode") == "standard"
         return {
             "run_id": kwargs.get("run_id"),
             "status": "completed",
@@ -212,6 +247,8 @@ def test_start_loop_keeps_champion_when_challenger_regresses(
         output_root: Path | str,
         snapshot_id: str,
         exclude_stub_rows: bool,
+        profile_id: str | None = None,
+        scenario_id: str | None = None,
     ) -> SnapshotResult:
         nonlocal last_snapshot_id, last_snapshot_root
         assert exclude_stub_rows is True
@@ -238,6 +275,7 @@ def test_start_loop_keeps_champion_when_challenger_regresses(
         output_root: Path | str,
         model_id: str,
         compute_backend: str,
+        **_: object,
     ) -> TrainResult:
         assert last_snapshot_root is not None
         assert Path(dataset_path) == last_snapshot_root
@@ -372,7 +410,9 @@ def test_start_loop_resumes_with_next_seed(tmp_path: Path, monkeypatch: pytest.M
     seed_calls: list[int] = []
 
     def fake_run_generation(**kwargs: object) -> dict[str, object]:
-        seed_calls.append(int(kwargs.get("seed_start")))
+        seed_start = kwargs.get("seed_start")
+        assert isinstance(seed_start, int)
+        seed_calls.append(seed_start)
         return {
             "run_id": kwargs.get("run_id"),
             "status": "completed",
@@ -385,6 +425,8 @@ def test_start_loop_resumes_with_next_seed(tmp_path: Path, monkeypatch: pytest.M
         output_root: Path | str,
         snapshot_id: str,
         exclude_stub_rows: bool,
+        profile_id: str | None = None,
+        scenario_id: str | None = None,
     ) -> SnapshotResult:
         nonlocal last_snapshot_id, last_snapshot_root
         assert exclude_stub_rows is True
@@ -411,6 +453,7 @@ def test_start_loop_resumes_with_next_seed(tmp_path: Path, monkeypatch: pytest.M
         output_root: Path | str,
         model_id: str,
         compute_backend: str,
+        **_: object,
     ) -> TrainResult:
         assert last_snapshot_root is not None
         assert Path(dataset_path) == last_snapshot_root
@@ -463,7 +506,7 @@ def test_start_loop_resumes_with_next_seed(tmp_path: Path, monkeypatch: pytest.M
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["iteration"] == 2
     assert state["last_iteration_seed_start"] == 42
-    assert state["next_iteration_seed_start"] == 47
+    assert state["next_iteration_seed_start"] == 62
     assert state["status"] == "completed"
 
 
@@ -500,6 +543,8 @@ def test_start_loop_records_failure_checkpoint_on_exception(
         output_root: Path | str,
         snapshot_id: str,
         exclude_stub_rows: bool,
+        profile_id: str | None = None,
+        scenario_id: str | None = None,
     ) -> SnapshotResult:
         raise RuntimeError("boom")
 
@@ -525,7 +570,125 @@ def test_start_loop_records_failure_checkpoint_on_exception(
     assert payload["run_id"] == f"{loop_id}-iter-0001"
     context = payload.get("state_context", {})
     assert context.get("last_run_id") == payload["run_id"]
-    assert context.get("next_iteration_seed_start") == args.seed_start + args.count
+    assert context.get("next_iteration_seed_start") == args.seed_start + (args.count * 4)
+
+
+def test_start_loop_retries_snapshot_without_profile_filter_when_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop_id = "snapshot-filter-retry"
+    data_path = tmp_path / "data"
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        iterations=1,
+        count=2,
+        seed_start=1,
+        profile_id="pinnacle",
+        ruleset_id="ruleset-smoke",
+        scenario_version=None,
+        price_snapshot_id="price",
+        pob_commit=None,
+        constraints_file=None,
+        data_path=data_path,
+        surrogate_backend="cpu",
+    )
+
+    rows = [{"full_dps": 1.0, "max_hit": 2.0, "utility_score": 3.0}]
+    last_snapshot_id: str | None = None
+    last_snapshot_root: Path | None = None
+    snapshot_call_profiles: list[str | None] = []
+
+    def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "completed",
+            "evaluation": {"attempted": 2, "successes": 2, "failures": 0, "errors": 0},
+        }
+
+    def fake_build_dataset_snapshot(
+        *,
+        data_path: Path | str,
+        output_root: Path | str,
+        snapshot_id: str,
+        exclude_stub_rows: bool,
+        profile_id: str | None = None,
+        scenario_id: str | None = None,
+    ) -> SnapshotResult:
+        nonlocal last_snapshot_id, last_snapshot_root
+        assert exclude_stub_rows is True
+        snapshot_call_profiles.append(profile_id)
+        last_snapshot_id = snapshot_id
+        snapshot_root = Path(output_root) / snapshot_id
+        last_snapshot_root = snapshot_root
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        dataset_path = snapshot_root / "dataset.jsonl"
+        dataset_path.write_text("[]", encoding="utf-8")
+        manifest_path = snapshot_root / "manifest.json"
+        manifest_path.write_text("{}", encoding="utf-8")
+        return SnapshotResult(
+            snapshot_id=snapshot_id,
+            dataset_path=dataset_path,
+            manifest_path=manifest_path,
+            row_count=0 if len(snapshot_call_profiles) == 1 else len(rows),
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+            dataset_hash="hash",
+        )
+
+    def fake_train(
+        *,
+        dataset_path: Path | str,
+        output_root: Path | str,
+        model_id: str,
+        compute_backend: str,
+        **_: object,
+    ) -> TrainResult:
+        assert last_snapshot_root is not None
+        assert Path(dataset_path) == last_snapshot_root
+        assert compute_backend == "cpu"
+        model_root = Path(output_root) / model_id
+        model_root.mkdir(parents=True, exist_ok=True)
+        model_path = model_root / "model.json"
+        model_path.write_text("{}", encoding="utf-8")
+        metrics_path = model_root / "metrics.json"
+        metrics_path.write_text("{}", encoding="utf-8")
+        meta_path = model_root / "meta.json"
+        meta_path.write_text("{}", encoding="utf-8")
+        return TrainResult(
+            model_id=model_id,
+            model_path=model_path,
+            metrics_path=metrics_path,
+            meta_path=meta_path,
+            dataset_snapshot_id=last_snapshot_id or "",
+            dataset_hash="hash",
+            row_count=len(rows),
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+        )
+
+    def fake_load_dataset_rows(dataset_path: Path | str) -> list[dict[str, float]]:
+        assert last_snapshot_root is not None
+        assert Path(dataset_path) == last_snapshot_root
+        return rows
+
+    def fake_load_model(*args: object, **kwargs: object) -> _FakeModel:
+        return _FakeModel()
+
+    def fake_evaluate_predictions(*args: object, **kwargs: object) -> EvaluationResult:
+        return EvaluationResult(
+            row_count=len(rows),
+            metric_mae={"full_dps": 0.0, "max_hit": 0.0, "utility_score": 0.0},
+            pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+        )
+
+    monkeypatch.setattr(ml_loop, "run_generation", fake_run_generation)
+    monkeypatch.setattr(ml_loop, "build_dataset_snapshot", fake_build_dataset_snapshot)
+    monkeypatch.setattr(ml_loop, "train", fake_train)
+    monkeypatch.setattr(ml_loop, "load_dataset_rows", fake_load_dataset_rows)
+    monkeypatch.setattr(ml_loop, "load_model", fake_load_model)
+    monkeypatch.setattr(ml_loop, "evaluate_predictions", fake_evaluate_predictions)
+
+    result = ml_loop.start_loop(args)
+    assert result == 0
+    assert snapshot_call_profiles == ["pinnacle", None]
 
 
 def test_start_loop_skips_when_generation_fails(
@@ -635,9 +798,11 @@ def test_start_loop_continues_after_unhealthy_generation(
 
     def fake_run_generation(**kwargs: object) -> dict[str, object]:
         nonlocal generation_calls
-        assert kwargs.get("run_mode") == "optimizer"
+        assert kwargs.get("run_mode") == "standard"
         generation_calls += 1
-        seed_calls.append(int(kwargs.get("seed_start")))
+        seed_start = kwargs.get("seed_start")
+        assert isinstance(seed_start, int)
+        seed_calls.append(seed_start)
         if generation_calls == 1:
             return {
                 "run_id": kwargs.get("run_id"),
@@ -660,6 +825,8 @@ def test_start_loop_continues_after_unhealthy_generation(
         output_root: Path | str,
         snapshot_id: str,
         exclude_stub_rows: bool,
+        profile_id: str | None = None,
+        scenario_id: str | None = None,
     ) -> SnapshotResult:
         nonlocal snapshot_calls, last_snapshot_id, last_snapshot_root
         snapshot_calls += 1
@@ -687,6 +854,7 @@ def test_start_loop_continues_after_unhealthy_generation(
         output_root: Path | str,
         model_id: str,
         compute_backend: str,
+        **_: object,
     ) -> TrainResult:
         nonlocal train_calls
         train_calls += 1
@@ -736,7 +904,7 @@ def test_start_loop_continues_after_unhealthy_generation(
 
     result = ml_loop.start_loop(args)
     assert result == 0
-    assert seed_calls == [2, 6]
+    assert seed_calls == [2, 18]
     assert snapshot_calls == 1
     assert train_calls == 1
 
@@ -791,7 +959,7 @@ def test_start_loop_endless_respects_stop_request(
     last_snapshot_root: Path | None = None
 
     def fake_run_generation(**kwargs: object) -> dict[str, object]:
-        assert kwargs.get("run_mode") == "optimizer"
+        assert kwargs.get("run_mode") == "standard"
         return {
             "run_id": kwargs.get("run_id"),
             "status": "completed",
@@ -804,6 +972,8 @@ def test_start_loop_endless_respects_stop_request(
         output_root: Path | str,
         snapshot_id: str,
         exclude_stub_rows: bool,
+        profile_id: str | None = None,
+        scenario_id: str | None = None,
     ) -> SnapshotResult:
         nonlocal last_snapshot_id, last_snapshot_root
         assert exclude_stub_rows is True
@@ -825,7 +995,12 @@ def test_start_loop_endless_respects_stop_request(
         )
 
     def fake_train(
-        *, dataset_path: Path | str, output_root: Path | str, model_id: str, compute_backend: str
+        *,
+        dataset_path: Path | str,
+        output_root: Path | str,
+        model_id: str,
+        compute_backend: str,
+        **_: object,
     ) -> TrainResult:
         assert last_snapshot_root is not None
         assert Path(dataset_path) == last_snapshot_root
@@ -904,19 +1079,71 @@ def test_start_loop_endless_respects_stop_request(
     assert record["iteration"] == 1
 
 
-def test_compute_improvement_requires_strict_gain() -> None:
+def test_compute_improvement_uses_pass_log1p_and_classifier_brier() -> None:
     current = EvaluationResult(
         row_count=1,
         metric_mae={"full_dps": 1.0, "max_hit": 1.0, "utility_score": 1.0},
+        metric_mae_log1p_pass={"full_dps": 0.40, "max_hit": 0.30},
+        classifier_metrics={"brier": 0.20},
         pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
     )
     previous = EvaluationResult(
         row_count=1,
         metric_mae={"full_dps": 1.0, "max_hit": 1.0, "utility_score": 1.0},
+        metric_mae_log1p_pass={"full_dps": 0.52, "max_hit": 0.41},
+        classifier_metrics={"brier": 0.24},
+        pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+    )
+    improvement = ml_loop._compute_improvement(current, previous)
+    assert improvement["improved"] is True
+    assert improvement["promotion_score_delta"] is not None
+    assert float(improvement["promotion_score_delta"]) > 0
+
+
+def test_compute_improvement_requires_epsilon_gap() -> None:
+    current = EvaluationResult(
+        row_count=1,
+        metric_mae={"full_dps": 1.0, "max_hit": 1.0, "utility_score": 1.0},
+        metric_mae_log1p_pass={"full_dps": 0.50, "max_hit": 0.50},
+        classifier_metrics={"brier": 0.20},
+        pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+    )
+    previous = EvaluationResult(
+        row_count=1,
+        metric_mae={"full_dps": 1.0, "max_hit": 1.0, "utility_score": 1.0},
+        metric_mae_log1p_pass={"full_dps": 0.50, "max_hit": 0.50},
+        classifier_metrics={"brier": 0.20},
         pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
     )
     improvement = ml_loop._compute_improvement(current, previous)
     assert improvement["improved"] is False
+
+
+def test_compute_improvement_records_classifier_skip_reason_for_single_class() -> None:
+    current = EvaluationResult(
+        row_count=1,
+        metric_mae={"full_dps": 0.9, "max_hit": 0.5, "utility_score": 0.2},
+        metric_mae_log1p_pass={"full_dps": 0.35, "max_hit": 0.25},
+        classifier_metrics={
+            "brier": 0.15,
+            "labeled_count": 2,
+            "positive_count": 0,
+            "negative_count": 2,
+        },
+        pass_probability={"mean": 0.4, "std": 0.0, "min": 0.4, "max": 0.4},
+    )
+    previous = EvaluationResult(
+        row_count=1,
+        metric_mae={"full_dps": 1.1, "max_hit": 0.7, "utility_score": 0.3},
+        metric_mae_log1p_pass={"full_dps": 0.40, "max_hit": 0.30},
+        classifier_metrics={"brier": 0.18},
+        pass_probability={"mean": 0.35, "std": 0.0, "min": 0.35, "max": 0.35},
+    )
+    improvement = ml_loop._compute_improvement(current, previous)
+    assert improvement["pass_probability_mean_delta"] is None
+    reason = improvement["current_classifier_skip_reason"]
+    assert isinstance(reason, str) and "single-class" in reason
+    assert improvement["previous_classifier_skip_reason"] is None
 
 
 def test_stop_loop_sets_stop_requested(tmp_path: Path) -> None:
@@ -1070,6 +1297,121 @@ def test_status_loop_human_readable_iteration_comparison(
     assert "reason=N/A" in output
     assert "run_status" in output
     assert "verified/attempted" in output
+
+
+def test_status_loop_human_reports_classifier_skip_reason_and_best_pass(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    loop_id = "status-skip-human"
+    data_path = tmp_path / "data"
+    loop_root = data_path / "ml_loops" / loop_id
+    loop_root.mkdir(parents=True, exist_ok=True)
+    state_path = loop_root / ml_loop.STATE_FILENAME
+    state = ml_loop._build_initial_state(
+        loop_id,
+        total_iterations=None,
+        seed_start_base=1,
+        seed_window_size=5,
+    )
+    state.update(
+        {
+            "status": "running",
+            "phase": "idle",
+            "iteration": 2,
+            "last_run_id": f"{loop_id}-iter-0002",
+            "last_snapshot_id": "iter-0002",
+            "last_model_id": f"{loop_id}-iter-0002",
+            "last_model_path": str(loop_root / "models" / f"{loop_id}-iter-0002" / "model.json"),
+        }
+    )
+    ml_loop._write_state(state_path, state)
+
+    iterations_path = loop_root / ml_loop.ITERATIONS_FILENAME
+    record_1 = {
+        "iteration": 1,
+        "run_status": "completed",
+        "generation": {
+            "status": "completed",
+            "status_reason_code": None,
+            "status_reason_message": None,
+            "attempted": 4,
+            "successes": 3,
+            "failures": 0,
+            "errors": 0,
+        },
+        "model": {
+            "model_id": f"{loop_id}-iter-0001",
+            "promoted": True,
+            "compute_backend_resolved": "cuda",
+            "token_learner_backend": "torch_sparse_sgd",
+        },
+        "evaluation": {
+            "current": {
+                "metric_mae": {"full_dps": 1.0, "max_hit": 0.5, "utility_score": 0.2},
+                "pass_probability": {"mean": 0.42},
+            },
+            "previous": None,
+            "improvement": {"improved": False},
+        },
+    }
+    record_2 = {
+        "iteration": 2,
+        "run_status": "completed",
+        "generation": {
+            "status": "completed",
+            "status_reason_code": None,
+            "status_reason_message": None,
+            "attempted": 4,
+            "successes": 3,
+            "failures": 0,
+            "errors": 0,
+        },
+        "model": {
+            "model_id": f"{loop_id}-iter-0002",
+            "promoted": True,
+            "compute_backend_resolved": "cuda",
+            "token_learner_backend": "torch_sparse_sgd",
+        },
+        "evaluation": {
+            "current": {
+                "metric_mae": {"full_dps": 0.8, "max_hit": 0.4, "utility_score": 0.15},
+                "pass_probability": {"mean": 0.55},
+                "classifier_metrics": {
+                    "brier": 0.12,
+                    "labeled_count": 3,
+                    "positive_count": 0,
+                    "negative_count": 3,
+                },
+            },
+            "previous": {
+                "metric_mae": {"full_dps": 1.0, "max_hit": 0.5, "utility_score": 0.2},
+                "pass_probability": {"mean": 0.42},
+                "classifier_metrics": {"brier": 0.18},
+            },
+            "improvement": {"improved": True},
+        },
+    }
+    iterations_path.write_text(
+        f"{json.dumps(record_1)}\n{json.dumps(record_2)}\n",
+        encoding="utf-8",
+    )
+
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        data_path=data_path,
+        output_format="human",
+        history=5,
+    )
+    result = ml_loop.status_loop(args)
+    assert result == 0
+
+    output = capsys.readouterr().out
+    assert "pass_prob_mean" in output
+    assert "Current classifier skip reason: single-class gate_pass labels: 0=3, 1=0" in output
+    assert "Best pass_probability.mean so far:" in output
+    best_line = output.split("Best pass_probability.mean so far:")[-1].splitlines()[0]
+    assert "iter=1" in best_line
+    assert "N/A" in output
 
 
 def test_status_loop_json_format_returns_state(

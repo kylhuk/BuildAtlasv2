@@ -324,7 +324,6 @@ def _read_meta(result: TrainResult) -> Mapping[str, object]:
     return json.loads(result.meta_path.read_text(encoding="utf-8"))
 
 
-
 def _make_balancing_row(
     index: int,
     class_name: str,
@@ -386,6 +385,91 @@ def _write_dataset_snapshot_with_rows(
     manifest_path = snapshot_root / "manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     return snapshot_root
+
+
+def test_baseline_key_includes_scenario_context() -> None:
+    rows = [
+        {
+            "build_id": "alpha-sunder",
+            "scenario_id": "alpha",
+            "profile_id": "pinnacle",
+            "main_skill_package": "sunder",
+            "full_dps": 1000.0,
+            "max_hit": 2000.0,
+            "utility_score": 1.0,
+        },
+        {
+            "build_id": "beta-sunder",
+            "scenario_id": "beta",
+            "profile_id": "pinnacle",
+            "main_skill_package": "sunder",
+            "full_dps": 1500.0,
+            "max_hit": 2200.0,
+            "utility_score": 1.1,
+        },
+    ]
+    aggregated = surrogate_model._aggregate_main_skill_metrics(rows)
+    assert "alpha|pinnacle|sunder" in aggregated
+    assert "beta|pinnacle|sunder" in aggregated
+
+
+def test_predict_many_uses_scenario_aware_baseline_key() -> None:
+    summary = surrogate_model.MetricSummary(
+        mean=1000.0,
+        std=100.0,
+        minimum=0.0,
+        maximum=5000.0,
+        count=1,
+    )
+    model = surrogate_model.SurrogateModel(
+        model_id="scenario-aware",
+        dataset_snapshot_id="snapshot",
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        global_metrics={metric: summary for metric in surrogate_model.METRIC_TARGETS},
+        main_skill_metrics={
+            "alpha|pinnacle|sunder": {
+                "full_dps": 900.0,
+                "max_hit": 1200.0,
+                "utility_score": 1.0,
+            },
+            "beta|pinnacle|sunder": {
+                "full_dps": 1800.0,
+                "max_hit": 800.0,
+                "utility_score": 1.1,
+            },
+        },
+        feature_stats={},
+        feature_weights={},
+        pass_metric="full_dps",
+        backend=MODEL_BACKEND,
+        backend_version=MODEL_VERSION,
+        compute_backend=surrogate_model.COMPUTE_BACKEND_CPU,
+        token_learner_backend=surrogate_model.TOKEN_LEARNER_RESIDUAL_MEAN,
+        trained_at_utc="2026-01-01T00:00:00Z",
+        target_transforms={
+            "full_dps": "identity",
+            "max_hit": "identity",
+            "utility_score": "identity",
+        },
+    )
+
+    predictions = model.predict_many(
+        [
+            {
+                "scenario_id": "alpha",
+                "profile_id": "pinnacle",
+                "main_skill_package": "sunder",
+            },
+            {
+                "scenario_id": "beta",
+                "profile_id": "pinnacle",
+                "main_skill_package": "sunder",
+            },
+        ]
+    )
+
+    assert predictions[0]["metrics"]["full_dps"] == 900.0
+    assert predictions[1]["metrics"]["full_dps"] == 1800.0
 
 
 def test_deterministic_balance_noop_for_small_dataset() -> None:
@@ -464,21 +548,23 @@ def test_train_records_deterministic_balance_rows(tmp_path: Path) -> None:
             ("Witch", "essence_drain", 10),
         ]
     )
-    snapshot_root = _write_dataset_snapshot_with_rows(
-        tmp_path / "data", rows, "balanced-train"
-    )
+    snapshot_root = _write_dataset_snapshot_with_rows(tmp_path / "data", rows, "balanced-train")
     output_root = tmp_path / "models" / "ep-v4"
     result = train(snapshot_root, output_root, model_id="balanced-train-model")
 
     meta = _read_meta(result)
-    balance_meta = meta["deterministic_balance"]
+    balance_meta = cast(Mapping[str, Any], meta["deterministic_balance"])
+    niche_counts_after = cast(Mapping[str, Any], balance_meta["niche_counts_after"])
     assert balance_meta["applied"] is True
     assert balance_meta["input_row_count"] == len(rows)
     assert balance_meta["output_row_count"] == 40
-    assert balance_meta["niche_counts_after"]["marauder|sunder"] == 20
+    assert niche_counts_after["marauder|sunder"] == 20
 
     metrics = json.loads(result.metrics_path.read_text(encoding="utf-8"))
-    assert metrics["row_count"] == balance_meta["output_row_count"]
+    split = cast(Mapping[str, Any], metrics["split"])
+    assert int(split["train_rows"]) + int(split["val_rows"]) == int(
+        balance_meta["output_row_count"]
+    )
     assert result.row_count == metrics["row_count"]
     assert "dominant share" in balance_meta["reason"]
 
@@ -505,8 +591,17 @@ def test_eval_metrics_deterministic(tmp_path: Path) -> None:
     model = load_model(result.model_path.parent)
 
     rows = _read_rows(snapshot.dataset_path.parent)
-    predictions = model.predict_many(rows)
-    evaluation = evaluate_predictions(rows, predictions)
+    _, val_rows = surrogate_model._resolve_train_val_split(
+        rows,
+        train_rows=None,
+        val_rows=None,
+        split_mod=surrogate_model.DEFAULT_VAL_SPLIT_MOD,
+        split_remainder=surrogate_model.DEFAULT_VAL_SPLIT_REMAINDER,
+        split_fn=None,
+    )
+    evaluation_rows = val_rows if val_rows else rows
+    predictions = model.predict_many(evaluation_rows)
+    evaluation = evaluate_predictions(evaluation_rows, predictions)
 
     metrics_data = json.loads(result.metrics_path.read_text(encoding="utf-8"))
     assert metrics_data["row_count"] == evaluation.row_count
@@ -524,7 +619,14 @@ def test_predict_many_returns_expected_shape(tmp_path: Path) -> None:
     model = load_model(result.model_path.parent)
 
     inputs = [
-        {"main_skill_package": "sunder", "full_dps": 0, "max_hit": 0, "utility_score": 0},
+        {
+            "scenario_id": "alpha",
+            "profile_id": "snapshot",
+            "main_skill_package": "sunder",
+            "full_dps": 0,
+            "max_hit": 0,
+            "utility_score": 0,
+        },
         {"main_skill_package": "unknown", "full_dps": 0, "max_hit": 0, "utility_score": 0},
     ]
     predictions = model.predict_many(inputs)
@@ -533,19 +635,143 @@ def test_predict_many_returns_expected_shape(tmp_path: Path) -> None:
     assert predictions == again
     assert len(predictions) == 2
     assert "metrics" in predictions[0]
-    assert math.isclose(predictions[0]["metrics"]["full_dps"], 2100.0, rel_tol=1e-9)
+    expected_skill = math.expm1(model.main_skill_metrics["alpha|snapshot|sunder"]["full_dps"])
+    assert math.isclose(predictions[0]["metrics"]["full_dps"], expected_skill, rel_tol=1e-9)
 
-    global_mean = (2000 + 2200 + 4000) / 3
+    global_mean = math.expm1(model.global_metrics["full_dps"].mean)
     assert math.isclose(predictions[1]["metrics"]["full_dps"], global_mean, rel_tol=1e-9)
     assert 0.0 <= predictions[0]["pass_probability"] <= 1.0
     assert 0.0 <= predictions[1]["pass_probability"] <= 1.0
 
 
+def test_pass_probability_uses_transformed_scale_fallback() -> None:
+    summary = surrogate_model.MetricSummary(
+        mean=math.log1p(1000.0),
+        std=0.5,
+        minimum=math.log1p(10.0),
+        maximum=math.log1p(10000.0),
+        count=10,
+    )
+    model = surrogate_model.SurrogateModel(
+        model_id="pass-prob",
+        dataset_snapshot_id="snapshot",
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        global_metrics={metric: summary for metric in surrogate_model.METRIC_TARGETS},
+        main_skill_metrics={},
+        feature_stats={},
+        feature_weights={},
+        pass_metric="full_dps",
+        backend=MODEL_BACKEND,
+        backend_version=MODEL_VERSION,
+        compute_backend=surrogate_model.COMPUTE_BACKEND_CPU,
+        token_learner_backend=surrogate_model.TOKEN_LEARNER_RESIDUAL_MEAN,
+        trained_at_utc="2026-01-01T00:00:00Z",
+        target_transforms={"full_dps": "log1p", "max_hit": "log1p", "utility_score": "identity"},
+    )
+
+    assert model._pass_probability(1000.0) == pytest.approx(0.5, abs=1e-6)
+    assert model._pass_probability(-10.0) == pytest.approx(0.5, abs=1e-6)
+
+
+def test_predict_many_clamps_transformed_predictions() -> None:
+    metric_summaries = {
+        "full_dps": surrogate_model.MetricSummary(
+            mean=math.log1p(1000.0),
+            std=0.5,
+            minimum=math.log1p(900.0),
+            maximum=math.log1p(1100.0),
+            count=10,
+        ),
+        "max_hit": surrogate_model.MetricSummary(
+            mean=math.log1p(2000.0),
+            std=0.5,
+            minimum=math.log1p(1800.0),
+            maximum=math.log1p(2200.0),
+            count=10,
+        ),
+        "utility_score": surrogate_model.MetricSummary(
+            mean=1.0,
+            std=0.1,
+            minimum=0.5,
+            maximum=1.5,
+            count=10,
+        ),
+    }
+    feature = FEATURE_SIGNAL_KEYS[0]
+    model = surrogate_model.SurrogateModel(
+        model_id="clamp-model",
+        dataset_snapshot_id="snapshot",
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        global_metrics=metric_summaries,
+        main_skill_metrics={},
+        feature_stats={},
+        feature_weights={
+            "full_dps": {feature: 1000.0},
+            "max_hit": {feature: 1000.0},
+            "utility_score": {feature: 1000.0},
+        },
+        pass_metric="full_dps",
+        backend=MODEL_BACKEND,
+        backend_version=MODEL_VERSION,
+        compute_backend=surrogate_model.COMPUTE_BACKEND_CPU,
+        token_learner_backend=surrogate_model.TOKEN_LEARNER_RESIDUAL_MEAN,
+        trained_at_utc="2026-01-01T00:00:00Z",
+        target_transforms={"full_dps": "log1p", "max_hit": "log1p", "utility_score": "identity"},
+    )
+
+    row = {feature: 1000.0, "main_skill_package": "unknown"}
+    prediction = model.predict_many([row])[0]["metrics"]
+    assert math.isfinite(prediction["full_dps"])
+    assert math.isfinite(prediction["max_hit"])
+    assert 900.0 <= prediction["full_dps"] <= 1100.0
+    assert 1800.0 <= prediction["max_hit"] <= 2200.0
+
+
 def test_feature_adjustments_change_predictions(tmp_path: Path) -> None:
-    snapshot = _create_featured_snapshot(tmp_path)
-    output_root = tmp_path / "models" / "ep-v4"
-    result = train(snapshot.dataset_path.parent, output_root, model_id="feature-model")
-    model = load_model(result.model_path.parent)
+    _ = tmp_path
+    metric_summaries = {
+        "full_dps": surrogate_model.MetricSummary(
+            mean=math.log1p(1000.0),
+            std=1.0,
+            minimum=math.log1p(100.0),
+            maximum=math.log1p(10000.0),
+            count=10,
+        ),
+        "max_hit": surrogate_model.MetricSummary(
+            mean=math.log1p(1500.0),
+            std=1.0,
+            minimum=math.log1p(100.0),
+            maximum=math.log1p(10000.0),
+            count=10,
+        ),
+        "utility_score": surrogate_model.MetricSummary(
+            mean=1.0,
+            std=0.2,
+            minimum=0.0,
+            maximum=3.0,
+            count=10,
+        ),
+    }
+    model = surrogate_model.SurrogateModel(
+        model_id="feature-model",
+        dataset_snapshot_id="snapshot",
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        global_metrics=metric_summaries,
+        main_skill_metrics={},
+        feature_stats={},
+        feature_weights={
+            "full_dps": {FEATURE_ITEM_SLOT_COUNT: 0.20},
+            "max_hit": {FEATURE_ITEM_SLOT_COUNT: 0.10},
+            "utility_score": {},
+        },
+        pass_metric="full_dps",
+        backend=MODEL_BACKEND,
+        backend_version=MODEL_VERSION,
+        compute_backend=surrogate_model.COMPUTE_BACKEND_CPU,
+        token_learner_backend=surrogate_model.TOKEN_LEARNER_RESIDUAL_MEAN,
+        trained_at_utc="2026-01-01T00:00:00Z",
+        target_transforms={"full_dps": "log1p", "max_hit": "log1p", "utility_score": "identity"},
+    )
 
     base_row: dict[str, object] = {key: 0.0 for key in FEATURE_SIGNAL_KEYS}
     base_row.update(
@@ -568,7 +794,14 @@ def test_feature_adjustments_change_predictions(tmp_path: Path) -> None:
 def test_token_effects_influence_predictions(tmp_path: Path) -> None:
     snapshot = _create_token_snapshot(tmp_path)
     output_root = tmp_path / "models" / "ep-v4"
-    result = train(snapshot.dataset_path.parent, output_root, model_id="token-model")
+    rows = _read_rows(snapshot.dataset_path.parent)
+    result = train(
+        snapshot.dataset_path.parent,
+        output_root,
+        model_id="token-model",
+        train_rows=rows,
+        val_rows=rows,
+    )
     model = load_model(result.model_path.parent)
 
     base_row: dict[str, object] = {key: 0.0 for key in FEATURE_SIGNAL_KEYS}
@@ -687,7 +920,6 @@ def test_train_rejects_invalid_backend(tmp_path: Path) -> None:
 
 
 def test_train_classifier_skips_when_gate_labels_missing(tmp_path: Path) -> None:
-    pytest.importorskip("sklearn")
     snapshot = _create_snapshot(tmp_path)
     output_root = tmp_path / "models" / "ep-v4"
     result = train(snapshot.dataset_path.parent, output_root, model_id="classifier-no-labels")
@@ -698,127 +930,38 @@ def test_train_classifier_skips_when_gate_labels_missing(tmp_path: Path) -> None
     assert meta["classifier_skip_reason"] == "no gate_pass labels available"
     assert meta["classifier_train_samples"] == 0
     assert meta["classifier_label_distribution"] == {}
+    assert meta["classifier_cv_status"] == "skipped"
+    assert meta["classifier_cv_skip_reason"] == "not implemented for sgd logistic"
 
 
 def test_train_classifier_skips_with_single_class_labels(tmp_path: Path) -> None:
-    pytest.importorskip("sklearn")
     snapshot = _create_gate_snapshot(tmp_path, [True, True, True])
     output_root = tmp_path / "models" / "ep-v4"
-    result = train(snapshot.dataset_path.parent, output_root, model_id="classifier-single-class")
+    rows = _read_rows(snapshot.dataset_path.parent)
+    result = train(
+        snapshot.dataset_path.parent,
+        output_root,
+        model_id="classifier-single-class",
+        train_rows=rows,
+        val_rows=rows,
+    )
 
     meta = _read_meta(result)
     assert meta["classifier_status"] == "skipped"
     assert meta["classifier_skip_reason"] == "single-class gate_pass labels: 1=3"
     assert meta["classifier_train_samples"] == 3
-    assert meta["classifier_label_distribution"] == {1: 3}
-
-
-def test_train_classifier_runs_without_cv_when_low_count(tmp_path: Path) -> None:
-    pytest.importorskip("sklearn")
-    snapshot = _create_gate_snapshot(tmp_path, [True, False, True])
-    output_root = tmp_path / "models" / "ep-v4"
-    result = train(snapshot.dataset_path.parent, output_root, model_id="classifier-low-count")
-
-    meta = _read_meta(result)
-    assert meta["classifier_status"] == "trained"
+    assert meta["classifier_label_distribution"] == {"1": 3}
     assert meta["classifier_cv_status"] == "skipped"
-    assert meta["classifier_cv_skip_reason"] == "insufficient labeled samples for requested cv"
-    assert meta["classifier_cv_used_folds"] == 1
-    assert meta["classifier_train_samples"] == 3
-    assert meta["classifier_cv_requested_folds"] == 5
-    assert meta["classifier_label_distribution"] == {0: 1, 1: 2}
-    assert "classifier" in meta
-    assert "classifier_metrics" in meta
-    classifier_metrics = cast(Mapping[str, Any], meta["classifier_metrics"])
-    assert classifier_metrics["train_samples"] == 3
 
 
-def test_train_classifier_runs_cv_when_enough_labels(tmp_path: Path) -> None:
-    pytest.importorskip("sklearn")
-    labels = [True, False, True, False, True, False]
+def test_train_classifier_trains_without_sklearn_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    labels = [True, False, True, False]
     snapshot = _create_gate_snapshot(tmp_path, labels)
     output_root = tmp_path / "models" / "ep-v4"
-    result = train(
-        snapshot.dataset_path.parent,
-        output_root,
-        model_id="classifier-happy",
-    )
-
-    meta = _read_meta(result)
-    assert meta["classifier_status"] == "trained"
-    assert meta["classifier_cv_status"] == "ran"
-    assert meta["classifier_cv_used_folds"] == 3
-    assert meta["classifier_cv_requested_folds"] == 5
-    assert meta["classifier_train_samples"] == len(labels)
-    assert meta["classifier_label_distribution"] == {0: 3, 1: 3}
-    assert "classifier" in meta
-    assert "classifier_metrics" in meta
-    classifier_metrics = cast(Mapping[str, Any], meta["classifier_metrics"])
-    assert classifier_metrics["train_samples"] == len(labels)
-    assert "cv_mean" in classifier_metrics
-    assert "cv_std" in classifier_metrics
-
-
-def test_pass_probability_contract_with_classifier(tmp_path: Path) -> None:
-    pytest.importorskip("sklearn")
-    labels = [True, False, True, False, True, False]
-    snapshot = _create_gate_snapshot(tmp_path, labels)
-    output_root = tmp_path / "models" / "ep-v4"
-    result = train(
-        snapshot.dataset_path.parent,
-        output_root,
-        model_id="classifier-pass-prob",
-    )
-
-    model = load_model(result.model_path.parent)
     rows = _read_rows(snapshot.dataset_path.parent)
-    predictions = model.predict_many(rows[:2])
-
-    assert predictions
-    for prediction in predictions:
-        pass_prob = prediction["pass_probability"]
-        assert isinstance(pass_prob, (float, int))
-        assert 0.0 <= pass_prob <= 1.0
-
-
-def test_train_classifier_handles_cross_val_score_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sklearn = pytest.importorskip("sklearn")
-    snapshot = _create_gate_snapshot(tmp_path, [True, False, True, False])
-    output_root = tmp_path / "models" / "ep-v4"
-
-    def _fake_cross_val_score(*args, **kwargs):
-        _ = (args, kwargs)
-        raise ValueError("forced cv failure")
-
-    monkeypatch.setattr(sklearn.model_selection, "cross_val_score", _fake_cross_val_score)
-
-    result = train(
-        snapshot.dataset_path.parent,
-        output_root,
-        model_id="classifier-cv-error",
-    )
-
-    meta = _read_meta(result)
-    assert meta["classifier_status"] == "trained"
-    assert meta["classifier_cv_status"] == "skipped"
-    assert meta["classifier_cv_skip_reason"] == "cv error: ValueError"
-    assert meta["classifier_cv_used_folds"] == 2
-    assert "classifier" in meta
-    assert "classifier_metrics" in meta
-    classifier_metrics = cast(Mapping[str, Any], meta["classifier_metrics"])
-    assert "cv_mean" not in classifier_metrics
-    assert "cv_std" not in classifier_metrics
-
-
-def test_train_classifier_marks_sklearn_unavailable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    snapshot = _create_gate_snapshot(tmp_path, [True, False, True, False])
-    output_root = tmp_path / "models" / "ep-v4"
 
     original_import = builtins.__import__
 
@@ -832,16 +975,63 @@ def test_train_classifier_marks_sklearn_unavailable(
     result = train(
         snapshot.dataset_path.parent,
         output_root,
-        model_id="classifier-sklearn-missing",
+        model_id="classifier-no-sklearn",
+        train_rows=rows,
+        val_rows=rows,
     )
 
     meta = _read_meta(result)
-    assert meta["classifier_enabled"] is True
-    assert meta["classifier_status"] == "skipped"
-    assert meta["classifier_skip_reason"] == "sklearn unavailable"
+    assert meta["classifier_status"] == "trained"
+    assert meta["classifier"] == surrogate_model.CLASSIFIER_BACKEND
     assert meta["classifier_cv_status"] == "skipped"
-    assert "classifier" not in meta
-    assert "classifier_metrics" not in meta
+    assert meta["classifier_cv_skip_reason"] == "not implemented for sgd logistic"
+    assert meta["classifier_train_samples"] == len(labels)
+    assert meta["classifier_label_distribution"] == {"0": 2, "1": 2}
+    assert "classifier_metrics" in meta
+    classifier_metrics = cast(Mapping[str, Any], meta["classifier_metrics"])
+    assert float(classifier_metrics["train_samples"]) == len(labels)
+    assert "train_brier" in classifier_metrics
+    assert "train_log_loss" in classifier_metrics
+
+    model_payload = json.loads(result.model_path.read_text(encoding="utf-8"))
+    classifier_payload = cast(Mapping[str, Any], model_payload["classifier"])
+    assert classifier_payload["backend"] == surrogate_model.CLASSIFIER_BACKEND
+    assert not (result.model_path.parent / "classifier.pkl").exists()
+
+
+def test_pass_probability_not_constant_with_mixed_labels(tmp_path: Path) -> None:
+    snapshot = _create_featured_snapshot(tmp_path)
+    output_root = tmp_path / "models" / "ep-v4"
+    rows = _read_rows(snapshot.dataset_path.parent)
+    labeled_rows: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        enriched = dict(row)
+        enriched["gate_pass"] = index % 2 == 0
+        labeled_rows.append(enriched)
+    result = train(
+        snapshot.dataset_path.parent,
+        output_root,
+        model_id="classifier-pass-prob",
+        train_rows=labeled_rows,
+        val_rows=labeled_rows,
+    )
+
+    model = load_model(result.model_path.parent)
+    predictions = model.predict_many(labeled_rows)
+
+    assert predictions
+    pass_probs: list[float] = []
+    for prediction in predictions:
+        pass_prob = float(prediction["pass_probability"])
+        assert isinstance(pass_prob, (float, int))
+        assert 0.0 <= pass_prob <= 1.0
+        pass_probs.append(pass_prob)
+
+    assert len({round(probability, 6) for probability in pass_probs}) > 1
+    assert any(abs(probability - 0.5) > 1e-3 for probability in pass_probs)
+
+    evaluation = evaluate_predictions(labeled_rows, predictions)
+    assert evaluation.classifier_metrics["brier"] is not None
 
 
 def test_train_classifier_disabled_when_include_failures_false(tmp_path: Path) -> None:
@@ -859,5 +1049,6 @@ def test_train_classifier_disabled_when_include_failures_false(tmp_path: Path) -
     assert meta["classifier_status"] == "disabled"
     assert meta["classifier_skip_reason"] == "include_failures disabled"
     assert meta["classifier_cv_requested_folds"] == 0
+    assert meta["classifier_cv_status"] == "skipped"
     assert "classifier" not in meta
     assert "classifier_metrics" not in meta

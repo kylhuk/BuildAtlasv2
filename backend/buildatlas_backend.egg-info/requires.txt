@@ -7,3 +7,8 @@ clickhouse-connect>=0.5
 httpx>=0.27
 pytest>=8.0
 ruff>=0.0.275
+
+[ml]
+numpy
+scikit-learn
+torch

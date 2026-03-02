@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import re
@@ -17,6 +18,7 @@ from backend.engine.ruleset import (
     read_pob_commit,
     scenario_version_from_profile,
 )
+from backend.engine.scenarios.loader import list_templates
 from backend.engine.surrogate import (
     EvaluationResult,
     SnapshotResult,
@@ -32,6 +34,9 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 IMPROVEMENT_EPSILON = 1e-6
+PROMOTION_CLASSIFIER_BRIER_WEIGHT = 0.05
+VAL_SPLIT_MOD = 5
+VAL_SPLIT_REMAINDER = 0
 
 
 def _log_loop_phase(
@@ -110,27 +115,51 @@ def _load_state(state_path: Path) -> dict[str, Any]:
     return payload
 
 
+def _resolve_evaluation_budget(args: argparse.Namespace) -> int:
+    budget = _coerce_int(getattr(args, "count", 1))
+    if budget is None:
+        return 1
+    return max(1, budget)
+
+
+def _resolve_pool_multiplier(args: argparse.Namespace) -> int:
+    multiplier = _coerce_int(getattr(args, "pool_multiplier", 4))
+    if multiplier is None:
+        return 4
+    return max(1, multiplier)
+
+
+def _resolve_generate_count(args: argparse.Namespace) -> int:
+    generated = _coerce_int(getattr(args, "generate_count", None))
+    if generated is not None and generated > 0:
+        return generated
+    return _resolve_evaluation_budget(args) * _resolve_pool_multiplier(args)
+
+
 def _seed_window_and_base(state: Mapping[str, Any], args: argparse.Namespace) -> tuple[int, int]:
     seed_start_base = state.get("seed_start_base")
     if not isinstance(seed_start_base, int):
         seed_start_base = args.seed_start
     seed_window_size = state.get("seed_window_size")
-    if not isinstance(seed_window_size, int):
-        seed_window_size = args.count
+    if not isinstance(seed_window_size, int) or seed_window_size <= 0:
+        seed_window_size = _resolve_generate_count(args)
     return seed_start_base, seed_window_size
 
 
 def _ensure_seed_metadata(
     state_path: Path, state: dict[str, Any], args: argparse.Namespace
 ) -> None:
-    seed_start_base, seed_window_size = _seed_window_and_base(state, args)
+    seed_start_base = state.get("seed_start_base")
+    if not isinstance(seed_start_base, int):
+        seed_start_base = args.seed_start
+    seed_window_size = _resolve_generate_count(args)
     updates: dict[str, Any] = {}
-    if state.get("seed_start_base") is None:
+    if state.get("seed_start_base") != seed_start_base:
         updates["seed_start_base"] = seed_start_base
-    if state.get("seed_window_size") is None:
+    if state.get("seed_window_size") != seed_window_size:
         updates["seed_window_size"] = seed_window_size
     if state.get("next_iteration_seed_start") is None:
-        iterations_done = max(0, state.get("iteration", 0))
+        iterations_done = max(0, _coerce_int(state.get("iteration")) or 0)
         updates["next_iteration_seed_start"] = seed_start_base + iterations_done * seed_window_size
     if updates:
         _persist_state(state_path, state, **updates)
@@ -145,6 +174,38 @@ def _resolve_iteration_seed_start(
     seed_start_base, seed_window_size = _seed_window_and_base(state, args)
     offset = max(0, iteration - 1)
     return seed_start_base + offset * seed_window_size
+
+
+def _stable_hash_mod(value: str, mod: int) -> int:
+    if mod <= 0:
+        return 0
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return int(digest, 16) % mod
+
+
+def _validation_split_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
+    train_rows: list[Mapping[str, Any]] = []
+    val_rows: list[Mapping[str, Any]] = []
+    for row in rows:
+        build_id = str(row.get("build_id") or "")
+        if not build_id:
+            build_id = (
+                f"{row.get('scenario_id') or ''}|"
+                f"{row.get('profile_id') or ''}|"
+                f"{row.get('main_skill_package') or ''}"
+            )
+        if _stable_hash_mod(build_id, VAL_SPLIT_MOD) == VAL_SPLIT_REMAINDER:
+            val_rows.append(row)
+        else:
+            train_rows.append(row)
+    if not val_rows and rows:
+        val_rows = [rows[0]]
+        train_rows = list(rows[1:]) or list(rows)
+    if not train_rows and rows:
+        train_rows = list(rows)
+    return train_rows, val_rows
 
 
 def _persist_state(state_path: Path, state: dict[str, Any], **updates: Any) -> dict[str, Any]:
@@ -262,37 +323,84 @@ def _iteration_checkpoint_path(loop_root: Path, iteration: int) -> Path:
 def _compute_improvement(
     current: EvaluationResult, previous: EvaluationResult | None
 ) -> dict[str, Any]:
+    current_score = _promotion_score(current)
+    current_skip_reason = _classifier_skip_reason_from_evaluation_result(current)
     if previous is None:
         return {
             "improved": False,
             "metric_mae_deltas": {},
             "pass_probability_mean_delta": None,
+            "promotion_score_current": current_score.get("total"),
+            "promotion_score_previous": None,
+            "promotion_score_delta": None,
+            "promotion_score_components": {"current": current_score, "previous": None},
+            "current_classifier_skip_reason": current_skip_reason,
+            "previous_classifier_skip_reason": None,
         }
+    previous_score = _promotion_score(previous)
     deltas: dict[str, float] = {}
-    metrics_non_regress = True
-    metrics_strict_gain = False
     for metric, current_value in current.metric_mae.items():
         previous_value = previous.metric_mae.get(metric)
         if previous_value is None:
             continue
         delta = previous_value - current_value
         deltas[metric] = delta
-        if delta < -IMPROVEMENT_EPSILON:
-            metrics_non_regress = False
-        if delta > IMPROVEMENT_EPSILON:
-            metrics_strict_gain = True
-    prev_pass_mean = previous.pass_probability.get("mean", 0.0)
-    current_pass_mean = current.pass_probability.get("mean", 0.0)
-    pass_delta = current_pass_mean - prev_pass_mean
-    pass_non_regress = pass_delta >= -IMPROVEMENT_EPSILON
-    pass_strict_gain = pass_delta > IMPROVEMENT_EPSILON
-    improved = (
-        metrics_non_regress and pass_non_regress and (metrics_strict_gain or pass_strict_gain)
+    prev_pass_mean = _numeric(previous.pass_probability.get("mean"))
+    current_pass_mean = _numeric(current.pass_probability.get("mean"))
+    previous_skip_reason = _classifier_skip_reason_from_evaluation_result(previous)
+    pass_delta: float | None = None
+    if (
+        prev_pass_mean is not None
+        and current_pass_mean is not None
+        and not previous_skip_reason
+        and not current_skip_reason
+    ):
+        pass_delta = current_pass_mean - prev_pass_mean
+    current_total = _numeric(current_score.get("total"))
+    previous_total = _numeric(previous_score.get("total"))
+    score_delta = (
+        previous_total - current_total
+        if previous_total is not None and current_total is not None
+        else None
     )
+    improved = bool(score_delta is not None and score_delta > IMPROVEMENT_EPSILON)
     return {
         "improved": improved,
         "metric_mae_deltas": deltas,
         "pass_probability_mean_delta": pass_delta,
+        "promotion_score_current": current_total,
+        "promotion_score_previous": previous_total,
+        "promotion_score_delta": score_delta,
+        "promotion_score_components": {
+            "current": current_score,
+            "previous": previous_score,
+        },
+        "current_classifier_skip_reason": current_skip_reason,
+        "previous_classifier_skip_reason": previous_skip_reason,
+    }
+
+
+def _promotion_score(evaluation: EvaluationResult) -> dict[str, float | None]:
+    log1p_pass = (
+        dict(evaluation.metric_mae_log1p_pass)
+        if evaluation.metric_mae_log1p_pass
+        else dict(evaluation.metric_mae_log1p)
+    )
+    full_dps = _numeric(log1p_pass.get("full_dps"))
+    max_hit = _numeric(log1p_pass.get("max_hit"))
+    regression_terms = [value for value in (full_dps, max_hit) if value is not None]
+    regression_component = (
+        sum(regression_terms) / len(regression_terms) if regression_terms else None
+    )
+    classifier_metrics = dict(evaluation.classifier_metrics)
+    brier = _numeric(classifier_metrics.get("brier"))
+    classifier_penalty = brier * PROMOTION_CLASSIFIER_BRIER_WEIGHT if brier is not None else 0.0
+    total = regression_component + classifier_penalty if regression_component is not None else None
+    return {
+        "regression_log1p_pass": regression_component,
+        "classifier_brier": brier,
+        "classifier_penalty": classifier_penalty,
+        "total": total,
     }
 
 
@@ -311,6 +419,8 @@ def _build_iteration_record(
 ) -> dict[str, Any]:
     run_status_reason = _as_dict(run_summary.get("status_reason"))
     evaluation_info = _as_dict(run_summary.get("evaluation"))
+    current_skip_reason = improvement.get("current_classifier_skip_reason")
+    previous_skip_reason = improvement.get("previous_classifier_skip_reason")
     return {
         "iteration": iteration,
         "timestamp_utc": timestamp,
@@ -355,12 +465,24 @@ def _build_iteration_record(
             "current": {
                 "row_count": evaluation.row_count,
                 "metric_mae": evaluation.metric_mae,
+                "metric_mae_all": evaluation.metric_mae_all,
+                "metric_mae_pass": evaluation.metric_mae_pass,
+                "metric_mae_log1p": evaluation.metric_mae_log1p,
+                "metric_mae_log1p_pass": evaluation.metric_mae_log1p_pass,
+                "classifier_metrics": evaluation.classifier_metrics,
+                "classifier_skip_reason": current_skip_reason,
                 "pass_probability": evaluation.pass_probability,
             },
             "previous": (
                 {
                     "row_count": previous_evaluation.row_count,
                     "metric_mae": previous_evaluation.metric_mae,
+                    "metric_mae_all": previous_evaluation.metric_mae_all,
+                    "metric_mae_pass": previous_evaluation.metric_mae_pass,
+                    "metric_mae_log1p": previous_evaluation.metric_mae_log1p,
+                    "metric_mae_log1p_pass": previous_evaluation.metric_mae_log1p_pass,
+                    "classifier_metrics": previous_evaluation.classifier_metrics,
+                    "classifier_skip_reason": previous_skip_reason,
                     "pass_probability": previous_evaluation.pass_probability,
                 }
                 if previous_evaluation
@@ -442,6 +564,11 @@ def start_loop(args: argparse.Namespace) -> int:
     loop_id = _validate_loop_id(args.loop_id)
     if args.iterations < 0:
         raise ValueError("iterations must be non-negative")
+    evaluation_budget = _resolve_evaluation_budget(args)
+    args.count = evaluation_budget
+    pool_multiplier = _resolve_pool_multiplier(args)
+    generate_count = evaluation_budget * pool_multiplier
+    args.generate_count = generate_count
     endless_mode = args.iterations == 0
     total_iterations = None if endless_mode else args.iterations
     data_root = Path(args.data_path)
@@ -463,13 +590,39 @@ def start_loop(args: argparse.Namespace) -> int:
     constraints = _load_constraints(args.constraints_file)
     ruleset_id = _resolve_ruleset_id(args)
 
+    profile_id = str(getattr(args, "profile_id", "pinnacle"))
+    scenario_templates = [
+        template for template in list_templates() if template.profile_id == profile_id
+    ]
+    snapshot_scenario_id = (
+        scenario_templates[0].scenario_id if len(scenario_templates) == 1 else None
+    )
+    candidate_pool_size_arg = getattr(args, "candidate_pool_size", None)
+    resolved_candidate_pool_size = (
+        int(candidate_pool_size_arg)
+        if candidate_pool_size_arg and int(candidate_pool_size_arg) > 0
+        else generate_count
+    )
+    surrogate_top_k_arg = getattr(args, "surrogate_top_k", None)
+    resolved_surrogate_top_k = (
+        int(surrogate_top_k_arg)
+        if surrogate_top_k_arg and int(surrogate_top_k_arg) > 0
+        else evaluation_budget
+    )
+    surrogate_exploration_pct = min(
+        0.5,
+        max(0.0, float(getattr(args, "surrogate_exploration_pct", 0.10))),
+    )
+    optimizer_iterations = int(getattr(args, "optimizer_iterations", 3))
+    optimizer_elite_count = int(getattr(args, "optimizer_elite_count", 16))
+
     completed_iterations = _count_completed_iterations(iterations_path)
     start_iteration = completed_iterations + 1
     state_exists = state_path.exists()
     if state_exists:
         state = _load_state(state_path)
     else:
-        state = _build_initial_state(loop_id, total_iterations, args.seed_start, args.count)
+        state = _build_initial_state(loop_id, total_iterations, args.seed_start, generate_count)
         _write_state(state_path, state)
 
     _ensure_seed_metadata(state_path, state, args)
@@ -546,19 +699,28 @@ def start_loop(args: argparse.Namespace) -> int:
                 "generation",
                 iteration=iteration,
                 detail=(
-                    f"run_id={current_run_id} seed_start={iteration_seed_start} count={args.count}"
+                    f"run_id={current_run_id} seed_start={iteration_seed_start} "
+                    f"eval_budget={evaluation_budget} generate_count={generate_count}"
                 ),
             )
             generation_started_at = monotonic()
+            active_surrogate_model_path = state.get("last_model_path")
             run_summary = run_generation(
-                count=args.count,
+                count=generate_count,
                 seed_start=iteration_seed_start,
                 ruleset_id=ruleset_id,
-                profile_id=args.profile_id,
+                profile_id=profile_id,
                 run_id=current_run_id,
                 base_path=data_root,
                 constraints=constraints,
-                run_mode="optimizer",
+                run_mode="standard",
+                surrogate_enabled=bool(active_surrogate_model_path),
+                surrogate_model_path=active_surrogate_model_path,
+                candidate_pool_size=resolved_candidate_pool_size,
+                surrogate_top_k=resolved_surrogate_top_k,
+                surrogate_exploration_pct=surrogate_exploration_pct,
+                optimizer_iterations=optimizer_iterations,
+                optimizer_elite_count=optimizer_elite_count,
             )
             _log_loop_phase(
                 loop_id,
@@ -663,7 +825,27 @@ def start_loop(args: argparse.Namespace) -> int:
                 output_root=snapshots_root,
                 snapshot_id=snapshot_id,
                 exclude_stub_rows=True,
+                profile_id=profile_id,
+                scenario_id=snapshot_scenario_id,
             )
+            if snapshot.row_count <= 0 and profile_id:
+                _log_loop_phase(
+                    loop_id,
+                    "snapshot_retry",
+                    iteration=iteration,
+                    detail=(
+                        "filtered snapshot empty; retrying without profile filter "
+                        f"profile_id={profile_id} scenario_id={snapshot_scenario_id}"
+                    ),
+                )
+                snapshot = build_dataset_snapshot(
+                    data_path=artifacts_root,
+                    output_root=snapshots_root,
+                    snapshot_id=snapshot_id,
+                    exclude_stub_rows=True,
+                    profile_id=None,
+                    scenario_id=snapshot_scenario_id,
+                )
             _log_loop_phase(
                 loop_id,
                 "snapshot_complete",
@@ -695,6 +877,8 @@ def start_loop(args: argparse.Namespace) -> int:
                 output_root=models_root,
                 model_id=model_id,
                 compute_backend=args.surrogate_backend,
+                split_mod=VAL_SPLIT_MOD,
+                split_remainder=VAL_SPLIT_REMAINDER,
             )
             current_model_path = str(train_result.model_path)
             _log_loop_phase(
@@ -715,15 +899,17 @@ def start_loop(args: argparse.Namespace) -> int:
             _log_loop_phase(loop_id, "evaluate", iteration=iteration)
             evaluate_started_at = monotonic()
             rows = load_dataset_rows(snapshot_root)
+            _, validation_rows = _validation_split_rows(rows)
+            evaluation_rows = validation_rows if validation_rows else rows
             current_model = load_model(train_result.model_path)
-            current_predictions = current_model.predict_many(rows)
-            current_evaluation = evaluate_predictions(rows, current_predictions)
+            current_predictions = current_model.predict_many(evaluation_rows)
+            current_evaluation = evaluate_predictions(evaluation_rows, current_predictions)
             previous_evaluation: EvaluationResult | None = None
             previous_model_id = state.get("last_model_id")
             if previous_model_path:
                 previous_model = load_model(previous_model_path)
-                previous_predictions = previous_model.predict_many(rows)
-                previous_evaluation = evaluate_predictions(rows, previous_predictions)
+                previous_predictions = previous_model.predict_many(evaluation_rows)
+                previous_evaluation = evaluate_predictions(evaluation_rows, previous_predictions)
             improvement = _compute_improvement(current_evaluation, previous_evaluation)
             promoted = previous_model_path is None or bool(improvement.get("improved"))
             promoted_model_path = current_model_path if promoted else str(previous_model_path)
@@ -808,7 +994,10 @@ def start_loop(args: argparse.Namespace) -> int:
             failure_phase = failure_state.get("phase") or failure_phase
         else:
             failure_state = _build_initial_state(
-                loop_id, total_iterations, args.seed_start, args.count
+                loop_id,
+                total_iterations,
+                args.seed_start,
+                _resolve_generate_count(args),
             )
             _write_state(state_path, failure_state)
         failure_checkpoint = _write_failure_checkpoint(
@@ -927,9 +1116,62 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _trimmed_string(value: Any) -> str | None:
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if trimmed:
+            return trimmed
+    return None
+
+
+def _classifier_skip_reason_from_metrics(metrics: Mapping[str, Any] | None) -> str | None:
+    candidate = _as_dict(metrics)
+    reason = _trimmed_string(candidate.get("classifier_skip_reason"))
+    if reason:
+        return reason
+    reason = _trimmed_string(candidate.get("skip_reason"))
+    if reason:
+        return reason
+    labeled = _coerce_int(candidate.get("labeled_count"))
+    if labeled is None or labeled <= 0:
+        return None
+    positive = _coerce_int(candidate.get("positive_count"))
+    negative = _coerce_int(candidate.get("negative_count"))
+    if positive is None or negative is None:
+        return None
+    if positive <= 0 or negative <= 0:
+        return f"single-class gate_pass labels: 0={negative}, 1={positive}"
+    return None
+
+
+def _classifier_skip_reason_from_payload(payload: Mapping[str, Any] | None) -> str | None:
+    if payload is None:
+        return None
+    reason = _trimmed_string(payload.get("classifier_skip_reason"))
+    if reason:
+        return reason
+    reason = _trimmed_string(payload.get("classifier_skip_reason_message"))
+    if reason:
+        return reason
+    reason = _trimmed_string(payload.get("skip_reason"))
+    if reason:
+        return reason
+    return _classifier_skip_reason_from_metrics(payload.get("classifier_metrics"))
+
+
+def _classifier_skip_reason_from_evaluation_result(
+    evaluation: EvaluationResult | None,
+) -> str | None:
+    if evaluation is None:
+        return None
+    return _classifier_skip_reason_from_metrics(dict(evaluation.classifier_metrics))
+
+
 def _record_pass_mean(record: Mapping[str, Any]) -> float | None:
     evaluation = _as_dict(record.get("evaluation"))
     current = _as_dict(evaluation.get("current"))
+    if _classifier_skip_reason_from_payload(current):
+        return None
     pass_probability = _as_dict(current.get("pass_probability"))
     return _numeric(pass_probability.get("mean"))
 
@@ -1002,10 +1244,16 @@ def _render_status_human(
     previous_metric_mae = _as_dict(previous_eval.get("metric_mae"))
     current_pass = _as_dict(current_eval.get("pass_probability"))
     previous_pass = _as_dict(previous_eval.get("pass_probability"))
+    current_skip_reason = _classifier_skip_reason_from_payload(current_eval)
+    previous_skip_reason = _classifier_skip_reason_from_payload(previous_eval)
 
     comparison_rows: list[tuple[str, float | None, float | None, float | None, str]] = []
     prev_pass_mean = _numeric(previous_pass.get("mean"))
     curr_pass_mean = _numeric(current_pass.get("mean"))
+    if current_skip_reason:
+        curr_pass_mean = None
+    if previous_skip_reason:
+        prev_pass_mean = None
     pass_delta = (
         curr_pass_mean - prev_pass_mean
         if prev_pass_mean is not None and curr_pass_mean is not None
@@ -1024,6 +1272,15 @@ def _render_status_human(
         )
         better = "yes" if delta is not None and delta <= 0.0 else "no"
         comparison_rows.append((f"{metric}_mae", prev_value, curr_value, delta, better))
+
+    reason_lines: list[str] = []
+    if current_skip_reason:
+        reason_lines.append(f"Current classifier skip reason: {current_skip_reason}")
+    if previous_skip_reason:
+        reason_lines.append(f"Previous classifier skip reason: {previous_skip_reason}")
+    if reason_lines:
+        summary_lines.append("")
+        summary_lines.extend(reason_lines)
 
     summary_lines.append("")
     summary_lines.append(
@@ -1064,13 +1321,16 @@ def _render_status_human(
         verified_attempted_value = _format_verified_ratio(
             generation.get("successes"), generation.get("attempted")
         )
+        row_skip_reason = _classifier_skip_reason_from_payload(current)
+        row_pass_mean = _numeric(pass_probability.get("mean"))
+        row_pass_display = None if row_skip_reason else row_pass_mean
         summary_lines.append(
             f"{record.get('iteration', '?'):>4} "
             f"{run_status_value:>11} "
             f"{verified_attempted_value:>19} "
             f"{_format_bool(model.get('promoted')):>9} "
             f"{_format_bool(improvement.get('improved')):>8} "
-            f"{_format_float(_numeric(pass_probability.get('mean'))):>9} "
+            f"{_format_float(row_pass_display):>9} "
             f"{_format_float(_numeric(metrics.get('full_dps'))):>12} "
             f"{_format_float(_numeric(metrics.get('max_hit'))):>11} "
             f"{_format_float(_numeric(metrics.get('utility_score'))):>17}"
@@ -1126,8 +1386,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--count",
         type=int,
         default=5,
-        help="Number of candidates to generate per iteration",
+        help="PoB evaluation budget per iteration",
     )
+    start_parser.add_argument(
+        "--pool-multiplier",
+        type=int,
+        default=4,
+        help="Generation pool multiplier (generate_count=count*pool_multiplier)",
+    )
+    start_parser.add_argument(
+        "--candidate-pool-size",
+        type=int,
+        default=None,
+        help="Optional explicit candidate pool override (default=generate_count)",
+    )
+
     start_parser.add_argument(
         "--seed-start",
         type=int,
@@ -1163,6 +1436,31 @@ def _build_parser() -> argparse.ArgumentParser:
         default=settings.data_path,
         help="Root directory for artifacts and loop state",
     )
+    start_parser.add_argument(
+        "--surrogate-top-k",
+        type=int,
+        default=None,
+        help="Number of surrogate-ranked candidates to keep (default=evaluation budget)",
+    )
+    start_parser.add_argument(
+        "--surrogate-exploration-pct",
+        type=float,
+        default=0.10,
+        help="Exploration fraction for surrogate selection (clamped to 0..0.5)",
+    )
+    start_parser.add_argument(
+        "--optimizer-iterations",
+        type=int,
+        default=3,
+        help="Iterations to run when optimizer mode is enabled",
+    )
+    start_parser.add_argument(
+        "--optimizer-elite-count",
+        type=int,
+        default=16,
+        help="Elites preserved per optimizer iteration",
+    )
+
     start_parser.add_argument(
         "--surrogate-backend",
         choices=("auto", "cpu", "cuda"),

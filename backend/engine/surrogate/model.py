@@ -17,11 +17,11 @@ import os
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from math import exp, floor, log1p
+from math import exp, expm1, floor, isfinite, log, log1p
 from pathlib import Path
 from statistics import mean, median, pstdev
 from time import monotonic
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from backend.engine.surrogate.dataset import (
     FEATURE_IDENTITY_CROSS_TOKENS,
@@ -34,6 +34,13 @@ MODEL_BACKEND = "ep-v4-baseline"
 MODEL_VERSION = "0.2.0"
 METRIC_TARGETS = ("full_dps", "max_hit", "utility_score")
 PASS_METRIC = "full_dps"
+TARGET_TRANSFORM_IDENTITY = "identity"
+TARGET_TRANSFORM_LOG1P = "log1p"
+DEFAULT_TARGET_TRANSFORMS: Mapping[str, str] = {
+    "full_dps": TARGET_TRANSFORM_LOG1P,
+    "max_hit": TARGET_TRANSFORM_LOG1P,
+    "utility_score": TARGET_TRANSFORM_IDENTITY,
+}
 BACKEND_PREFERENCE_AUTO = "auto"
 BACKEND_PREFERENCE_CPU = "cpu"
 BACKEND_PREFERENCE_CUDA = "cuda"
@@ -55,6 +62,15 @@ CROSS_TOKEN_EFFECT_LIMIT = 256
 _TOKEN_SHRINKAGE_PRIOR = 5.0
 TOKEN_LEARNER_RESIDUAL_MEAN = "residual_mean"
 TOKEN_LEARNER_TORCH_SPARSE = "torch_sparse_sgd"
+CLASSIFIER_BACKEND = "sgd_logistic_v1"
+CLASSIFIER_HASH_DIM = 256
+CLASSIFIER_EPOCHS = 120
+CLASSIFIER_LEARNING_RATE = 0.05
+CLASSIFIER_L2 = 1e-4
+CLASSIFIER_LR_DECAY = 0.99
+
+DEFAULT_VAL_SPLIT_MOD = 5
+DEFAULT_VAL_SPLIT_REMAINDER = 0
 
 DETERMINISTIC_BALANCE_VERSION = "1.0"
 DETERMINISTIC_BALANCE_SEED = 0
@@ -160,6 +176,10 @@ class EvaluationResult:
     metric_median_ae: Mapping[str, float] = field(default_factory=dict)
     metric_trimmed_mae: Mapping[str, float] = field(default_factory=dict)
     metric_mae_log1p: Mapping[str, float] = field(default_factory=dict)
+    metric_mae_all: Mapping[str, float] = field(default_factory=dict)
+    metric_mae_pass: Mapping[str, float] = field(default_factory=dict)
+    metric_mae_log1p_pass: Mapping[str, float] = field(default_factory=dict)
+    classifier_metrics: Mapping[str, float | None] = field(default_factory=dict)
 
 
 @dataclass
@@ -179,6 +199,8 @@ class SurrogateModel:
     trained_at_utc: str
     identity_token_effects: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
     identity_cross_token_effects: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+    target_transforms: Mapping[str, str] = field(default_factory=dict)
+    classifier: Mapping[str, Any] | None = None
 
     def to_dict(self) -> Mapping[str, Any]:
         return {
@@ -199,6 +221,8 @@ class SurrogateModel:
             "compute_backend": self.compute_backend,
             "token_learner_backend": self.token_learner_backend,
             "trained_at_utc": self.trained_at_utc,
+            "target_transforms": self.target_transforms,
+            "classifier": self.classifier,
         }
 
     @classmethod
@@ -228,6 +252,11 @@ class SurrogateModel:
         identity_cross_token_effects = _parse_token_effects(
             payload.get("identity_cross_token_effects")
         )
+        target_transforms = _parse_target_transforms(payload.get("target_transforms"))
+        classifier_payload = payload.get("classifier")
+        classifier: Mapping[str, Any] | None = (
+            dict(classifier_payload) if isinstance(classifier_payload, Mapping) else None
+        )
 
         return cls(
             model_id=str(payload.get("model_id", "")),
@@ -250,16 +279,23 @@ class SurrogateModel:
                 payload.get("token_learner_backend", TOKEN_LEARNER_RESIDUAL_MEAN)
             ),
             trained_at_utc=str(payload.get("trained_at_utc", "")),
+            target_transforms=target_transforms,
+            classifier=classifier,
         )
 
     def predict_many(self, rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
         results: list[Mapping[str, Any]] = []
         for row in rows:
             metrics = {metric: self._predict_metric(row, metric) for metric in METRIC_TARGETS}
+            classifier_probability = self._classifier_probability(row)
             results.append(
                 {
                     "metrics": metrics,
-                    "pass_probability": self._pass_probability(metrics.get(self.pass_metric)),
+                    "pass_probability": (
+                        classifier_probability
+                        if classifier_probability is not None
+                        else self._pass_probability(metrics.get(self.pass_metric))
+                    ),
                 }
             )
         return results
@@ -288,7 +324,13 @@ class SurrogateModel:
             effect = cross_effects.get(token)
             if effect is not None:
                 adjusted += effect
-        return adjusted
+        summary = self.global_metrics.get(metric)
+        bounded = _clamp_transformed_prediction(adjusted, summary)
+        raw_prediction = _apply_inverse_target_transform(metric, bounded, self.target_transforms)
+        if raw_prediction is not None:
+            return raw_prediction
+        fallback_value = summary.mean if summary and summary.count > 0 else bounded
+        return _apply_inverse_target_transform(metric, fallback_value, self.target_transforms)
 
     def _apply_feature_adjustment(
         self, row: Mapping[str, Any], metric: str, baseline: float
@@ -313,10 +355,41 @@ class SurrogateModel:
         summary = self.global_metrics.get(self.pass_metric)
         if not summary or summary.count == 0:
             return 0.0
-        target = value if value is not None else summary.mean
+        target = _apply_target_transform(self.pass_metric, value, self.target_transforms)
+        if target is None:
+            target = summary.mean
         denom = summary.std if summary.std > 1e-9 else 1.0
         normalized = (target - summary.mean) / denom
         return _sigmoid(normalized)
+
+    def _classifier_probability(self, row: Mapping[str, Any]) -> float | None:
+        payload = self.classifier
+        if not isinstance(payload, Mapping):
+            return None
+        if str(payload.get("backend", "")) != CLASSIFIER_BACKEND:
+            return None
+        signal_features = payload.get("signal_features")
+        if not isinstance(signal_features, Sequence) or isinstance(signal_features, (str, bytes)):
+            signal_features = FEATURE_SIGNAL_KEYS
+        signal_feature_keys = [str(feature) for feature in signal_features]
+        weights_payload = payload.get("weights")
+        if not isinstance(weights_payload, Sequence) or isinstance(weights_payload, (str, bytes)):
+            return None
+        weights = [float(weight) for weight in weights_payload]
+        intercept = float(payload.get("intercept", 0.0))
+        identity_hash_dim = int(payload.get("identity_hash_dim", CLASSIFIER_HASH_DIM))
+        cross_hash_dim = int(payload.get("cross_hash_dim", CLASSIFIER_HASH_DIM))
+        features = _classifier_feature_vector(
+            row,
+            signal_feature_keys=signal_feature_keys,
+            identity_hash_dim=max(0, identity_hash_dim),
+            cross_hash_dim=max(0, cross_hash_dim),
+        )
+        logit = intercept
+        for index, value in features.items():
+            if 0 <= index < len(weights):
+                logit += weights[index] * value
+        return _sigmoid(logit)
 
 
 def _normalize_niche_label(value: Any) -> str:
@@ -451,6 +524,11 @@ def train(
     model_id: str | None = None,
     compute_backend: str = BACKEND_PREFERENCE_AUTO,
     include_failures: bool = True,
+    train_rows: Sequence[Mapping[str, Any]] | None = None,
+    val_rows: Sequence[Mapping[str, Any]] | None = None,
+    split_mod: int = DEFAULT_VAL_SPLIT_MOD,
+    split_remainder: int = DEFAULT_VAL_SPLIT_REMAINDER,
+    split_fn: Callable[[Mapping[str, Any]], bool] | None = None,
 ) -> TrainResult:
     train_started_at = monotonic()
     dataset_root = resolve_snapshot_root(Path(dataset_path))
@@ -458,6 +536,18 @@ def train(
     rows = list(_load_dataset_rows(dataset_root))
     raw_row_count = len(rows)
     rows, balance_meta = _apply_deterministic_balance(rows)
+    resolved_train_rows, resolved_val_rows = _resolve_train_val_split(
+        rows,
+        train_rows=train_rows,
+        val_rows=val_rows,
+        split_mod=split_mod,
+        split_remainder=split_remainder,
+        split_fn=split_fn,
+    )
+    regression_rows = [row for row in resolved_train_rows if row.get("gate_pass") is True]
+    if not regression_rows:
+        regression_rows = list(resolved_train_rows)
+
     model_id = model_id or _default_model_id()
     backend_preference = _normalize_backend_preference(compute_backend)
     resolved_backend, fallback_reason = _resolve_compute_backend(backend_preference)
@@ -465,11 +555,13 @@ def train(
     model_root.mkdir(parents=True, exist_ok=True)
     _train_phase_log(
         "surrogate train %s phase=start "
-        "(snapshot=%s rows=%d raw_rows=%d backend_preference=%s backend_resolved=%s)",
+        "(snapshot=%s rows=%d raw_rows=%d train_rows=%d val_rows=%d backend_preference=%s backend_resolved=%s)",
         model_id,
         manifest.get("snapshot_id", ""),
-        len(rows),
+        len(regression_rows),
         raw_row_count,
+        len(resolved_train_rows),
+        len(resolved_val_rows),
         backend_preference,
         resolved_backend,
     )
@@ -486,13 +578,17 @@ def train(
     feature_metric_pairs = {
         metric: {feature: [] for feature in FEATURE_SIGNAL_KEYS} for metric in METRIC_TARGETS
     }
-    for row in rows:
+    for row in regression_rows:
         for metric in METRIC_TARGETS:
-            global_accumulators[metric].add(_to_number(row.get(metric)))
+            global_accumulators[metric].add(
+                _apply_target_transform(metric, row.get(metric), DEFAULT_TARGET_TRANSFORMS)
+            )
         for feature in FEATURE_SIGNAL_KEYS:
             feature_accumulators[feature].add(_to_number(row.get(feature)))
         for metric in METRIC_TARGETS:
-            metric_value = _to_number(row.get(metric))
+            metric_value = _apply_target_transform(
+                metric, row.get(metric), DEFAULT_TARGET_TRANSFORMS
+            )
             if metric_value is None:
                 continue
             for feature in FEATURE_SIGNAL_KEYS:
@@ -518,7 +614,10 @@ def train(
         for feature, summary in feature_summaries.items()
     }
 
-    main_skill_metrics = _aggregate_main_skill_metrics(rows)
+    main_skill_metrics = _aggregate_main_skill_metrics(
+        regression_rows,
+        target_transforms=DEFAULT_TARGET_TRANSFORMS,
+    )
     feature_weights: dict[str, dict[str, float]] = {}
     for metric in METRIC_TARGETS:
         weights_for_metric: dict[str, float] = {}
@@ -538,7 +637,7 @@ def train(
     _train_phase_log(
         "surrogate train %s phase=feature_regression_complete (rows=%d elapsed=%.1fs)",
         model_id,
-        len(rows),
+        len(regression_rows),
         max(0.0, monotonic() - feature_stage_started_at),
     )
 
@@ -556,6 +655,7 @@ def train(
         "backend_version": MODEL_VERSION,
         "compute_backend": resolved_backend,
         "trained_at_utc": trained_at,
+        "target_transforms": DEFAULT_TARGET_TRANSFORMS,
     }
     base_model = SurrogateModel(
         **model_kwargs,
@@ -564,18 +664,20 @@ def train(
         token_learner_backend=TOKEN_LEARNER_RESIDUAL_MEAN,
     )
     token_stage_started_at = monotonic()
-    baseline_predictions = base_model.predict_many(rows)
+    baseline_predictions = base_model.predict_many(regression_rows)
     (
         identity_effects,
         cross_effects,
         token_learner_backend,
         token_learner_fallback_reason,
-    ) = _learn_token_effects(rows, baseline_predictions, resolved_backend)
+    ) = _learn_token_effects(regression_rows, baseline_predictions, resolved_backend)
+    classifier_payload: Mapping[str, Any] | None = None
     model = SurrogateModel(
         **model_kwargs,
         identity_token_effects=identity_effects,
         identity_cross_token_effects=cross_effects,
         token_learner_backend=token_learner_backend,
+        classifier=classifier_payload,
     )
     _train_phase_log(
         "surrogate train %s phase=token_effects_complete "
@@ -598,7 +700,7 @@ def train(
         "classifier_cv_requested_folds": 0,
         "classifier_cv_used_folds": 0,
         "classifier_cv_status": "skipped",
-        "classifier_cv_skip_reason": None,
+        "classifier_cv_skip_reason": "not implemented for sgd logistic",
     }
     if include_failures:
         classifier_stage_started_at = monotonic()
@@ -606,94 +708,44 @@ def train(
             "surrogate train %s phase=classifier_start (include_failures=true)",
             model_id,
         )
-        classifier_cv_requested = 5
-        classifier_meta["classifier_cv_requested_folds"] = classifier_cv_requested
-        try:
-            import numpy as np
-            from sklearn.ensemble import RandomForestClassifier
-            from sklearn.model_selection import cross_val_score
-
-            classification_rows = [row for row in rows if row.get("gate_pass") is not None]
-            classifier_meta["classifier_train_samples"] = len(classification_rows)
-            if not classification_rows:
-                classifier_meta["classifier_skip_reason"] = "no gate_pass labels available"
-            else:
-                labels = [1 if row.get("gate_pass") else 0 for row in classification_rows]
-                label_counts = Counter(labels)
-                classifier_meta["classifier_label_distribution"] = dict(
-                    sorted(label_counts.items())
+        classification_rows = [
+            row for row in resolved_train_rows if row.get("gate_pass") is not None
+        ]
+        classifier_meta["classifier_train_samples"] = len(classification_rows)
+        if not classification_rows:
+            classifier_meta["classifier_skip_reason"] = "no gate_pass labels available"
+        else:
+            labels = [1 if row.get("gate_pass") else 0 for row in classification_rows]
+            label_counts = Counter(labels)
+            classifier_meta["classifier_label_distribution"] = {
+                str(key): int(value) for key, value in sorted(label_counts.items())
+            }
+            if len(label_counts) < 2:
+                classifier_meta["classifier_skip_reason"] = (
+                    "single-class gate_pass labels: "
+                    + ", ".join(f"{label}={count}" for label, count in sorted(label_counts.items()))
                 )
-                if len(label_counts) < 2:
-                    classifier_meta["classifier_skip_reason"] = (
-                        "single-class gate_pass labels: "
-                        + ", ".join(f"{label}={count}" for label, count in label_counts.items())
-                    )
-                else:
-                    feature_cols = list(FEATURE_SIGNAL_KEYS)
-                    X = np.array(
-                        [[row.get(f, 0) or 0 for f in feature_cols] for row in classification_rows]
-                    )
-                    y = np.array(labels)
-
-                    clf = RandomForestClassifier(n_estimators=50, max_depth=10, random_state=42)
-                    clf.fit(X, y)
-
-                    classifier_model = "RandomForestClassifier"
-                    classifier_meta["classifier_status"] = "trained"
-
-                    min_class_count = min(label_counts.values())
-                    cv_used = min(
-                        classifier_cv_requested,
-                        len(classification_rows),
-                        min_class_count,
-                    )
-                    cv_scores: list[float] = []
-                    if cv_used >= 2:
-                        _train_phase_log(
-                            "surrogate train %s phase=classifier_cv_start (folds=%d samples=%d)",
-                            model_id,
-                            cv_used,
-                            len(classification_rows),
-                        )
-                        try:
-                            cv_scores = cross_val_score(clf, X, y, cv=cv_used)
-                            classifier_meta["classifier_cv_status"] = "ran"
-                            classifier_meta["classifier_cv_skip_reason"] = None
-                        except Exception as exc:  # pragma: no cover - defensive guard
-                            classifier_meta["classifier_cv_status"] = "skipped"
-                            classifier_meta["classifier_cv_skip_reason"] = (
-                                f"cv error: {exc.__class__.__name__}"
-                            )
-                        finally:
-                            classifier_meta["classifier_cv_used_folds"] = cv_used
-                    else:
-                        classifier_meta["classifier_cv_status"] = "skipped"
-                        classifier_meta["classifier_cv_skip_reason"] = (
-                            "insufficient labeled samples for requested cv"
-                        )
-                        classifier_meta["classifier_cv_used_folds"] = cv_used
-
-                    import pickle
-
-                    classifier_path = model_root / "classifier.pkl"
-                    with open(classifier_path, "wb") as f:
-                        pickle.dump(clf, f)
-
-                    classifier_metrics = {
-                        "accuracy": float(clf.score(X, y)),
-                        "train_samples": len(X),
-                    }
-                    if classifier_meta["classifier_cv_status"] == "ran":
-                        classifier_metrics["cv_mean"] = float(np.mean(cv_scores))
-                        classifier_metrics["cv_std"] = float(np.std(cv_scores))
-        except ImportError:
-            classifier_meta["classifier_skip_reason"] = "sklearn unavailable"
-            classifier_meta["classifier_status"] = "skipped"
-        except Exception as exc:
-            classifier_meta["classifier_skip_reason"] = (
-                f"classifier processing failed: {exc.__class__.__name__}"
-            )
-            classifier_meta["classifier_status"] = "skipped"
+            else:
+                classifier_payload, classifier_metrics = _train_logistic_classifier(
+                    classification_rows,
+                    signal_feature_keys=list(FEATURE_SIGNAL_KEYS),
+                    identity_hash_dim=CLASSIFIER_HASH_DIM,
+                    cross_hash_dim=CLASSIFIER_HASH_DIM,
+                    epochs=CLASSIFIER_EPOCHS,
+                    learning_rate=CLASSIFIER_LEARNING_RATE,
+                    l2=CLASSIFIER_L2,
+                    lr_decay=CLASSIFIER_LR_DECAY,
+                )
+                classifier_model = CLASSIFIER_BACKEND
+                classifier_meta["classifier_status"] = "trained"
+                classifier_meta["classifier_skip_reason"] = None
+                model = SurrogateModel(
+                    **model_kwargs,
+                    identity_token_effects=identity_effects,
+                    identity_cross_token_effects=cross_effects,
+                    token_learner_backend=token_learner_backend,
+                    classifier=classifier_payload,
+                )
 
     classifier_elapsed = (
         max(0.0, monotonic() - classifier_stage_started_at)
@@ -716,12 +768,27 @@ def train(
 
     evaluation_stage_started_at = monotonic()
     _train_phase_log("surrogate train %s phase=evaluation_start", model_id)
-    predictions = model.predict_many(rows)
-    evaluation = evaluate_predictions(rows, predictions)
+    evaluation_rows = list(resolved_val_rows)
+    if not evaluation_rows:
+        evaluation_rows = list(resolved_train_rows)
+    predictions = model.predict_many(evaluation_rows)
+    evaluation = evaluate_predictions(evaluation_rows, predictions)
     metrics_payload = {
         "row_count": evaluation.row_count,
         "metric_mae": evaluation.metric_mae,
+        "metric_mae_all": evaluation.metric_mae_all,
+        "metric_mae_pass": evaluation.metric_mae_pass,
+        "metric_mae_log1p": evaluation.metric_mae_log1p,
+        "metric_mae_log1p_pass": evaluation.metric_mae_log1p_pass,
         "pass_probability": evaluation.pass_probability,
+        "classifier_metrics": evaluation.classifier_metrics,
+        "split": {
+            "train_rows": len(resolved_train_rows),
+            "val_rows": len(resolved_val_rows),
+            "regression_rows": len(regression_rows),
+            "split_mod": split_mod,
+            "split_remainder": split_remainder,
+        },
     }
     metrics_path = model_root / _METRICS_FILENAME
     metrics_path.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
@@ -750,6 +817,13 @@ def train(
     }
     meta_payload.update(classifier_meta)
     meta_payload["deterministic_balance"] = balance_meta
+    meta_payload["split"] = {
+        "train_rows": len(resolved_train_rows),
+        "val_rows": len(resolved_val_rows),
+        "regression_rows": len(regression_rows),
+        "split_mod": split_mod,
+        "split_remainder": split_remainder,
+    }
     if classifier_model and classifier_metrics:
         meta_payload["classifier"] = classifier_model
         meta_payload["classifier_metrics"] = classifier_metrics
@@ -813,32 +887,377 @@ def evaluate_predictions(
     rows: Sequence[Mapping[str, Any]],
     predictions: Sequence[Mapping[str, Any]],
 ) -> EvaluationResult:
-    metric_errors: dict[str, list[float]] = {metric: [] for metric in METRIC_TARGETS}
+    metric_errors_all: dict[str, list[float]] = {metric: [] for metric in METRIC_TARGETS}
+    metric_errors_pass: dict[str, list[float]] = {metric: [] for metric in METRIC_TARGETS}
+    metric_log_errors_all: dict[str, list[float]] = {metric: [] for metric in METRIC_TARGETS}
+    metric_log_errors_pass: dict[str, list[float]] = {metric: [] for metric in METRIC_TARGETS}
     pass_probs: list[float] = []
+    classifier_labels: list[int] = []
+    classifier_probs: list[float] = []
     row_list = list(rows)
     for row, prediction in zip(row_list, predictions, strict=True):
-        pass_probs.append(float(prediction.get("pass_probability", 0.0)))
+        pass_probability = float(prediction.get("pass_probability", 0.0))
+        pass_probs.append(min(1.0, max(0.0, pass_probability)))
+        gate_pass = row.get("gate_pass")
+        if isinstance(gate_pass, bool):
+            classifier_labels.append(1 if gate_pass else 0)
+            classifier_probs.append(pass_probs[-1])
         predicted_metrics = prediction.get("metrics", {})
+        is_pass_row = gate_pass is True
         for metric in METRIC_TARGETS:
             actual = _to_number(row.get(metric))
             predicted = _to_number(predicted_metrics.get(metric))
             if actual is None or predicted is None:
                 continue
-            metric_errors[metric].append(abs(predicted - actual))
+            metric_errors_all[metric].append(abs(predicted - actual))
+            transformed_actual = _safe_log1p(actual)
+            transformed_predicted = _safe_log1p(predicted)
+            metric_log_errors_all[metric].append(abs(transformed_predicted - transformed_actual))
+            if is_pass_row:
+                metric_errors_pass[metric].append(abs(predicted - actual))
+                metric_log_errors_pass[metric].append(
+                    abs(transformed_predicted - transformed_actual)
+                )
 
-    metric_mae = {
-        metric: mean(errors) if errors else 0.0 for metric, errors in metric_errors.items()
+    metric_mae_all = {
+        metric: mean(errors) if errors else 0.0 for metric, errors in metric_errors_all.items()
+    }
+    metric_mae_pass = {
+        metric: mean(errors) if errors else 0.0 for metric, errors in metric_errors_pass.items()
+    }
+    metric_mae_log1p_all = {
+        metric: mean(errors) if errors else 0.0 for metric, errors in metric_log_errors_all.items()
+    }
+    metric_mae_log1p_pass = {
+        metric: mean(errors) if errors else 0.0 for metric, errors in metric_log_errors_pass.items()
     }
     pass_summary = _stat_summary(pass_probs)
+    classifier_metrics = _classifier_eval_metrics(classifier_labels, classifier_probs)
     return EvaluationResult(
         row_count=len(row_list),
-        metric_mae=metric_mae,
+        metric_mae=metric_mae_all,
         pass_probability=pass_summary,
+        metric_mae_all=metric_mae_all,
+        metric_mae_pass=metric_mae_pass,
+        metric_mae_log1p=metric_mae_log1p_all,
+        metric_mae_log1p_pass=metric_mae_log1p_pass,
+        classifier_metrics=classifier_metrics,
     )
+
+
+def _normalize_target_transform(value: Any) -> str:
+    if isinstance(value, str) and value.strip().lower() == TARGET_TRANSFORM_LOG1P:
+        return TARGET_TRANSFORM_LOG1P
+    return TARGET_TRANSFORM_IDENTITY
+
+
+def _parse_target_transforms(payload: Any | None) -> dict[str, str]:
+    if not isinstance(payload, Mapping):
+        return {str(metric): TARGET_TRANSFORM_IDENTITY for metric in METRIC_TARGETS}
+    transforms = {
+        str(metric): _normalize_target_transform(
+            DEFAULT_TARGET_TRANSFORMS.get(metric, TARGET_TRANSFORM_IDENTITY)
+        )
+        for metric in METRIC_TARGETS
+    }
+    for metric, transform in payload.items():
+        metric_name = str(metric)
+        transforms[metric_name] = _normalize_target_transform(transform)
+    return transforms
+
+
+def _target_transform_name(metric: str, target_transforms: Mapping[str, str] | None = None) -> str:
+    if target_transforms and metric in target_transforms:
+        return _normalize_target_transform(target_transforms.get(metric))
+    return TARGET_TRANSFORM_IDENTITY
+
+
+def _apply_target_transform(
+    metric: str,
+    value: Any,
+    target_transforms: Mapping[str, str] | None = None,
+) -> float | None:
+    numeric = _to_number(value)
+    if numeric is None or not isfinite(numeric):
+        return None
+    transform_name = _target_transform_name(metric, target_transforms)
+    if transform_name == TARGET_TRANSFORM_LOG1P:
+        if numeric <= -1.0:
+            return None
+        return log1p(max(0.0, numeric))
+    return numeric
+
+
+def _apply_inverse_target_transform(
+    metric: str,
+    value: float | None,
+    target_transforms: Mapping[str, str] | None = None,
+) -> float | None:
+    if value is None or not isfinite(value):
+        return None
+    transform_name = _target_transform_name(metric, target_transforms)
+    if transform_name == TARGET_TRANSFORM_LOG1P:
+        raw = expm1(value)
+        if not isfinite(raw):
+            return None
+        return max(0.0, raw)
+    return value
+
+
+def _clamp_transformed_prediction(value: float, summary: MetricSummary | None) -> float:
+    if summary and summary.count > 0:
+        lower = min(summary.minimum, summary.maximum)
+        upper = max(summary.minimum, summary.maximum)
+        fallback = summary.mean
+    else:
+        lower = value
+        upper = value
+        fallback = 0.0
+    bounded = value if isfinite(value) else fallback
+    return min(upper, max(lower, bounded))
+
+
+def _safe_log1p(value: float) -> float:
+    bounded = value if isfinite(value) else 0.0
+    return log1p(max(0.0, bounded))
+
+
+def _stable_hash_mod(value: str, mod: int) -> int:
+    if mod <= 0:
+        return 0
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return int(digest, 16) % mod
+
+
+def _resolve_train_val_split(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    train_rows: Sequence[Mapping[str, Any]] | None,
+    val_rows: Sequence[Mapping[str, Any]] | None,
+    split_mod: int,
+    split_remainder: int,
+    split_fn: Callable[[Mapping[str, Any]], bool] | None,
+) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
+    if train_rows is not None or val_rows is not None:
+        resolved_train = list(train_rows or [])
+        resolved_val = list(val_rows or [])
+        if not resolved_train and resolved_val:
+            resolved_train = list(resolved_val)
+        if not resolved_val and resolved_train:
+            resolved_val = list(resolved_train)
+        return resolved_train, resolved_val
+
+    source_rows = list(rows)
+    if not source_rows:
+        return [], []
+
+    normalized_mod = max(1, int(split_mod))
+    normalized_remainder = int(split_remainder) % normalized_mod
+    resolved_train: list[Mapping[str, Any]] = []
+    resolved_val: list[Mapping[str, Any]] = []
+    for row in source_rows:
+        if split_fn is not None:
+            use_val = bool(split_fn(row))
+        else:
+            build_id = str(row.get("build_id") or "")
+            if not build_id:
+                build_id = (
+                    f"{row.get('scenario_id') or ''}|"
+                    f"{row.get('profile_id') or ''}|"
+                    f"{row.get('main_skill_package') or ''}"
+                )
+            use_val = _stable_hash_mod(build_id, normalized_mod) == normalized_remainder
+        if use_val:
+            resolved_val.append(row)
+        else:
+            resolved_train.append(row)
+
+    if not resolved_val:
+        resolved_val = [source_rows[0]]
+        resolved_train = source_rows[1:] or list(source_rows)
+    if not resolved_train:
+        resolved_train = list(source_rows)
+    return resolved_train, resolved_val
+
+
+def _hash_bucket(value: str, mod: int) -> int:
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return int(digest, 16) % mod
+
+
+def _classifier_feature_vector(
+    row: Mapping[str, Any],
+    *,
+    signal_feature_keys: Sequence[str],
+    identity_hash_dim: int,
+    cross_hash_dim: int,
+) -> dict[int, float]:
+    vector: dict[int, float] = {}
+    for index, feature in enumerate(signal_feature_keys):
+        numeric = _to_number(row.get(feature))
+        if numeric is None or not isfinite(numeric) or numeric == 0.0:
+            continue
+        vector[index] = numeric
+
+    offset = len(signal_feature_keys)
+    if identity_hash_dim > 0:
+        for token in _token_sequence(row.get(FEATURE_IDENTITY_TOKENS)):
+            bucket = _hash_bucket(f"identity:{token}", identity_hash_dim)
+            feature_index = offset + bucket
+            vector[feature_index] = vector.get(feature_index, 0.0) + 1.0
+    offset += max(0, identity_hash_dim)
+    if cross_hash_dim > 0:
+        for token in _token_sequence(row.get(FEATURE_IDENTITY_CROSS_TOKENS)):
+            bucket = _hash_bucket(f"cross:{token}", cross_hash_dim)
+            feature_index = offset + bucket
+            vector[feature_index] = vector.get(feature_index, 0.0) + 1.0
+
+    return vector
+
+
+def _train_logistic_classifier(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    signal_feature_keys: Sequence[str],
+    identity_hash_dim: int,
+    cross_hash_dim: int,
+    epochs: int,
+    learning_rate: float,
+    l2: float,
+    lr_decay: float,
+) -> tuple[dict[str, Any], dict[str, float]]:
+    labels = [1 if row.get("gate_pass") else 0 for row in rows]
+    vectors = [
+        _classifier_feature_vector(
+            row,
+            signal_feature_keys=signal_feature_keys,
+            identity_hash_dim=identity_hash_dim,
+            cross_hash_dim=cross_hash_dim,
+        )
+        for row in rows
+    ]
+    feature_count = len(signal_feature_keys) + max(0, identity_hash_dim) + max(0, cross_hash_dim)
+    weights = [0.0 for _ in range(feature_count)]
+    intercept = 0.0
+
+    positive_count = sum(labels)
+    negative_count = len(labels) - positive_count
+    positive_weight = len(labels) / (2.0 * positive_count)
+    negative_weight = len(labels) / (2.0 * negative_count)
+
+    step_size = max(1e-6, learning_rate)
+    for _ in range(max(1, epochs)):
+        for label, vector in zip(labels, vectors, strict=True):
+            logit = intercept
+            for index, value in vector.items():
+                if 0 <= index < feature_count:
+                    logit += weights[index] * value
+            probability = _sigmoid(logit)
+            class_weight = positive_weight if label == 1 else negative_weight
+            error = (probability - float(label)) * class_weight
+            for index, value in vector.items():
+                if 0 <= index < feature_count:
+                    gradient = (error * value) + (l2 * weights[index])
+                    weights[index] -= step_size * gradient
+            intercept -= step_size * error
+        step_size = max(1e-6, step_size * lr_decay)
+
+    predictions: list[float] = []
+    for vector in vectors:
+        logit = intercept
+        for index, value in vector.items():
+            if 0 <= index < feature_count:
+                logit += weights[index] * value
+        predictions.append(_sigmoid(logit))
+
+    eps = 1e-9
+    train_log_loss = mean(
+        [
+            -((label * log(max(eps, prob))) + ((1 - label) * log(max(eps, 1.0 - prob))))
+            for label, prob in zip(labels, predictions, strict=True)
+        ]
+    )
+    train_brier = mean(
+        [(prob - float(label)) ** 2 for label, prob in zip(labels, predictions, strict=True)]
+    )
+    train_auc = _roc_auc_score(labels, predictions)
+
+    payload = {
+        "backend": CLASSIFIER_BACKEND,
+        "signal_features": list(signal_feature_keys),
+        "identity_hash_dim": max(0, identity_hash_dim),
+        "cross_hash_dim": max(0, cross_hash_dim),
+        "weights": weights,
+        "intercept": intercept,
+    }
+    metrics: dict[str, float] = {
+        "train_samples": float(len(rows)),
+        "train_log_loss": float(train_log_loss),
+        "train_brier": float(train_brier),
+    }
+    if train_auc is not None:
+        metrics["train_auc"] = float(train_auc)
+    return payload, metrics
+
+
+def _classifier_eval_metrics(
+    labels: Sequence[int], probabilities: Sequence[float]
+) -> dict[str, float | None]:
+    if not labels:
+        return {
+            "brier": None,
+            "auc": None,
+            "labeled_count": 0.0,
+            "positive_count": 0.0,
+            "negative_count": 0.0,
+        }
+    brier = mean(
+        [
+            (probability - float(label)) ** 2
+            for label, probability in zip(labels, probabilities, strict=True)
+        ]
+    )
+    auc = _roc_auc_score(labels, probabilities)
+    positive = sum(labels)
+    negative = len(labels) - positive
+    return {
+        "brier": float(brier),
+        "auc": float(auc) if auc is not None else None,
+        "labeled_count": float(len(labels)),
+        "positive_count": float(positive),
+        "negative_count": float(negative),
+    }
+
+
+def _roc_auc_score(labels: Sequence[int], probabilities: Sequence[float]) -> float | None:
+    if len(labels) != len(probabilities) or not labels:
+        return None
+    positive = sum(labels)
+    negative = len(labels) - positive
+    if positive <= 0 or negative <= 0:
+        return None
+
+    ranked = sorted(zip(probabilities, labels, strict=True), key=lambda item: item[0])
+    rank = 1
+    positive_rank_sum = 0.0
+    index = 0
+    while index < len(ranked):
+        end = index + 1
+        while end < len(ranked) and ranked[end][0] == ranked[index][0]:
+            end += 1
+        tie_count = end - index
+        average_rank = (rank + (rank + tie_count - 1)) / 2.0
+        positive_rank_sum += average_rank * sum(label for _, label in ranked[index:end])
+        rank += tie_count
+        index = end
+
+    return (positive_rank_sum - (positive * (positive + 1) / 2.0)) / (positive * negative)
 
 
 def _aggregate_main_skill_metrics(
     rows: Sequence[Mapping[str, Any]],
+    *,
+    target_transforms: Mapping[str, str] | None = None,
 ) -> dict[str, dict[str, float]]:
     groups: dict[str, dict[str, _MetricAccumulator]] = {}
     for row in rows:
@@ -846,7 +1265,9 @@ def _aggregate_main_skill_metrics(
         if key not in groups:
             groups[key] = {metric: _MetricAccumulator() for metric in METRIC_TARGETS}
         for metric in METRIC_TARGETS:
-            groups[key][metric].add(_to_number(row.get(metric)))
+            groups[key][metric].add(
+                _apply_target_transform(metric, row.get(metric), target_transforms)
+            )
 
     result: dict[str, dict[str, float]] = {}
     for key, metrics in groups.items():
@@ -881,10 +1302,10 @@ def _is_snapshot(path: Path) -> bool:
 
 
 def _main_skill_key(row: Mapping[str, Any]) -> str:
-    value = row.get("main_skill_package")
-    if value is None:
-        return _MISSING_SKILL
-    return str(value) if value else _MISSING_SKILL
+    scenario = _normalize_niche_label(row.get("scenario_id"))
+    profile = _normalize_niche_label(row.get("profile_id"))
+    skill = _normalize_niche_label(row.get("main_skill_package"))
+    return f"{scenario}|{profile}|{skill}"
 
 
 def _sigmoid(value: float) -> float:
@@ -1095,8 +1516,12 @@ def _learn_token_effects_residual_mean(
     for row, prediction in zip(rows, predictions, strict=True):
         predicted_metrics = prediction.get("metrics", {})
         for metric in METRIC_TARGETS:
-            actual = _to_number(row.get(metric))
-            predicted = _to_number(predicted_metrics.get(metric))
+            actual = _apply_target_transform(metric, row.get(metric), DEFAULT_TARGET_TRANSFORMS)
+            predicted = _apply_target_transform(
+                metric,
+                predicted_metrics.get(metric),
+                DEFAULT_TARGET_TRANSFORMS,
+            )
             if actual is None or predicted is None:
                 continue
             residual = actual - predicted
@@ -1149,8 +1574,12 @@ def _learn_token_effects_torch_sparse(
         targets: list[float] = []
         row_indices: list[int] = []
         for row_idx, (row, prediction) in enumerate(zip(rows, predictions, strict=True)):
-            actual = _to_number(row.get(metric))
-            predicted = _to_number((prediction.get("metrics") or {}).get(metric))
+            actual = _apply_target_transform(metric, row.get(metric), DEFAULT_TARGET_TRANSFORMS)
+            predicted = _apply_target_transform(
+                metric,
+                (prediction.get("metrics") or {}).get(metric),
+                DEFAULT_TARGET_TRANSFORMS,
+            )
             if actual is None or predicted is None:
                 continue
             targets.append(actual - predicted)

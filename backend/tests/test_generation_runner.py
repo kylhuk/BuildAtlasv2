@@ -1,11 +1,20 @@
+import json
+import random
+from pathlib import Path
 from xml.etree import ElementTree as ET
+
+from typing import Any, Sequence
 
 from backend.engine.generation.runner import (
     CANONICAL_ITEM_SLOTS,
     Candidate,
     POB_TARGET_VERSION,
+    _predict_candidates,
     _optimizer_objectives_from_payload,
+    _select_optimizer_elites,
+    _select_surrogate_optimizer_elites,
     _build_worker_xml_payload,
+    _load_surrogate_predictor,
 )
 from backend.engine.genome import GenomeV0
 
@@ -89,6 +98,54 @@ def _dummy_candidate() -> Candidate:
     )
 
 
+def _make_optimizer_candidate(
+    build_id: str,
+    seed: int,
+    actual_full_dps: float,
+    predicted_full_dps: float,
+    predicted_max_hit: float,
+    predicted_pass_probability: float | None = None,
+) -> Candidate:
+    genome = GenomeV0(
+        seed=seed,
+        class_name="Marauder",
+        ascendancy="Chieftain",
+        main_skill_package="sunder",
+        defense_archetype="armour",
+        budget_tier="endgame",
+        profile_id="alpha",
+    )
+    candidate = Candidate(
+        seed=seed,
+        build_id=build_id,
+        main_skill_package=genome.main_skill_package,
+        class_name=genome.class_name,
+        ascendancy=genome.ascendancy,
+        budget_tier=genome.budget_tier,
+        failures=[],
+        metrics_payload={
+            "alpha": {
+                "metrics": {
+                    "full_dps": actual_full_dps,
+                    "max_hit": 1000.0,
+                    "utility_score": 1.0,
+                    "total_cost_chaos": 10.0,
+                }
+            }
+        },
+        genome=genome,
+        code_payload="{}",
+        build_details_payload={},
+    )
+    candidate.predicted_metrics = {
+        "full_dps": predicted_full_dps,
+        "max_hit": predicted_max_hit,
+    }
+    candidate.predicted_full_dps = predicted_full_dps
+    candidate.pass_probability = predicted_pass_probability
+    return candidate
+
+
 def test_worker_xml_includes_target_version_attribute() -> None:
     candidate = _dummy_candidate()
     payload = _build_worker_xml_payload(candidate)
@@ -102,9 +159,7 @@ def test_worker_xml_includes_target_version_attribute() -> None:
     item_set = items.find("ItemSet")
     assert item_set is not None
     slot_names = {
-        slot.attrib.get("name")
-        for slot in item_set.findall("Slot")
-        if slot.attrib.get("name")
+        slot.attrib.get("name") for slot in item_set.findall("Slot") if slot.attrib.get("name")
     }
     assert set(CANONICAL_ITEM_SLOTS).issubset(slot_names)
     assert len(items.findall("Item")) >= len(CANONICAL_ITEM_SLOTS)
@@ -120,9 +175,9 @@ def test_worker_xml_includes_target_version_attribute() -> None:
     assert first_gem.attrib.get("nameSpec")
 
 
-
-
-def _scenario_metrics_entry(full_dps: float, max_hit: float, cost: float, warnings: list[str] | None = None) -> dict[str, Any]:
+def _scenario_metrics_entry(
+    full_dps: float, max_hit: float, cost: float, warnings: list[str] | None = None
+) -> dict[str, Any]:
     entry = {
         "metrics": {
             "full_dps": full_dps,
@@ -162,3 +217,103 @@ def test_optimizer_objectives_prefers_real_metrics_over_stub() -> None:
     assert summary["full_dps"] == 2000.0
     assert summary["max_hit"] == 1000.0
     assert summary["cost"] == 80.0
+
+
+def test_surrogate_optimizer_elites_prefers_predicted_metrics() -> None:
+    actual = _make_optimizer_candidate(
+        build_id="actual",
+        seed=1,
+        actual_full_dps=1500.0,
+        predicted_full_dps=500.0,
+        predicted_max_hit=1200.0,
+        predicted_pass_probability=0.2,
+    )
+    surrogate = _make_optimizer_candidate(
+        build_id="surrogate",
+        seed=2,
+        actual_full_dps=1200.0,
+        predicted_full_dps=700.0,
+        predicted_max_hit=1400.0,
+        predicted_pass_probability=0.4,
+    )
+
+    def stub_predictor(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        assert len(rows) == 2
+        return [
+            {
+                "metrics": {"full_dps": 900.0, "max_hit": 1200.0},
+                "pass_probability": 0.25,
+            },
+            {
+                "metrics": {"full_dps": 2200.0, "max_hit": 800.0},
+                "pass_probability": 0.9,
+            },
+        ]
+
+    _predict_candidates(stub_predictor, [actual, surrogate])
+
+    actual_elites = _select_optimizer_elites([actual, surrogate], 1)
+    assert actual_elites[0][0].build_id == "actual"
+    surrogate_elites = _select_surrogate_optimizer_elites([actual, surrogate], 1)
+    assert surrogate_elites[0][0].build_id == "surrogate"
+
+
+def test_load_surrogate_predictor_legacy_mapping(tmp_path: Path) -> None:
+    payload = {
+        "model_id": "legacy",
+        "predictions": {"sunder": 12.5},
+        "default": 2.0,
+    }
+    path = tmp_path / "legacy-surrogate.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    model_id, predictor = _load_surrogate_predictor(path)
+
+    assert model_id == "legacy"
+    scores = list(predictor([{"main_skill_package": "sunder"}, {"main_skill_package": "other"}]))
+    assert scores == [12.5, 2.0]
+
+
+def test_select_surrogate_elites_ignores_missing_pass_probability() -> None:
+    high = _make_optimizer_candidate(
+        build_id="high",
+        seed=1,
+        actual_full_dps=100.0,
+        predicted_full_dps=200.0,
+        predicted_max_hit=120.0,
+        predicted_pass_probability=None,
+    )
+    low = _make_optimizer_candidate(
+        build_id="low",
+        seed=2,
+        actual_full_dps=90.0,
+        predicted_full_dps=150.0,
+        predicted_max_hit=110.0,
+        predicted_pass_probability=0.5,
+    )
+
+    elites = _select_surrogate_optimizer_elites([low, high], 2, rng=random.Random(0))
+    assert elites[0][0] is high
+
+
+def test_select_surrogate_elites_tie_breaker_depends_on_rng() -> None:
+    tie_a = _make_optimizer_candidate(
+        build_id="tie-a",
+        seed=3,
+        actual_full_dps=100.0,
+        predicted_full_dps=160.0,
+        predicted_max_hit=130.0,
+        predicted_pass_probability=0.3,
+    )
+    tie_b = _make_optimizer_candidate(
+        build_id="tie-b",
+        seed=4,
+        actual_full_dps=105.0,
+        predicted_full_dps=160.0,
+        predicted_max_hit=130.0,
+        predicted_pass_probability=0.3,
+    )
+
+    elites = _select_surrogate_optimizer_elites([tie_a, tie_b], 2, rng=random.Random(0))
+    order = [candidate.build_id for candidate, _ in elites]
+    assert order != ["tie-a", "tie-b"]

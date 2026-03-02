@@ -637,6 +637,111 @@ def test_surrogate_predictor_prunes_candidates(tmp_path: Path) -> None:
         assert "selection_reason" in record
 
 
+def test_surrogate_model_path_predictions(tmp_path: Path) -> None:
+    surrogate_model_path = tmp_path / "tiny-surrogate.json"
+    surrogate_model_path.write_text(
+        json.dumps(
+            {
+                "model_id": "tiny",
+                "dataset_snapshot_id": "snapshot",
+                "feature_schema_version": "1.0",
+                "global_metrics": {
+                    "full_dps": {"mean": 100.0, "std": 1.0, "min": 50.0, "max": 150.0, "count": 1},
+                    "max_hit": {"mean": 200.0, "std": 1.0, "min": 100.0, "max": 250.0, "count": 1},
+                    "utility_score": {"mean": 1.0, "std": 0.5, "min": 0.0, "max": 2.0, "count": 1},
+                },
+                "main_skill_metrics": {
+                    "sunder": {"full_dps": 150.0, "max_hit": 250.0, "utility_score": 2.0}
+                },
+                "feature_stats": {},
+                "feature_weights": {},
+                "identity_token_effects": {},
+                "identity_cross_token_effects": {},
+                "pass_metric": "full_dps",
+                "backend": "ep-v4-baseline",
+                "backend_version": "0.2.0",
+                "compute_backend": "cpu",
+                "token_learner_backend": "torch_sparse_sgd",
+                "trained_at_utc": "2024-01-01T00:00:00Z",
+                "target_transforms": {
+                    "full_dps": "log1p",
+                    "max_hit": "log1p",
+                    "utility_score": "identity",
+                },
+                "classifier": None,
+            }
+        )
+    )
+
+    repo = FakeRepository()
+    evaluator = _fake_evaluator(tmp_path, repo)
+    summary = generation_runner.run_generation(
+        count=3,
+        seed_start=13,
+        ruleset_id=_ruleset_id(),
+        profile_id="pinnacle",
+        base_path=tmp_path,
+        repo=repo,
+        evaluator=evaluator,
+        surrogate_enabled=True,
+        surrogate_model_path=surrogate_model_path,
+        surrogate_top_k=2,
+        surrogate_exploration_pct=0.0,
+        metrics_generator=_verified_metrics_generator,
+        run_id="surrogate-model-path",
+    )
+
+    surrogate = summary["surrogate"]
+    assert surrogate["status"] == "active"
+    predictions_path = Path(summary["paths"]["surrogate_predictions"])
+    assert predictions_path.exists()
+    payload = json.loads(predictions_path.read_text())
+    assert payload["status"] == "active"
+    candidates = payload.get("candidates", [])
+    assert candidates
+    full_dps_values = {candidate["predicted_metrics"]["full_dps"] for candidate in candidates}
+    assert any(value != 0.0 for value in full_dps_values)
+
+
+def test_surrogate_degenerate_predictions_warn(tmp_path: Path, caplog) -> None:
+    repo = FakeRepository()
+    evaluator = _fake_evaluator(tmp_path, repo)
+
+    def constant_predictor(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [{"metrics": {"full_dps": 5.0}, "pass_probability": None} for _ in rows]
+
+    run_id = "degenerate-warning-run"
+    caplog.set_level(logging.WARNING)
+    with caplog.at_level(logging.WARNING, logger=generation_runner.__name__):
+        generation_runner.run_generation(
+            count=3,
+            seed_start=29,
+            ruleset_id=_ruleset_id(),
+            profile_id="pinnacle",
+            base_path=tmp_path,
+            repo=repo,
+            evaluator=evaluator,
+            surrogate_enabled=True,
+            surrogate_predictor=constant_predictor,
+            surrogate_top_k=2,
+            surrogate_exploration_pct=0.0,
+            metrics_generator=_verified_metrics_generator,
+            run_id=run_id,
+        )
+
+    warning_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == generation_runner.__name__
+    ]
+    assert any(
+        run_id in message and "surrogate predictions constant" in message
+        for message in warning_messages
+    )
+    assert any("full_dps" in message for message in warning_messages)
+    assert any("candidates" in message for message in warning_messages)
+
+
 def test_surrogate_missing_model_fallback(tmp_path: Path) -> None:
     repo = FakeRepository()
     evaluator = _fake_evaluator(tmp_path, repo)

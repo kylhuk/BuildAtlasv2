@@ -49,6 +49,7 @@ from backend.engine.passives.builder import PassiveTreePlan, build_passive_tree_
 from backend.engine.scenarios.loader import ScenarioTemplate, list_templates
 from backend.engine.skills.catalog import GemPlan, SkillCatalog, load_default_skill_catalog
 from backend.engine.sockets.planner import SocketPlan, plan_sockets
+from backend.engine.surrogate import load_model
 from backend.engine.surrogate.dataset import extract_feature_signals
 
 logger = logging.getLogger(__name__)
@@ -341,25 +342,154 @@ def _normalize_prediction_entry(entry: Any) -> tuple[dict[str, float], float | N
     return metrics, pass_probability
 
 
+def _predict_candidates(
+    predictor: Callable[[Sequence[dict[str, Any]]], Sequence[Any]],
+    candidates: Sequence[Candidate],
+) -> None:
+    target_candidates = [candidate for candidate in candidates if candidate.evaluable]
+    if not target_candidates:
+        return
+    feature_rows = [_candidate_feature_row(candidate) for candidate in target_candidates]
+    predictions = predictor(feature_rows)
+    if len(predictions) != len(feature_rows):
+        raise ValueError(
+            "surrogate predictor returned %d predictions for %d candidates"
+            % (len(predictions), len(feature_rows))
+        )
+    for candidate, prediction in zip(target_candidates, predictions, strict=True):
+        metrics, probability = _normalize_prediction_entry(prediction)
+        candidate.predicted_metrics = metrics or {}
+        candidate.pass_probability = probability
+        candidate.predicted_full_dps = candidate.predicted_metrics.get("full_dps", 0.0)
+
+
+def _log_degenerate_surrogate_predictions(run_id: str, candidates: Sequence[Candidate]) -> None:
+    total = len(candidates)
+    if total <= 1:
+        return
+    constant_metrics: list[str] = []
+    full_dps_values = {
+        candidate.predicted_full_dps if candidate.predicted_full_dps is not None else 0.0
+        for candidate in candidates
+    }
+    if len(full_dps_values) == 1:
+        constant_metrics.append("full_dps")
+    metric_counts: dict[str, int] = defaultdict(int)
+    metric_values: dict[str, set[float]] = defaultdict(set)
+    for candidate in candidates:
+        metrics = candidate.predicted_metrics or {}
+        for key, value in metrics.items():
+            if value is None or key == "full_dps":
+                continue
+            metric_counts[key] += 1
+            metric_values[key].add(value)
+    for metric, count in metric_counts.items():
+        if count == total and len(metric_values[metric]) == 1:
+            constant_metrics.append(metric)
+    if not constant_metrics:
+        return
+    metric_list = ", ".join(sorted(set(constant_metrics)))
+    logger.warning(
+        "generation run %s surrogate predictions constant for metrics [%s] across %d evaluable candidates",
+        run_id,
+        metric_list,
+        total,
+    )
+
+
+def _surrogate_prediction_components(
+    candidate: Candidate,
+) -> tuple[float, float | None, float | None]:
+    metrics = candidate.predicted_metrics or {}
+    full_dps = _coerce_float(metrics.get("full_dps"))
+    if full_dps is None:
+        full_dps = candidate.predicted_full_dps or 0.0
+    max_hit = _coerce_float(metrics.get("max_hit"))
+    pass_probability = _coerce_float(candidate.pass_probability)
+    return full_dps, max_hit, pass_probability
+
+
+def _surrogate_rank_key(
+    candidate: Candidate, *, tie_breaker: float
+) -> tuple[float, float, float, float]:
+    full_dps, max_hit, pass_probability = _surrogate_prediction_components(candidate)
+    max_hit_sort = max_hit if max_hit is not None else float("inf")
+    probability_sort = pass_probability if pass_probability is not None else float("-inf")
+    return (-full_dps, max_hit_sort, -probability_sort, tie_breaker)
+
+
+def _select_surrogate_optimizer_elites(
+    candidates: Sequence[Candidate],
+    elite_count: int,
+    *,
+    rng: random.Random | None = None,
+) -> list[tuple[Candidate, dict[str, Any]]]:
+    if elite_count <= 0:
+        return []
+    ranker = rng or random.Random()
+    scored: list[tuple[Candidate, tuple[float, float, float, float], dict[str, Any]]] = []
+    for candidate in candidates:
+        if not candidate.evaluable:
+            continue
+        full_dps, max_hit, _ = _surrogate_prediction_components(candidate)
+        summary = {
+            "full_dps": full_dps,
+            "max_hit": max_hit,
+            "cost": None,
+            "selection_basis": "surrogate_prediction",
+        }
+        scored.append(
+            (
+                candidate,
+                _surrogate_rank_key(candidate, tie_breaker=ranker.random()),
+                summary,
+            )
+        )
+    scored.sort(key=lambda item: item[1])
+    selected: list[tuple[Candidate, dict[str, Any]]] = []
+    selected_ids: set[str] = set()
+    for candidate, _, summary in scored:
+        if candidate.build_id in selected_ids:
+            continue
+        selected.append((candidate, summary))
+        selected_ids.add(candidate.build_id)
+        if len(selected) >= elite_count:
+            break
+    return selected
+
+
 def _load_surrogate_predictor(
     path: Path,
-) -> tuple[str | None, Callable[[Sequence[dict[str, Any]]], Sequence[float]]]:
+) -> tuple[str | None, Callable[[Sequence[dict[str, Any]]], Sequence[Any]]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    model_id = payload.get("model_id") or payload.get("id") or path.name
-    mapping = payload.get("predictions") or payload.get("scores") or {}
-    if not isinstance(mapping, Mapping):
-        raise ValueError("surrogate predictions payload must be a mapping")
-    default_score = float(payload.get("default", 0.0))
-    normalized = {str(key): float(value) for key, value in mapping.items()}
+    payload_model_id = payload.get("model_id") or payload.get("id")
+    base_name = path.name
 
-    def predictor(rows: Sequence[dict[str, Any]]) -> Sequence[float]:
-        results: list[float] = []
-        for row in rows:
-            key = str(row.get("main_skill_package") or "")
-            results.append(normalized.get(key, default_score))
-        return results
+    def _mapping_predictor(
+        mapping: Mapping[str, float],
+    ) -> Callable[[Sequence[dict[str, Any]]], Sequence[Any]]:
+        default_score = float(payload.get("default", 0.0))
+        normalized = {str(key): float(value) for key, value in mapping.items()}
 
-    return model_id, predictor
+        def predictor(rows: Sequence[dict[str, Any]]) -> Sequence[Any]:
+            results: list[float] = []
+            for row in rows:
+                key = str(row.get("main_skill_package") or "")
+                results.append(normalized.get(key, default_score))
+            return results
+
+        return predictor
+
+    mapping_payload = payload.get("predictions")
+    if not isinstance(mapping_payload, Mapping):
+        mapping_payload = payload.get("scores")
+    if isinstance(mapping_payload, Mapping):
+        model_id = payload_model_id or base_name
+        return model_id, _mapping_predictor(mapping_payload)
+
+    model = load_model(path)
+    model_id = payload_model_id or getattr(model, "model_id", None) or base_name
+    return model_id, model.predict_many
 
 
 SocketPlanner = Callable[[SkillCatalog, GenomeV0], SocketPlan]
@@ -1160,9 +1290,10 @@ def run_generation(
     metrics_generator: MetricsGenerator | None = None,
     surrogate_enabled: bool = False,
     surrogate_model_path: Path | str | None = None,
+    candidate_pool_size: int | None = None,
     surrogate_exploration_pct: float = 0.2,
     surrogate_top_k: int | None = None,
-    surrogate_predictor: Callable[[Sequence[dict[str, Any]]], Sequence[float]] | None = None,
+    surrogate_predictor: Callable[[Sequence[dict[str, Any]]], Sequence[Any]] | None = None,
     run_mode: Literal["standard", "optimizer"] = "standard",
     optimizer_iterations: int = 1,
     optimizer_elite_count: int = 2,
@@ -1178,6 +1309,9 @@ def run_generation(
         raise ValueError("optimizer_iterations must be positive")
     if optimizer_elite_count <= 0:
         raise ValueError("optimizer_elite_count must be positive")
+    if candidate_pool_size is not None and candidate_pool_size <= 0:
+        raise ValueError("candidate_pool_size must be positive")
+    pool_size = candidate_pool_size if candidate_pool_size is not None else max(count * 4, count)
     exploration_pct = max(0.0, min(1.0, surrogate_exploration_pct))
     top_k = surrogate_top_k if surrogate_top_k and surrogate_top_k > 0 else None
 
@@ -1187,6 +1321,28 @@ def run_generation(
     base_path.mkdir(parents=True, exist_ok=True)
 
     surrogate_model_path_obj = Path(surrogate_model_path) if surrogate_model_path else None
+
+    resolved_surrogate_predictor = surrogate_predictor
+    resolved_surrogate_model_id: str | None = None
+
+    def _resolve_surrogate_predictor() -> tuple[
+        str | None, Callable[[Sequence[dict[str, Any]]], Sequence[Any]]
+    ]:
+        nonlocal resolved_surrogate_predictor, resolved_surrogate_model_id
+        if resolved_surrogate_predictor is not None:
+            if resolved_surrogate_model_id is None:
+                resolved_surrogate_model_id = getattr(
+                    resolved_surrogate_predictor, "__name__", "custom_predictor"
+                )
+            return resolved_surrogate_model_id, resolved_surrogate_predictor
+        if not surrogate_model_path_obj:
+            raise ValueError(
+                "surrogate_model_path is required when surrogate is enabled without a predictor"
+            )
+        predictor_model_id, predictor_callable = _load_surrogate_predictor(surrogate_model_path_obj)
+        resolved_surrogate_predictor = predictor_callable
+        resolved_surrogate_model_id = predictor_model_id
+        return predictor_model_id, predictor_callable
 
     catalog = load_default_skill_catalog()
     templates = [template for template in list_templates() if template.profile_id == profile_id]
@@ -1355,8 +1511,9 @@ def run_generation(
         for index in range(count):
             _build_candidate(seed_start + index)
     else:
+        warmup_size = max(count, pool_size) if surrogate_enabled else count
         warmup_candidates: list[Candidate] = []
-        for index in range(count):
+        for index in range(warmup_size):
             warmup_candidates.append(
                 _build_candidate(
                     seed_start + index,
@@ -1364,8 +1521,34 @@ def run_generation(
                     source="optimizer_warmup",
                 )
             )
-        optimizer_stage_reports.append({"stage": "warmup", "count": len(warmup_candidates)})
-        elites = _select_optimizer_elites(candidates, optimizer_elite_count)
+        optimizer_stage_reports.append(
+            {
+                "stage": "warmup",
+                "count": len(warmup_candidates),
+            }
+        )
+        elites: list[tuple[Candidate, dict[str, Any]]] = []
+        surrogate_optimizer_predictor: (
+            Callable[[Sequence[dict[str, Any]]], Sequence[Any]] | None
+        ) = None
+        if surrogate_enabled:
+            try:
+                predictor_model_id, predictor_callable = _resolve_surrogate_predictor()
+                surrogate_optimizer_predictor = predictor_callable
+                _predict_candidates(predictor_callable, warmup_candidates)
+                elites = _select_surrogate_optimizer_elites(
+                    candidates,
+                    optimizer_elite_count,
+                    rng=random.Random(seed_start),
+                )
+            except Exception as exc:  # pragma: no cover - best effort surrogate fallback
+                logger.warning(
+                    "generation run %s surrogate optimizer warmup prediction failed: %s",
+                    session_id,
+                    exc,
+                )
+        if not elites:
+            elites = _select_optimizer_elites(candidates, optimizer_elite_count)
         optimizer_selection_history.append(_optimizer_selection_record("warmup", 0, elites))
         for iteration in range(1, optimizer_iterations + 1):
             if not elites:
@@ -1390,9 +1573,34 @@ def run_generation(
             if not new_stage_candidates:
                 break
             optimizer_stage_reports.append(
-                {"stage": f"iteration_{iteration}", "count": len(new_stage_candidates)}
+                {
+                    "stage": f"iteration_{iteration}",
+                    "count": len(new_stage_candidates),
+                }
             )
-            elites = _select_optimizer_elites(candidates, optimizer_elite_count)
+            if surrogate_enabled and surrogate_optimizer_predictor is not None:
+                try:
+                    _predict_candidates(surrogate_optimizer_predictor, new_stage_candidates)
+                    new_elites = _select_surrogate_optimizer_elites(
+                        candidates,
+                        optimizer_elite_count,
+                        rng=random.Random(seed_start + iteration),
+                    )
+                    if new_elites:
+                        elites = new_elites
+                    else:
+                        raise ValueError("surrogate optimizer selected no elites")
+                except Exception as exc:  # pragma: no cover - best effort surrogate fallback
+                    logger.warning(
+                        "generation run %s surrogate optimizer iteration %d prediction failed: %s",
+                        session_id,
+                        iteration,
+                        exc,
+                    )
+                    surrogate_optimizer_predictor = None
+                    elites = _select_optimizer_elites(candidates, optimizer_elite_count)
+            else:
+                elites = _select_optimizer_elites(candidates, optimizer_elite_count)
             optimizer_selection_history.append(
                 _optimizer_selection_record(f"iteration_{iteration}", iteration, elites)
             )
@@ -1446,11 +1654,17 @@ def run_generation(
                 candidate.predicted_metrics = metrics or {}
                 candidate.pass_probability = probability
                 candidate.predicted_full_dps = candidate.predicted_metrics.get("full_dps", 0.0)
-            scored_candidates = sorted(
-                evaluable_candidates,
-                key=lambda item: item.predicted_full_dps or 0.0,
-                reverse=True,
-            )
+            _log_degenerate_surrogate_predictions(session_id, evaluable_candidates)
+            ranker = random.Random(seed_start)
+            ranked_candidates = [
+                (
+                    candidate,
+                    _surrogate_rank_key(candidate, tie_breaker=ranker.random()),
+                )
+                for candidate in evaluable_candidates
+            ]
+            ranked_candidates.sort(key=lambda item: item[1])
+            scored_candidates = [candidate for candidate, _ in ranked_candidates]
             if top_k is None:
                 top_candidates = scored_candidates
                 remaining = []
@@ -1819,6 +2033,7 @@ def run_generation(
         "parameters": {
             "count": count,
             "seed_start": seed_start,
+            "candidate_pool_size": pool_size,
             "ruleset_id": ruleset_id,
             "profile_id": profile_id,
             "run_mode": run_mode,

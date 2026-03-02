@@ -35,6 +35,8 @@ engine/ep_v6/surrogate.py
 engine/evaluation/__init__.py
 engine/evaluation/gates.py
 engine/evaluation/normalized.py
+engine/generation/diversity.py
+engine/generation/exploration.py
 engine/generation/runner.py
 engine/items/__init__.py
 engine/items/templates.py
@@ -77,6 +79,7 @@ tests/test_item_templates.py
 tests/test_ml_loop.py
 tests/test_model_ops_api.py
 tests/test_passive_tree_builder.py
+tests/test_pob_worker.py
 tests/test_price_snapshot_ingest.py
 tests/test_price_snapshot_loader.py
 tests/test_recovery_manifest_tool.py
@@ -84,6 +87,7 @@ tests/test_reevaluate_builds.py
 tests/test_regression_baselines.py
 tests/test_ruleset_derivation.py
 tests/test_scenarios_and_gates.py
+tests/test_settings.py
 tests/test_skill_catalog.py
 tests/test_socket_planner.py
 tests/test_surrogate_model.py

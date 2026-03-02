@@ -98,6 +98,8 @@ def build_dataset_snapshot(
     snapshot_id: str,
     *,
     exclude_stub_rows: bool = False,
+    profile_id: str | None = None,
+    scenario_id: str | None = None,
 ) -> SnapshotResult:
     """Build a dataset snapshot from the given data/artifacts root."""
 
@@ -113,7 +115,14 @@ def build_dataset_snapshot(
         shutil.rmtree(snapshot_dir)
     snapshot_dir.mkdir(parents=True, exist_ok=True)
 
-    rows = list(_collect_rows(builds_root, exclude_stub_rows=exclude_stub_rows))
+    rows = list(
+        _collect_rows(
+            builds_root,
+            exclude_stub_rows=exclude_stub_rows,
+            profile_id=profile_id,
+            scenario_id=scenario_id,
+        )
+    )
     dataset_path = snapshot_dir / _DATASET_FILENAME
     dataset_hash = _write_rows(rows, dataset_path)
 
@@ -142,6 +151,8 @@ def _collect_rows(
     builds_root: Path,
     *,
     exclude_stub_rows: bool,
+    profile_id: str | None,
+    scenario_id: str | None,
 ) -> Iterable[Mapping[str, Any]]:
     if not builds_root.exists():
         return ()
@@ -159,6 +170,8 @@ def _collect_rows(
                 metrics,
                 build_details,
                 exclude_stub_rows=exclude_stub_rows,
+                profile_id_filter=profile_id,
+                scenario_id_filter=scenario_id,
             )
         )
     return rows
@@ -171,6 +184,8 @@ def _rows_for_build(
     build_details: Mapping[str, Any] | None,
     *,
     exclude_stub_rows: bool,
+    profile_id_filter: str | None,
+    scenario_id_filter: str | None,
 ) -> Iterable[Mapping[str, Any]]:
     pairs = sorted(
         ((str(key), key) for key in metrics),
@@ -182,7 +197,12 @@ def _rows_for_build(
             continue
         if exclude_stub_rows and _is_stub_scenario_payload(scenario_payload):
             continue
-        yield _build_row(build_id, scenario_label, genome, scenario_payload, build_details)
+        row = _build_row(build_id, scenario_label, genome, scenario_payload, build_details)
+        if not _matches_filter(row.get("profile_id"), profile_id_filter):
+            continue
+        if not _matches_filter(row.get("scenario_id"), scenario_id_filter):
+            continue
+        yield row
 
 
 def _is_stub_scenario_payload(payload: Mapping[str, Any]) -> bool:
@@ -241,7 +261,42 @@ def _build_row(
         row[attribute] = _numeric(attributes_section, attribute)
 
     row.update(extract_feature_signals(build_details))
+    identity_tokens = list(row.get(FEATURE_IDENTITY_TOKENS) or [])
+    identity_tokens = _extend_identity_tokens(
+        identity_tokens, _categorical_identity_tokens(row)
+    )
+    row[FEATURE_IDENTITY_TOKENS] = identity_tokens
     return row
+
+
+def _categorical_identity_tokens(row: Mapping[str, Any]) -> list[str]:
+    tokens: list[str] = []
+    entries = (
+        ("profile_id", row.get("profile_id")),
+        ("scenario_id", row.get("scenario_id")),
+        ("class", row.get("class")),
+        ("ascendancy", row.get("ascendancy")),
+        ("defense", row.get("defense_archetype")),
+        ("budget", row.get("budget_tier")),
+        ("main_skill", row.get("main_skill_package")),
+    )
+    for prefix, value in entries:
+        normalized = _normalize_token_value(value)
+        if normalized:
+            tokens.append(f"{prefix}:{normalized}")
+    return tokens
+
+
+def _extend_identity_tokens(tokens: list[str], extras: Sequence[str]) -> list[str]:
+    extended = list(tokens)
+    seen: set[str] = set(extended)
+    for token in extras:
+        if not token or token in seen:
+            continue
+        extended.append(token)
+        seen.add(token)
+    return extended[:_IDENTITY_TOKEN_LIMIT]
+
 
 
 def _write_rows(rows: Iterable[Mapping[str, Any]], path: Path) -> str:
@@ -821,6 +876,14 @@ def _normalize_token_value(value: Any | None) -> str | None:
     if not normalized:
         return None
     return re.sub(r"\s+", "_", normalized)
+
+
+def _matches_filter(value: Any, expected: str | None) -> bool:
+    if expected is None:
+        return True
+    if value is None:
+        return False
+    return str(value) == expected
 
 
 def _contributions_positive(contributions: Mapping[str, Any], keys: Iterable[str]) -> bool:

@@ -369,6 +369,174 @@ def test_rows_include_build_details_features(tmp_path: Path) -> None:
     assert "main_gem:arcane|main_support:added_lightning|passive_node:node-1" in cross_tokens
 
 
+def test_snapshot_filters_by_profile_id(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    builds_root = data_root / "builds"
+    genome = {
+        "schema_version": "v0",
+        "seed": 1,
+        "class": "Marauder",
+        "ascendancy": "Chieftain",
+        "main_skill_package": "sunder",
+        "defense_archetype": "armour",
+        "budget_tier": "endgame",
+        "profile_id": "filtered",
+    }
+    metrics = {
+        "alpha": {
+            "metrics": {
+                "full_dps": 1500,
+                "max_hit": 1400,
+                "utility_score": 1.2,
+            },
+            "defense": {
+                "armour": 2000,
+                "evasion": 1200,
+            },
+            "resources": {
+                "life": 5000,
+                "mana": 1000,
+            },
+            "reservation": {
+                "reserved_percent": 50,
+                "available_percent": 50,
+            },
+            "attributes": {
+                "strength": 120,
+                "dexterity": 110,
+                "intelligence": 130,
+            },
+        }
+    }
+    _create_build(builds_root, "filtered-build", genome, metrics)
+    _create_build(builds_root, "other-build", {**genome, "profile_id": "other", "seed": 2}, metrics)
+    output_root = data_root / "datasets" / "ep-v4"
+    result = build_dataset_snapshot(data_root, output_root, "profile-filter", profile_id="filtered")
+    rows = [
+        json.loads(line)
+        for line in result.dataset_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == 1
+    assert rows[0]["profile_id"] == "filtered"
+
+
+def test_snapshot_filters_by_scenario_id(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    builds_root = data_root / "builds"
+    genome = {
+        "schema_version": "v0",
+        "seed": 1,
+        "class": "Marauder",
+        "ascendancy": "Chieftain",
+        "main_skill_package": "sunder",
+        "defense_archetype": "armour",
+        "budget_tier": "endgame",
+        "profile_id": "filtered",
+    }
+    base_payload = {
+        "metrics": {
+            "full_dps": 1500,
+            "max_hit": 1400,
+            "utility_score": 1.2,
+        },
+        "defense": {
+            "armour": 2000,
+            "evasion": 1200,
+        },
+        "resources": {
+            "life": 5000,
+            "mana": 1000,
+        },
+        "reservation": {
+            "reserved_percent": 50,
+            "available_percent": 50,
+        },
+        "attributes": {
+            "strength": 120,
+            "dexterity": 110,
+            "intelligence": 130,
+        },
+    }
+    _create_build(builds_root, "alpha-build", genome, {"alpha": base_payload})
+    _create_build(
+        builds_root,
+        "beta-build",
+        {**genome, "seed": 2},
+        {"beta": {**base_payload, "metrics": {**base_payload["metrics"], "full_dps": 1700}}},
+    )
+    output_root = data_root / "datasets" / "ep-v4"
+    result = build_dataset_snapshot(data_root, output_root, "scenario-filter", scenario_id="beta")
+    rows = [
+        json.loads(line)
+        for line in result.dataset_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == 1
+    assert rows[0]["scenario_id"] == "beta"
+
+
+def test_categorical_identity_tokens(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    builds_root = data_root / "builds"
+    genome = {
+        "schema_version": "v0",
+        "seed": 7,
+        "class": "Marauder",
+        "ascendancy": "Chieftain",
+        "main_skill_package": "sunder",
+        "defense_archetype": "armour",
+        "budget_tier": "endgame",
+        "profile_id": "TokenProfile",
+    }
+    metrics = {
+        "omega": {
+            "metrics": {
+                "full_dps": 2100,
+                "max_hit": 1800,
+                "utility_score": 1.5,
+            },
+            "defense": {
+                "armour": 2500,
+                "evasion": 1500,
+            },
+            "resources": {
+                "life": 5200,
+                "mana": 1200,
+            },
+            "reservation": {
+                "reserved_percent": 55,
+                "available_percent": 60,
+            },
+            "attributes": {
+                "strength": 130,
+                "dexterity": 120,
+                "intelligence": 140,
+            },
+        }
+    }
+    _create_build(builds_root, "token-row", genome, metrics)
+    output_root = data_root / "datasets" / "ep-v4"
+    result = build_dataset_snapshot(data_root, output_root, "categorical-tokens")
+    rows = [
+        json.loads(line)
+        for line in result.dataset_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert rows
+    tokens = set(rows[0][FEATURE_IDENTITY_TOKENS])
+    expected = {
+        "profile_id:tokenprofile",
+        "scenario_id:omega",
+        "class:marauder",
+        "ascendancy:chieftain",
+        "defense:armour",
+        "budget:endgame",
+        "main_skill:sunder",
+    }
+    assert expected.issubset(tokens)
+
+
 def test_snapshot_id_rejects_path_traversal(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     output_root = data_root / "datasets" / "ep-v4"
