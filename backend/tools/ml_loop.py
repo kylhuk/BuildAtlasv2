@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import logging
+import math
+import statistics
+import tarfile
+import tempfile
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,7 +16,11 @@ from time import monotonic
 from typing import Any, Mapping, Sequence
 
 from backend.app.settings import settings
-from backend.engine.generation.runner import run_generation
+from backend.engine.generation.runner import (
+    run_generation,
+    load_run_summary,
+    _run_summary_path,
+)
 from backend.engine.ruleset import (
     DEFAULT_PRICE_SNAPSHOT_ID,
     derive_ruleset_id,
@@ -1150,6 +1159,560 @@ def _load_iteration_records(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+REPORT_CSV_SEPARATOR = ";"
+REPORT_METRICS = tuple(METRIC_TARGETS)
+REPORT_FIELD_ORDER = [
+    "iteration",
+    "run_id",
+    "snapshot_id",
+    "model_id",
+    "promoted",
+    "generation.candidate_pool_size",
+    "generation.evaluation_budget",
+    "generation.surrogate_enabled",
+    "generation.surrogate_model_id",
+    "generation.surrogate_status",
+    "generation.fallback_reason",
+    "generation.counts.candidates",
+    "generation.counts.selected",
+    "generation.counts.pruned",
+    "generation.counts.exploration",
+    "surrogate.full_dps.min",
+    "surrogate.full_dps.median",
+    "surrogate.full_dps.p95",
+    "surrogate.full_dps.max",
+    "surrogate.full_dps.std",
+    "surrogate.full_dps.uniq",
+    "surrogate.full_dps.degenerate",
+    "surrogate.max_hit.min",
+    "surrogate.max_hit.median",
+    "surrogate.max_hit.p95",
+    "surrogate.max_hit.max",
+    "surrogate.max_hit.std",
+    "surrogate.max_hit.uniq",
+    "surrogate.max_hit.degenerate",
+    "evaluation.attempted",
+    "evaluation.verified",
+    "evaluation.failures",
+    "evaluation.errors",
+    "evaluation.full_dps.min",
+    "evaluation.full_dps.median",
+    "evaluation.full_dps.p95",
+    "evaluation.full_dps.max",
+    "evaluation.full_dps.std",
+    "evaluation.full_dps.uniq",
+    "evaluation.max_hit.min",
+    "evaluation.max_hit.median",
+    "evaluation.max_hit.p95",
+    "evaluation.max_hit.max",
+    "evaluation.max_hit.std",
+    "evaluation.max_hit.uniq",
+    "evaluation.gate_pass_0",
+    "evaluation.gate_pass_1",
+    "training.snapshot_row_count",
+    "training.label_counts",
+    "training.feature_sparsity.nonzero_signals",
+    "training.feature_sparsity.nonzero_tokens",
+    "training.backend",
+    "training.token_learner",
+    "training.train_seconds",
+    "model_quality.metric_mae_log1p_pass.full_dps",
+    "model_quality.metric_mae_log1p_pass.max_hit",
+    "model_quality.classifier_metrics",
+    "warnings",
+]
+
+
+def _safe_load_state(state_path: Path) -> tuple[dict[str, Any], list[str]]:
+    warnings: list[str] = []
+    if not state_path.exists():
+        warnings.append("state_missing")
+        return {}, warnings
+    try:
+        return _load_state(state_path), warnings
+    except Exception as exc:
+        warnings.append(f"state_invalid:{exc}")
+        return {}, warnings
+
+
+def _try_load_json(
+    path: Path, description: str, warnings: list[str]
+) -> Mapping[str, Any] | list[Any] | None:
+    try:
+        if not path.exists():
+            warnings.append(f"{description}_missing")
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        warnings.append(f"{description}_invalid:{exc}")
+    except OSError as exc:
+        warnings.append(f"{description}_io_error:{exc}")
+    except Exception as exc:
+        warnings.append(f"{description}_error:{exc}")
+    return None
+
+
+def _safe_percentile(values: Sequence[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    sorted_values = sorted(values)
+    if not sorted_values:
+        return None
+    position = (len(sorted_values) - 1) * percentile
+    lower_index = math.floor(position)
+    upper_index = math.ceil(position)
+    lower_value = sorted_values[int(lower_index)]
+    upper_value = sorted_values[int(upper_index)]
+    if lower_index == upper_index:
+        return float(lower_value)
+    weight = position - lower_index
+    return float(lower_value + (upper_value - lower_value) * weight)
+
+
+def _metric_stats(values: Sequence[float]) -> dict[str, float | int | bool | None]:
+    if not values:
+        return {
+            "min": None,
+            "median": None,
+            "p95": None,
+            "max": None,
+            "std": None,
+            "uniq": None,
+            "degenerate": None,
+        }
+    sorted_values = sorted(values)
+    uniq_values = len(set(sorted_values))
+    std_value = statistics.pstdev(sorted_values)
+    return {
+        "min": float(sorted_values[0]),
+        "median": float(statistics.median(sorted_values)),
+        "p95": _safe_percentile(sorted_values, 0.95),
+        "max": float(sorted_values[-1]),
+        "std": float(std_value),
+        "uniq": uniq_values,
+        "degenerate": len(sorted_values) <= 1 or std_value <= 1e-6,
+    }
+
+
+def _collect_surrogate_metric_stats(
+    payload: Mapping[str, Any] | None, warnings: list[str]
+) -> dict[str, dict[str, float | int | bool | None]]:
+    stats = {metric: _metric_stats([]) for metric in REPORT_METRICS}
+    if not isinstance(payload, Mapping):
+        return stats
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, Sequence) or isinstance(candidates, (str, bytes)):
+        return stats
+    values: dict[str, list[float]] = {metric: [] for metric in REPORT_METRICS}
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        predicted = candidate.get("predicted_metrics")
+        if not isinstance(predicted, Mapping):
+            continue
+        for metric in REPORT_METRICS:
+            value = _numeric(predicted.get(metric))
+            if value is not None:
+                values[metric].append(value)
+    if not any(values[metric] for metric in REPORT_METRICS):
+        warnings.append("surrogate_predictions_no_values")
+    for metric in REPORT_METRICS:
+        stats[metric] = _metric_stats(values[metric])
+    return stats
+
+
+def _exploration_count(attempt_records: Sequence[Mapping[str, Any]] | None) -> int:
+    if not attempt_records:
+        return 0
+    return sum(
+        1
+        for record in attempt_records
+        if record.get("surrogate_selection_reason") == "surrogate_exploration"
+    )
+
+
+def _collect_gate_pass_counts(
+    records: Sequence[Mapping[str, Any]] | None,
+) -> tuple[int | None, int | None]:
+    if not records:
+        return None, None
+    zeros = ones = 0
+    seen = 0
+    for entry in records:
+        gate_value = entry.get("gate_pass")
+        if gate_value is True:
+            ones += 1
+            seen += 1
+        elif gate_value is False:
+            zeros += 1
+            seen += 1
+    if seen == 0:
+        return None, None
+    return zeros, ones
+
+
+def _derive_feature_sparsity(
+    model_payload: Mapping[str, Any] | None,
+) -> tuple[int | None, int | None]:
+    if not isinstance(model_payload, Mapping):
+        return None, None
+    feature_stats = model_payload.get("feature_stats")
+    nonzero_signals: int | None = None
+    if isinstance(feature_stats, Mapping):
+        count = 0
+        for value in feature_stats.values():
+            if isinstance(value, Mapping):
+                parsed = _numeric(value.get("count"))
+                if parsed is not None and parsed > 0:
+                    count += 1
+        nonzero_signals = count
+    identity_effects = model_payload.get("identity_token_effects")
+    cross_effects = model_payload.get("identity_cross_token_effects")
+    tokens: set[str] = set()
+    for effect_map in (identity_effects, cross_effects):
+        if not isinstance(effect_map, Mapping):
+            continue
+        for token_values in effect_map.values():
+            if not isinstance(token_values, Mapping):
+                continue
+            for token, value in token_values.items():
+                numeric_value = _numeric(value)
+                if numeric_value is not None and numeric_value != 0.0:
+                    tokens.add(str(token))
+    nonzero_tokens = len(tokens)
+    return nonzero_signals, nonzero_tokens
+
+
+def _extract_metric_value(entry: Mapping[str, Any], metric: str) -> float | None:
+    direct = _numeric(entry.get(metric))
+    if direct is not None:
+        return direct
+    for key in ("metrics", "actual_metrics", "predicted_metrics", "best_metrics"):
+        nested = entry.get(key)
+        if not isinstance(nested, Mapping):
+            continue
+        nested_value = _numeric(nested.get(metric))
+        if nested_value is not None:
+            return nested_value
+    return None
+
+
+def _collect_evaluation_metric_stats(
+    run_summary: Mapping[str, Any], warnings: list[str]
+) -> dict[str, dict[str, float | int | bool | None]]:
+    values: dict[str, list[float]] = {metric: [] for metric in REPORT_METRICS}
+
+    evaluation = _as_dict(run_summary.get("evaluation"))
+    generation = _as_dict(run_summary.get("generation"))
+    record_sets: list[Sequence[Any]] = []
+
+    evaluation_records = evaluation.get("records")
+    if isinstance(evaluation_records, Sequence) and not isinstance(
+        evaluation_records, (str, bytes)
+    ):
+        record_sets.append(evaluation_records)
+
+    generation_records = generation.get("records")
+    if isinstance(generation_records, Sequence) and not isinstance(
+        generation_records, (str, bytes)
+    ):
+        record_sets.append(generation_records)
+
+    generation_attempt_records = generation.get("attempt_records")
+    if isinstance(generation_attempt_records, Sequence) and not isinstance(
+        generation_attempt_records, (str, bytes)
+    ):
+        record_sets.append(generation_attempt_records)
+
+    for records in record_sets:
+        for entry in records:
+            if not isinstance(entry, Mapping):
+                continue
+            for metric in REPORT_METRICS:
+                value = _extract_metric_value(entry, metric)
+                if value is not None:
+                    values[metric].append(value)
+
+    if not any(values.get(metric) for metric in REPORT_METRICS):
+        benchmark = _as_dict(run_summary.get("benchmark"))
+        scenarios = benchmark.get("scenarios")
+        if isinstance(scenarios, Mapping):
+            for scenario_payload in scenarios.values():
+                if not isinstance(scenario_payload, Mapping):
+                    continue
+                full_dps = _numeric(scenario_payload.get("median_full_dps"))
+                max_hit = _numeric(scenario_payload.get("median_max_hit"))
+                if full_dps is not None and "full_dps" in values:
+                    values["full_dps"].append(full_dps)
+                if max_hit is not None and "max_hit" in values:
+                    values["max_hit"].append(max_hit)
+        if any(values.get(metric) for metric in REPORT_METRICS):
+            warnings.append("evaluation_stats_from_benchmark_medians")
+
+    if not any(values.get(metric) for metric in REPORT_METRICS):
+        warnings.append("evaluation_actual_metrics_missing")
+
+    return {metric: _metric_stats(values[metric]) for metric in REPORT_METRICS}
+
+
+def _mapping_numeric(payload: Mapping[str, Any] | None, keys: Sequence[str]) -> float | None:
+    if not isinstance(payload, Mapping):
+        return None
+    for key in keys:
+        value = _numeric(payload.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _resolve_train_seconds(
+    meta_payload: Mapping[str, Any] | None,
+    run_summary: Mapping[str, Any],
+) -> float | None:
+    common_keys = ("train_seconds", "training_seconds", "elapsed_seconds", "duration_seconds")
+    value = _mapping_numeric(meta_payload, common_keys)
+    if value is not None:
+        return value
+    meta_timings = _as_dict(_as_dict(meta_payload).get("timings"))
+    value = _mapping_numeric(meta_timings, common_keys)
+    if value is not None:
+        return value
+
+    ml_lifecycle = _as_dict(run_summary.get("ml_lifecycle"))
+    metadata = _as_dict(ml_lifecycle.get("metadata"))
+    model_meta = _as_dict(metadata.get("model_meta"))
+    value = _mapping_numeric(model_meta, common_keys)
+    if value is not None:
+        return value
+    model_meta_timings = _as_dict(model_meta.get("timings"))
+    return _mapping_numeric(model_meta_timings, common_keys)
+
+
+def _build_report_rows(
+    data_root: Path,
+    loop_root: Path,
+    iterations: Sequence[dict[str, Any]],
+    last: int | None,
+) -> list[dict[str, Any]]:
+    if last and last > 0:
+        selected = iterations[-last:]
+    else:
+        selected = list(iterations)
+    state_path = loop_root / STATE_FILENAME
+    state_payload, state_warnings = _safe_load_state(state_path)
+    summary_cache: dict[str, dict[str, Any]] = {}
+    summary_warnings: dict[str, list[str]] = {}
+    prediction_cache: dict[str, Mapping[str, Any] | None] = {}
+    prediction_warnings: dict[str, list[str]] = {}
+
+    def _load_summary(run_id: str) -> dict[str, Any]:
+        if run_id in summary_cache:
+            return summary_cache[run_id]
+        warnings: list[str] = []
+        try:
+            summary = load_run_summary(run_id, base_path=data_root)
+        except FileNotFoundError:
+            summary = {}
+            warnings.append(f"run_summary_missing:{run_id}")
+        except Exception as exc:
+            summary = {}
+            warnings.append(f"run_summary_error:{exc}")
+        summary_cache[run_id] = summary
+        summary_warnings[run_id] = warnings
+        return summary
+
+    def _load_predictions(run_id: str) -> Mapping[str, Any] | None:
+        if run_id in prediction_cache:
+            return prediction_cache[run_id]
+        warnings_list: list[str] = []
+        try:
+            summary_path = _run_summary_path(run_id, base_path=data_root)
+            payload_raw = _try_load_json(
+                summary_path.parent / "surrogate_predictions.json",
+                "surrogate_predictions",
+                warnings_list,
+            )
+            if isinstance(payload_raw, Mapping):
+                payload: Mapping[str, Any] | None = payload_raw
+            else:
+                payload = None
+                if payload_raw is not None:
+                    warnings_list.append(f"surrogate_predictions_invalid_shape:{run_id}")
+        except FileNotFoundError:
+            payload = None
+            warnings_list.append(f"surrogate_predictions_missing:{run_id}")
+        except Exception as exc:
+            payload = None
+            warnings_list.append(f"surrogate_predictions_error:{exc}")
+        prediction_cache[run_id] = payload
+        prediction_warnings[run_id] = warnings_list
+        return payload
+
+    rows: list[dict[str, Any]] = []
+    for record in selected:
+        row_warnings = list(state_warnings)
+        run_id_value = record.get("run_id")
+        run_id = str(run_id_value) if run_id_value else ""
+        run_summary: dict[str, Any] = {}
+        predictions_payload: Mapping[str, Any] | None = None
+        if run_id:
+            run_summary = _load_summary(run_id)
+            row_warnings.extend(summary_warnings.get(run_id, []))
+            predictions_payload = _load_predictions(run_id)
+            row_warnings.extend(prediction_warnings.get(run_id, []))
+        else:
+            row_warnings.append("run_id_missing")
+        row: dict[str, Any] = {key: None for key in REPORT_FIELD_ORDER}
+        row["iteration"] = record.get("iteration")
+        row["run_id"] = run_id or run_id_value
+        snapshot_info = record.get("snapshot") or {}
+        row["snapshot_id"] = snapshot_info.get("snapshot_id")
+        model_info = record.get("model") or {}
+        row["model_id"] = model_info.get("model_id")
+        row["promoted"] = model_info.get("promoted")
+        parameters = _as_dict(run_summary.get("parameters"))
+        surrogate = _as_dict(run_summary.get("surrogate"))
+        generation = _as_dict(run_summary.get("generation"))
+        counts = _as_dict(surrogate.get("counts"))
+        row["generation.candidate_pool_size"] = parameters.get("candidate_pool_size")
+        row["generation.evaluation_budget"] = parameters.get("count")
+        row["generation.surrogate_enabled"] = parameters.get("surrogate_enabled")
+        row["generation.surrogate_model_id"] = surrogate.get("model_id")
+        row["generation.surrogate_status"] = surrogate.get("status")
+        row["generation.fallback_reason"] = surrogate.get("fallback_reason")
+        row["generation.counts.candidates"] = counts.get("candidates")
+        row["generation.counts.selected"] = counts.get("selected")
+        row["generation.counts.pruned"] = counts.get("pruned")
+        generation_attempt_records = generation.get("attempt_records")
+        gate_source: Sequence[Mapping[str, Any]] | None = None
+        if isinstance(generation_attempt_records, Sequence) and not isinstance(
+            generation_attempt_records, (str, bytes)
+        ):
+            gate_source = [
+                entry for entry in generation_attempt_records if isinstance(entry, Mapping)
+            ]
+        generation_records = generation.get("records")
+        if (
+            gate_source is None
+            and isinstance(generation_records, Sequence)
+            and not isinstance(generation_records, (str, bytes))
+        ):
+            gate_source = [entry for entry in generation_records if isinstance(entry, Mapping)]
+        row["generation.counts.exploration"] = _exploration_count(gate_source)
+        surrogate_stats = _collect_surrogate_metric_stats(predictions_payload, row_warnings)
+        for metric in REPORT_METRICS:
+            metric_stats = surrogate_stats.get(metric, {})
+            row[f"surrogate.{metric}.min"] = metric_stats.get("min")
+            row[f"surrogate.{metric}.median"] = metric_stats.get("median")
+            row[f"surrogate.{metric}.p95"] = metric_stats.get("p95")
+            row[f"surrogate.{metric}.max"] = metric_stats.get("max")
+            row[f"surrogate.{metric}.std"] = metric_stats.get("std")
+            row[f"surrogate.{metric}.uniq"] = metric_stats.get("uniq")
+            row[f"surrogate.{metric}.degenerate"] = metric_stats.get("degenerate")
+        evaluation_summary = _as_dict(run_summary.get("evaluation"))
+        row["evaluation.attempted"] = _coerce_int(evaluation_summary.get("attempted"))
+        row["evaluation.verified"] = _coerce_int(evaluation_summary.get("successes"))
+        row["evaluation.failures"] = _coerce_int(evaluation_summary.get("failures"))
+        row["evaluation.errors"] = _coerce_int(evaluation_summary.get("errors"))
+        gate_zero, gate_one = _collect_gate_pass_counts(gate_source)
+        row["evaluation.gate_pass_0"] = gate_zero
+        row["evaluation.gate_pass_1"] = gate_one
+        evaluation_stats = _collect_evaluation_metric_stats(run_summary, row_warnings)
+        for metric in REPORT_METRICS:
+            metric_stats = evaluation_stats.get(metric, {})
+            row[f"evaluation.{metric}.min"] = metric_stats.get("min")
+            row[f"evaluation.{metric}.median"] = metric_stats.get("median")
+            row[f"evaluation.{metric}.p95"] = metric_stats.get("p95")
+            row[f"evaluation.{metric}.max"] = metric_stats.get("max")
+            row[f"evaluation.{metric}.std"] = metric_stats.get("std")
+            row[f"evaluation.{metric}.uniq"] = metric_stats.get("uniq")
+        row["training.snapshot_row_count"] = snapshot_info.get("row_count")
+        row["training.backend"] = model_info.get("compute_backend_resolved")
+        row["training.token_learner"] = model_info.get("token_learner_backend")
+        meta_payload: Mapping[str, Any] | None = None
+        meta_path = model_info.get("meta_path")
+        if meta_path:
+            loaded_meta = _try_load_json(Path(meta_path), "training_meta", row_warnings)
+            if isinstance(loaded_meta, Mapping):
+                meta_payload = loaded_meta
+            elif loaded_meta is not None:
+                row_warnings.append("training_meta_invalid_shape")
+        else:
+            row_warnings.append("training_meta_missing")
+        if isinstance(meta_payload, Mapping):
+            classifier_distribution = meta_payload.get("classifier_label_distribution")
+            if isinstance(classifier_distribution, Mapping):
+                row["training.label_counts"] = {
+                    str(key): int(value) if isinstance(value, (int, float)) else value
+                    for key, value in classifier_distribution.items()
+                }
+            backend_value = meta_payload.get("compute_backend_resolved")
+            token_value = meta_payload.get("token_learner_backend")
+            if backend_value is not None:
+                row["training.backend"] = backend_value
+            if token_value is not None:
+                row["training.token_learner"] = token_value
+        else:
+            row["training.label_counts"] = None
+        model_payload: Mapping[str, Any] | None = None
+        model_path = model_info.get("model_path")
+        if model_path:
+            loaded_model = _try_load_json(Path(model_path), "training_model", row_warnings)
+            if isinstance(loaded_model, Mapping):
+                model_payload = loaded_model
+            elif loaded_model is not None:
+                row_warnings.append("training_model_invalid_shape")
+        sparsity_signals, sparsity_tokens = _derive_feature_sparsity(model_payload)
+        row["training.feature_sparsity.nonzero_signals"] = sparsity_signals
+        row["training.feature_sparsity.nonzero_tokens"] = sparsity_tokens
+        row["training.train_seconds"] = _resolve_train_seconds(meta_payload, run_summary)
+        current_evaluation = _as_dict(_as_dict(record.get("evaluation")).get("current"))
+        mae_log1p_pass = _as_dict(current_evaluation.get("metric_mae_log1p_pass"))
+        row["model_quality.metric_mae_log1p_pass.full_dps"] = _numeric(
+            mae_log1p_pass.get("full_dps")
+        )
+        row["model_quality.metric_mae_log1p_pass.max_hit"] = _numeric(mae_log1p_pass.get("max_hit"))
+        classifier_metrics = current_evaluation.get("classifier_metrics")
+        if isinstance(classifier_metrics, Mapping):
+            row["model_quality.classifier_metrics"] = dict(classifier_metrics)
+        else:
+            row["model_quality.classifier_metrics"] = None
+        row["warnings"] = row_warnings
+        rows.append(row)
+    return rows
+
+
+def _format_csv_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value)
+
+
+def _write_report_file(rows: Sequence[dict[str, Any]], path: Path, fmt: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if fmt == "json":
+        path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+        return
+    if fmt == "csv":
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=REPORT_FIELD_ORDER)
+            writer.writeheader()
+            for row in rows:
+                csv_row = {}
+                for field in REPORT_FIELD_ORDER:
+                    if field == "warnings":
+                        csv_row[field] = REPORT_CSV_SEPARATOR.join(row.get(field) or [])
+                        continue
+                    csv_row[field] = _format_csv_value(row.get(field))
+                writer.writerow(csv_row)
+        return
+    raise ValueError(f"unsupported report format: {fmt}")
+
+
 def _numeric(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
@@ -1455,6 +2018,157 @@ def status_loop(args: argparse.Namespace) -> int:
     return 0
 
 
+def report_loop(args: argparse.Namespace) -> int:
+    loop_id = _validate_loop_id(args.loop_id)
+    data_root = Path(args.data_path)
+    data_root.mkdir(parents=True, exist_ok=True)
+    loop_root = _loop_root(data_root, loop_id)
+    iterations_path = loop_root / ITERATIONS_FILENAME
+    iterations = _load_iteration_records(iterations_path)
+    last_value = getattr(args, "last", None)
+    window = last_value if last_value and last_value > 0 else None
+    rows = _build_report_rows(data_root, loop_root, iterations, window)
+    output_path = Path(args.out)
+    _write_report_file(rows, output_path, args.format)
+    return 0
+
+
+def bundle_loop(args: argparse.Namespace) -> int:
+    loop_id = _validate_loop_id(args.loop_id)
+    data_root = Path(args.data_path)
+    data_root.mkdir(parents=True, exist_ok=True)
+    loop_root = _loop_root(data_root, loop_id)
+    iterations_path = loop_root / ITERATIONS_FILENAME
+    iterations = _load_iteration_records(iterations_path)
+    last_value = getattr(args, "last", None)
+    window = last_value if last_value and last_value > 0 else None
+    rows = _build_report_rows(data_root, loop_root, iterations, window)
+    if window and window > 0:
+        selected_iterations = iterations[-window:]
+    else:
+        selected_iterations = list(iterations)
+    state_path = loop_root / STATE_FILENAME
+    state_payload, _ = _safe_load_state(state_path)
+
+    def _determine_champion() -> Path | None:
+        last_model = state_payload.get("last_model_path")
+        if last_model:
+            return Path(last_model)
+        for record in reversed(selected_iterations):
+            model_info = record.get("model")
+            if not isinstance(model_info, Mapping):
+                continue
+            model_path = model_info.get("model_path")
+            if model_path:
+                return Path(model_path)
+        return None
+
+    champion_model_path = _determine_champion()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        tmp_root = Path(temp_dir)
+        report_json = tmp_root / "report.json"
+        report_csv = tmp_root / "report.csv"
+        _write_report_file(rows, report_json, "json")
+        _write_report_file(rows, report_csv, "csv")
+        output_path = Path(args.out)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        warnings_list: list[str] = []
+        files_info: list[dict[str, Any]] = []
+        repo_root = Path(__file__).resolve().parents[2]
+        with tarfile.open(output_path, "w:gz") as tar:
+
+            def _add_file(
+                src: Path,
+                arcname: str,
+                description: str,
+                *,
+                append_entry: bool = True,
+                override_entry: dict[str, Any] | None = None,
+            ) -> None:
+                entry = override_entry or {
+                    "path": arcname,
+                    "source": str(src),
+                    "description": description,
+                }
+                if not src.exists():
+                    entry["status"] = "missing"
+                    if append_entry:
+                        files_info.append(entry)
+                    warnings_list.append(f"{description}_missing")
+                    return
+                tar.add(src, arcname=arcname)
+                entry["status"] = "included"
+                if append_entry:
+                    files_info.append(entry)
+
+            _add_file(loop_root / STATE_FILENAME, f"ml_loops/{loop_id}/state.json", "loop_state")
+            _add_file(
+                loop_root / ITERATIONS_FILENAME,
+                f"ml_loops/{loop_id}/iterations.jsonl",
+                "iteration_records",
+            )
+            _add_file(report_json, "report.json", "loop_report_json")
+            _add_file(report_csv, "report.csv", "loop_report_csv")
+            backend_dir = repo_root / "backend"
+            _add_file(backend_dir, "backend", "backend_source")
+            run_ids = sorted(
+                run_id
+                for run_id in {row.get("run_id") for row in rows}
+                if isinstance(run_id, str) and run_id
+            )
+            for run_id in run_ids:
+                try:
+                    summary_path = _run_summary_path(run_id, base_path=data_root)
+                except Exception as exc:
+                    warnings_list.append(f"run_summary_path_error:{run_id}:{exc}")
+                    continue
+                _add_file(
+                    summary_path,
+                    f"runs/{run_id}/summary.json",
+                    f"run_summary:{run_id}",
+                )
+                _add_file(
+                    summary_path.parent / "surrogate_predictions.json",
+                    f"runs/{run_id}/surrogate_predictions.json",
+                    f"surrogate_predictions:{run_id}",
+                )
+            if champion_model_path:
+                _add_file(
+                    champion_model_path,
+                    f"ml_loops/{loop_id}/champion_model.json",
+                    "champion_model",
+                )
+            else:
+                warnings_list.append("champion_model_missing")
+            manifest_path = tmp_root / "bundle_manifest.json"
+            manifest_entry = {
+                "path": "bundle_manifest.json",
+                "source": str(manifest_path),
+                "description": "bundle_manifest",
+                "status": "included",
+            }
+            files_info.append(manifest_entry)
+            manifest_data = {
+                "loop_id": loop_id,
+                "selected_iterations": [record.get("iteration") for record in selected_iterations],
+                "generated_at": _now(),
+                "warnings": warnings_list,
+                "files": list(files_info),
+            }
+            manifest_path.write_text(
+                json.dumps(manifest_data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            _add_file(
+                manifest_path,
+                "bundle_manifest.json",
+                "bundle_manifest",
+                append_entry=False,
+                override_entry=manifest_entry,
+            )
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ML loop controller")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1591,6 +2305,44 @@ def _build_parser() -> argparse.ArgumentParser:
         help="recent iteration rows to print in human output",
     )
 
+    report_parser = subparsers.add_parser("report", help="Generate an ML loop report")
+    report_parser.add_argument("--loop-id", required=True, help="Loop identifier")
+    report_parser.add_argument(
+        "--data-path",
+        type=Path,
+        default=settings.data_path,
+        help="Root directory for artifacts and loop state",
+    )
+    report_parser.add_argument(
+        "--format",
+        choices=("json", "csv"),
+        default="json",
+        help="Output format for the report",
+    )
+    report_parser.add_argument("--out", type=Path, required=True, help="Report output path")
+    report_parser.add_argument(
+        "--last",
+        type=int,
+        default=None,
+        help="Limit the report to the final N iterations",
+    )
+
+    bundle_parser = subparsers.add_parser("bundle", help="Bundle ML loop artifacts")
+    bundle_parser.add_argument("--loop-id", required=True, help="Loop identifier")
+    bundle_parser.add_argument(
+        "--data-path",
+        type=Path,
+        default=settings.data_path,
+        help="Root directory for artifacts and loop state",
+    )
+    bundle_parser.add_argument("--out", type=Path, required=True, help="Tarball output path")
+    bundle_parser.add_argument(
+        "--last",
+        type=int,
+        default=None,
+        help="Include only the final N iterations",
+    )
+
     return parser
 
 
@@ -1601,7 +2353,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return start_loop(args)
     if args.command == "stop":
         return stop_loop(args)
-    return status_loop(args)
+    if args.command == "status":
+        return status_loop(args)
+    if args.command == "report":
+        return report_loop(args)
+    if args.command == "bundle":
+        return bundle_loop(args)
+    return 1
 
 
 if __name__ == "__main__":

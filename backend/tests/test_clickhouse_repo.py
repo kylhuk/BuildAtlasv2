@@ -3,6 +3,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from clickhouse_connect.driver.exceptions import ClickHouseError
+
 from backend.app.db.ch import (
     BuildCostRow,
     BuildInsertPayload,
@@ -104,6 +106,33 @@ def test_insert_scenario_metrics_batches_rows():
     assert kwargs["table"] == "scenario_metrics"
     assert kwargs["data"][0][3] == 1
     assert len(kwargs["data"]) == 2
+
+
+def test_insert_scenario_metrics_raises_schema_mismatch_hint():
+    client = MagicMock()
+    repo = ClickhouseRepository(client=client)
+    missing_error = ClickHouseError(
+        "Unrecognized column 'metrics_source' in table scenario_metrics"
+    )
+    client.insert.side_effect = missing_error
+
+    with pytest.raises(RuntimeError, match="make db-init"):
+        repo.insert_scenario_metrics([sample_scenario_row()])
+
+    assert client.insert.call_count == 1
+    first_columns = client.insert.call_args.kwargs["column_names"]
+    assert "metrics_source" in first_columns
+
+
+def test_insert_scenario_metrics_propagates_unrelated_errors():
+    client = MagicMock()
+    repo = ClickhouseRepository(client=client)
+    client.insert.side_effect = ClickHouseError("Syntax error near 'full_dps'")
+
+    with pytest.raises(ClickHouseError):
+        repo.insert_scenario_metrics([sample_scenario_row()])
+
+    assert client.insert.call_count == 1
 
 
 def test_insert_build_costs_batches_rows():

@@ -10,12 +10,18 @@ ML_LOOP_ITERATIONS ?= 0
 ML_LOOP_COUNT ?= 128
 ML_LOOP_DATA_PATH ?= .
 ML_LOOP_STATUS_FORMAT ?= human
+ML_LOOP_LAST ?=
+ML_LOOP_LAST_ARG = $(if $(strip $(ML_LOOP_LAST)),--last $(ML_LOOP_LAST))
+ML_LOOP_REPORT_DIR ?= reports/$(ML_LOOP_ID)
+ML_LOOP_REPORT_FORMAT ?= json
+ML_LOOP_REPORT_OUT ?= $(ML_LOOP_REPORT_DIR)/report.$(ML_LOOP_REPORT_FORMAT)
+ML_LOOP_BUNDLE_OUT ?= $(ML_LOOP_REPORT_DIR)/bundle.tar.gz
 TORCH_CPU_PACKAGES ?= torch torchvision torchaudio
 TORCH_CUDA_PACKAGES ?= torch torchvision torchaudio
 TORCH_CUDA_INDEX_URL ?= https://download.pytorch.org/whl/cu118
 TORCH_CUDA_INDEX_ARG = $(if $(strip $(TORCH_CUDA_INDEX_URL)),--extra-index-url $(TORCH_CUDA_INDEX_URL))
 
-.PHONY: clean db-up db-down db-init db-check dev backend-dev ui-dev test backend-test ui-test lint backend-lint ui-lint fmt backend-fmt ui-fmt regen-baselines ml-loop-start ml-loop-stop ml-loop-status torch-install-cpu torch-install-cuda torch-verify
+.PHONY: clean db-up db-down db-init db-check dev backend-dev ui-dev test backend-test ui-test lint backend-lint ui-lint fmt backend-fmt ui-fmt regen-baselines ml-loop-start ml-loop-stop ml-loop-status ml-loop-report ml-loop-bundle torch-install-cpu torch-install-cuda torch-verify
 
 clean:
 	@echo "Removing ML run/build artifacts under $(ML_LOOP_DATA_PATH)"
@@ -79,6 +85,23 @@ ml-loop-stop:
 
 ml-loop-status:
 	$(BACKEND_RUN) python -m backend.tools.ml_loop status --loop-id $(ML_LOOP_ID) --data-path $(ML_LOOP_DATA_PATH) --format $(ML_LOOP_STATUS_FORMAT)
+
+ml-loop-report:
+	@mkdir -p "$(ML_LOOP_REPORT_DIR)"
+	$(BACKEND_RUN) python -m backend.tools.ml_loop report \
+		--loop-id $(ML_LOOP_ID) \
+		--data-path $(ML_LOOP_DATA_PATH) \
+		--format $(ML_LOOP_REPORT_FORMAT) \
+		--out $(ML_LOOP_REPORT_OUT) \
+		$(ML_LOOP_LAST_ARG)
+
+ml-loop-bundle:
+	@mkdir -p "$(ML_LOOP_REPORT_DIR)"
+	$(BACKEND_RUN) python -m backend.tools.ml_loop bundle \
+		--loop-id $(ML_LOOP_ID) \
+		--data-path $(ML_LOOP_DATA_PATH) \
+		--out $(ML_LOOP_BUNDLE_OUT) \
+		$(ML_LOOP_LAST_ARG)
 
 # Torch helpers (optional install)
 torch-install-cpu:

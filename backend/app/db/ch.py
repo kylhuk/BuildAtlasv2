@@ -49,6 +49,33 @@ SCENARIO_METRIC_COLUMNS = [
     "metrics_source",
 ]
 
+_MISSING_METRICS_SOURCE_ERROR_KEYWORDS = (
+    "no column",
+    "unrecognized column",
+    "unknown identifier",
+    "unknown column",
+    "missing columns",
+    "does not exist",
+    "doesn't exist",
+    "is not under",
+    "not found",
+)
+
+
+def _is_missing_metrics_source_column_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    if "metrics_source" not in message:
+        return False
+    return any(keyword in message for keyword in _MISSING_METRICS_SOURCE_ERROR_KEYWORDS)
+
+
+def _schema_mismatch_error() -> RuntimeError:
+    return RuntimeError(
+        "ClickHouse schema mismatch: scenario_metrics.metrics_source is missing. "
+        "Run `make db-init` and retry."
+    )
+
+
 BUILD_COST_COLUMNS = [
     "build_id",
     "ruleset_id",
@@ -223,36 +250,47 @@ class ClickhouseRepository:
             database=settings.clickhouse_db,
         )
 
+    def _format_scenario_metric_rows(
+        self, rows: Sequence[ScenarioMetricRow], include_metrics_source: bool
+    ) -> list[list[Any]]:
+        formatted: list[list[Any]] = []
+        for row in rows:
+            entry = [
+                row.build_id,
+                row.ruleset_id,
+                row.scenario_id,
+                int(row.gate_pass),
+                row.gate_fail_reasons,
+                row.pob_warnings,
+                row.evaluated_at,
+                row.full_dps,
+                row.max_hit,
+                row.armour,
+                row.evasion,
+                row.life,
+                row.mana,
+                row.utility_score,
+            ]
+            if include_metrics_source:
+                entry.append(row.metrics_source)
+            formatted.append(entry)
+        return formatted
+
     def insert_scenario_metrics(self, rows: Sequence[ScenarioMetricRow]) -> None:
         if not rows:
             return
-        data = []
-        for row in rows:
-            data.append(
-                [
-                    row.build_id,
-                    row.ruleset_id,
-                    row.scenario_id,
-                    int(row.gate_pass),
-                    row.gate_fail_reasons,
-                    row.pob_warnings,
-                    row.evaluated_at,
-                    row.full_dps,
-                    row.max_hit,
-                    row.armour,
-                    row.evasion,
-                    row.life,
-                    row.mana,
-                    row.utility_score,
-                    row.metrics_source,
-                ]
+        data = self._format_scenario_metric_rows(rows, include_metrics_source=True)
+        try:
+            self._client.insert(
+                table="scenario_metrics",
+                data=data,
+                column_names=SCENARIO_METRIC_COLUMNS,
+                database=settings.clickhouse_db,
             )
-        self._client.insert(
-            table="scenario_metrics",
-            data=data,
-            column_names=SCENARIO_METRIC_COLUMNS,
-            database=settings.clickhouse_db,
-        )
+        except Exception as exc:
+            if _is_missing_metrics_source_column_error(exc):
+                raise _schema_mismatch_error() from exc
+            raise
 
     def insert_build_costs(self, rows: Sequence[BuildCostRow]) -> None:
         if not rows:

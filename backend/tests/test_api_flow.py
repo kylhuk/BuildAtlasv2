@@ -101,6 +101,9 @@ def _prepare_client(tmp_path) -> tuple[TestClient, FakeRepository]:
     app.dependency_overrides[get_build_evaluator] = lambda: BuildEvaluator(
         repo=fake_repo,
         base_path=tmp_path,
+        worker_cmd="luajit",
+        worker_args="pob/worker/worker.lua",
+        worker_cwd=".",
     )
     return TestClient(app), fake_repo
 

@@ -84,13 +84,17 @@ STUB_TRIPWIRE_MAX_HIT_INTERCEPT_TOLERANCE = 50.0
 def _row_metrics_sources(rows: Sequence[ScenarioMetricRow]) -> set[str]:
     sources: set[str] = set()
     for row in rows:  # pragma: no cover - defensive typing
-        normalized = normalize_metrics_source(getattr(row, "metrics_source", None), METRICS_SOURCE_STUB)
+        normalized = normalize_metrics_source(
+            getattr(row, "metrics_source", None), METRICS_SOURCE_STUB
+        )
         if normalized:
             sources.add(normalized)
     return sources
 
 
-def _collect_verified_metric_entries(candidates: Sequence[Candidate]) -> list[tuple[int, float | None, float | None]]:
+def _collect_verified_metric_entries(
+    candidates: Sequence[Candidate],
+) -> list[tuple[int, float | None, float | None]]:
     entries: list[tuple[int, float | None, float | None]] = []
     for candidate in candidates:
         if candidate.evaluation_status != BuildStatus.evaluated.value:
@@ -162,7 +166,8 @@ def _assert_no_stub_metrics(entries: Sequence[tuple[int, float | None, float | N
     max_matches = sum(
         1
         for seed, _, max_hit in entries
-        if max_hit is not None and isclose(
+        if max_hit is not None
+        and isclose(
             max_hit, STUB_TRIPWIRE_MAX_HIT_BASE + STUB_TRIPWIRE_MAX_HIT_SLOPE * seed, abs_tol=1e-3
         )
     )
@@ -177,6 +182,7 @@ def _assert_no_stub_metrics(entries: Sequence[tuple[int, float | None, float | N
         intercept_target=STUB_TRIPWIRE_MAX_HIT_BASE,
     ):
         raise ValueError("PoB evaluation inactive; stub metrics detected")
+
 
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -199,6 +205,8 @@ PRECHECK_CATEGORIES: tuple[str, ...] = (
 POB_TARGET_VERSION_DEFAULT = "3_0"
 _POB_TARGET_VERSION_PATTERN = re.compile(r"liveTargetVersion\s*=\s*\"([^\"]+)\"")
 _POB_GAME_VERSIONS_PATH = settings.pob_path / "src" / "GameVersions.lua"
+INFRASTRUCTURE_EVALUATION_ERROR_CODES = {"evaluation_error"}
+INFRASTRUCTURE_ERROR_CODE_PREFIXES = ("worker_",)
 
 
 def _load_pob_target_version() -> str:
@@ -517,8 +525,6 @@ def _log_degenerate_surrogate_predictions(run_id: str, candidates: Sequence[Cand
     )
 
 
-
-
 def _surrogate_predictions_degenerate(candidates: Sequence[Candidate]) -> bool:
     values = [
         candidate.predicted_full_dps if candidate.predicted_full_dps is not None else 0.0
@@ -531,6 +537,7 @@ def _surrogate_predictions_degenerate(candidates: Sequence[Candidate]) -> bool:
         return True
     stddev = pstdev(values)
     return stddev <= DEGENERATE_FULL_DPS_STDDEV_THRESHOLD
+
 
 def _surrogate_prediction_components(
     candidate: Candidate,
@@ -593,17 +600,16 @@ def _select_surrogate_optimizer_elites(
     return selected
 
 
-
-
 def _is_surrogate_model_payload(payload: Mapping[str, Any]) -> bool:
     required_keys = {
-        'feature_schema_version',
-        'feature_weights',
-        'global_metrics',
-        'main_skill_metrics',
-        'backend',
+        "feature_schema_version",
+        "feature_weights",
+        "global_metrics",
+        "main_skill_metrics",
+        "backend",
     }
     return all(key in payload for key in required_keys)
+
 
 def _load_surrogate_predictor(
     path: Path,
@@ -647,7 +653,6 @@ def _load_surrogate_predictor(
     model = load_model(path)
     model_id = payload_model_id or getattr(model, "model_id", None) or base_name
     return model_id, model.predict_many
-
 
 
 SocketPlanner = Callable[[SkillCatalog, GenomeV0], SocketPlan]
@@ -1949,6 +1954,7 @@ def run_generation(
     evaluation_failures = 0
     evaluation_errors = 0
     evaluation_started_at = monotonic()
+    infrastructure_failure_reason: dict[str, Any] | None = None
     progress_step = max(1, selected_count // 5) if selected_count else 1
     next_progress_count = progress_step
     last_progress_log_at = evaluation_started_at
@@ -1966,6 +1972,7 @@ def run_generation(
         if not candidate.selected_for_evaluation:
             continue
         evaluation_attempted += 1
+        abort_for_non_pob_metrics = False
         try:
             _persist_candidate(candidate)
             status, rows = evaluator.evaluate_build(candidate.build_id)
@@ -1975,9 +1982,9 @@ def run_generation(
             candidate.verified_metrics_payload = _metrics_payload_from_scenario_rows(rows)
             evaluation_rows.extend(rows)
             metrics_sources = _row_metrics_sources(rows)
-            evaluation_success = (
-                status is BuildStatus.evaluated and metrics_sources == {METRICS_SOURCE_POB}
-            )
+            evaluation_success = status is BuildStatus.evaluated and metrics_sources == {
+                METRICS_SOURCE_POB
+            }
             if evaluation_success:
                 evaluation_successes += 1
                 if candidate.surrogate_prediction_payload:
@@ -1996,6 +2003,18 @@ def run_generation(
                             "metrics_sources": sorted(metrics_sources),
                         },
                     }
+                if metrics_sources and METRICS_SOURCE_POB not in metrics_sources:
+                    abort_for_non_pob_metrics = True
+                    if infrastructure_failure_reason is None:
+                        infrastructure_failure_reason = {
+                            "code": "evaluation_non_pob_metrics",
+                            "message": "PoB evaluation inactive; non-PoB metrics returned",
+                            "details": {
+                                "build_id": candidate.build_id,
+                                "metrics_sources": sorted(metrics_sources),
+                                "error": candidate.evaluation_error,
+                            },
+                        }
                 candidate.evaluation_status = BuildStatus.failed.value
             evaluation_records.append(
                 {
@@ -2004,11 +2023,16 @@ def run_generation(
                     "error": candidate.evaluation_error,
                 }
             )
+            if abort_for_non_pob_metrics:
+                break
         except Exception as exc:  # pylint: disable=broad-except
+            error_code = getattr(exc, "code", "generation_error")
+            error_message = getattr(exc, "message", str(exc))
+            error_details = getattr(exc, "details", None)
             candidate.evaluation_error = {
-                "code": getattr(exc, "code", "generation_error"),
-                "message": getattr(exc, "message", str(exc)),
-                "details": getattr(exc, "details", None),
+                "code": error_code,
+                "message": error_message,
+                "details": error_details,
             }
             evaluation_records.append(
                 {
@@ -2021,12 +2045,41 @@ def run_generation(
             evaluation_failures += 1
             candidate.evaluation_status = BuildStatus.failed.value
             logger.warning(
-                "generation run %s candidate %s evaluation error code=%s message=%s",
+                "generation run %s candidate %s evaluation error code=%s message=%s details=%s",
                 session_id,
                 candidate.build_id,
                 candidate.evaluation_error["code"],
                 candidate.evaluation_error["message"],
+                candidate.evaluation_error.get("details"),
             )
+            normalized_code = str(error_code) if error_code is not None else ""
+            is_infrastructure_error = (
+                normalized_code in INFRASTRUCTURE_EVALUATION_ERROR_CODES
+                or any(
+                    normalized_code.startswith(prefix)
+                    for prefix in INFRASTRUCTURE_ERROR_CODE_PREFIXES
+                )
+            )
+            if is_infrastructure_error:
+                if infrastructure_failure_reason is None:
+                    details_text = str(error_details).lower() if error_details is not None else ""
+                    reason_code = "evaluation_infrastructure_error"
+                    reason_message = "PoB evaluation aborted after infrastructure failure"
+                    if "make db-init" in details_text or (
+                        "scenario_metrics.metrics_source" in details_text
+                        and "schema mismatch" in details_text
+                    ):
+                        reason_code = "clickhouse_schema_mismatch"
+                        reason_message = "ClickHouse schema mismatch detected; run `make db-init`"
+                    infrastructure_failure_reason = {
+                        "code": reason_code,
+                        "message": reason_message,
+                        "details": {
+                            "build_id": candidate.build_id,
+                            "error": candidate.evaluation_error,
+                        },
+                    }
+                break
 
         now = monotonic()
         should_log_progress = (
@@ -2199,7 +2252,14 @@ def run_generation(
         "errors": evaluation_errors,
     }
     status_reason: dict[str, Any] | None = None
-    if evaluation_attempted == 0:
+    run_status = "completed"
+    if infrastructure_failure_reason is not None:
+        run_status = "failed"
+        status_reason = {
+            **infrastructure_failure_reason,
+            "evaluation": evaluation_stats,
+        }
+    elif evaluation_attempted == 0:
         run_status = "failed"
         status_reason = {
             "code": "no_evaluation_attempts",
@@ -2220,8 +2280,6 @@ def run_generation(
             "message": f"{evaluation_failures} evaluation(s) failed",
             "evaluation": evaluation_stats,
         }
-    else:
-        run_status = "completed"
 
     summary = {
         "run_id": session_id,
@@ -2435,6 +2493,7 @@ def _benchmark_summary_from_rows(
         }
     summary_payload["metrics_source_counts"] = global_source_counts
     return summary_payload
+
 
 def _median_or_zero(values: Sequence[float]) -> float:
     if not values:

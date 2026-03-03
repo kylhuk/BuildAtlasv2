@@ -57,6 +57,7 @@ def test_evaluate_uses_worker_player_stats_when_enabled(tmp_path) -> None:
         mapping_payload = metrics_raw.get("mapping_t16")
         assert mapping_payload is not None
         assert mapping_payload["source"] == "pob_xml_playerstats"
+        assert mapping_payload["metrics_source"] == "fallback"
     finally:
         client.close()
 

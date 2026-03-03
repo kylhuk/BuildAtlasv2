@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,130 @@ class _FakeModel:
             }
             for _ in rows
         ]
+
+
+def _setup_ml_loop_report_artifacts(tmp_path: Path, loop_id: str, run_id: str) -> dict[str, Path]:
+    data_root = tmp_path / "data"
+    data_root.mkdir(parents=True, exist_ok=True)
+    loop_root = data_root / "ml_loops" / loop_id
+    loop_root.mkdir(parents=True, exist_ok=True)
+
+    model_root = loop_root / "models" / "champion"
+    model_root.mkdir(parents=True, exist_ok=True)
+    model_path = model_root / "model.json"
+    meta_path = model_root / "meta.json"
+    model_payload = {
+        "feature_stats": {
+            "signal_strength": {"count": 2},
+        },
+        "identity_token_effects": {
+            "tokenA": {"effect": 1},
+        },
+        "identity_cross_token_effects": {
+            "combo": {"effect": 2},
+        },
+    }
+    meta_payload = {
+        "classifier_label_distribution": {"0": 5, "1": 7},
+        "compute_backend_resolved": "cuda-meta",
+        "token_learner_backend": "token-learner-meta",
+        "timings": {"train_seconds": 12.5},
+    }
+    model_path.write_text(json.dumps(model_payload), encoding="utf-8")
+    meta_path.write_text(json.dumps(meta_payload), encoding="utf-8")
+
+    state_payload = {
+        "loop_id": loop_id,
+        "status": "completed",
+        "iteration": 1,
+        "last_model_id": "champion-model",
+        "last_model_path": str(model_path),
+        "last_improvement": {"improved": True},
+    }
+    state_path = loop_root / ml_loop.STATE_FILENAME
+    state_path.write_text(json.dumps(state_payload), encoding="utf-8")
+
+    iteration_record = {
+        "iteration": 1,
+        "run_id": run_id,
+        "snapshot": {"snapshot_id": "iter-0001", "row_count": 123},
+        "model": {
+            "model_id": "champion-model",
+            "model_path": str(model_path),
+            "meta_path": str(meta_path),
+            "compute_backend_resolved": "cuda-record",
+            "token_learner_backend": "token-learner-record",
+            "promoted": True,
+        },
+        "evaluation": {
+            "current": {
+                "metric_mae_log1p_pass": {"full_dps": 2.1, "max_hit": 3.2},
+                "classifier_metrics": {"brier": 0.1},
+            }
+        },
+    }
+    iterations_path = loop_root / ml_loop.ITERATIONS_FILENAME
+    iterations_path.write_text(json.dumps(iteration_record) + "\n", encoding="utf-8")
+
+    run_root = data_root / "runs" / run_id
+    run_root.mkdir(parents=True, exist_ok=True)
+    summary_path = run_root / "summary.json"
+    gate_records = [
+        {"surrogate_selection_reason": "surrogate_exploitation", "gate_pass": False},
+        {"surrogate_selection_reason": "surrogate_exploration", "gate_pass": True},
+        {"surrogate_selection_reason": "surrogate_exploitation", "gate_pass": True},
+        {"surrogate_selection_reason": "surrogate_exploitation", "gate_pass": False},
+    ]
+    evaluation_records = [
+        {"full_dps": 100, "max_hit": 50},
+        {"full_dps": 200, "max_hit": 60},
+        {"full_dps": 300, "max_hit": 70},
+        {"full_dps": 400, "max_hit": 80},
+    ]
+    summary_payload = {
+        "parameters": {
+            "count": 4,
+            "candidate_pool_size": 6,
+            "surrogate_enabled": True,
+        },
+        "surrogate": {
+            "status": "active",
+            "model_id": "surrogate-model",
+            "counts": {"candidates": 6, "selected": 4, "pruned": 2},
+        },
+        "generation": {
+            "attempt_records": gate_records,
+            "records": [],
+        },
+        "evaluation": {
+            "attempted": 4,
+            "successes": 3,
+            "failures": 1,
+            "errors": 0,
+            "records": evaluation_records,
+        },
+    }
+    summary_path.write_text(json.dumps(summary_payload), encoding="utf-8")
+
+    predictions_payload = {
+        "schema_version": 1,
+        "status": "active",
+        "candidates": [
+            {"predicted_metrics": {"full_dps": 10, "max_hit": 7}},
+            {"predicted_metrics": {"full_dps": 20, "max_hit": 7}},
+            {"predicted_metrics": {"full_dps": 30, "max_hit": 7}},
+            {"predicted_metrics": {"full_dps": 40, "max_hit": 7}},
+        ],
+    }
+    predictions_path = run_root / "surrogate_predictions.json"
+    predictions_path.write_text(json.dumps(predictions_payload), encoding="utf-8")
+
+    return {
+        "data_root": data_root,
+        "surrogate_predictions_path": predictions_path,
+        "iterations_path": iterations_path,
+        "state_path": state_path,
+    }
 
 
 @pytest.mark.parametrize(
@@ -971,6 +1097,63 @@ def test_start_loop_continues_after_unhealthy_generation(
     assert records[1]["model"]["promoted"] is True
 
 
+def test_start_loop_fails_fast_on_terminal_generation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop_id = "terminal-generation-failure"
+    data_path = tmp_path / "data"
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        iterations=0,
+        count=4,
+        seed_start=2,
+        profile_id="pinnacle",
+        ruleset_id="ruleset-smoke",
+        scenario_version=None,
+        price_snapshot_id="price",
+        pob_commit=None,
+        constraints_file=None,
+        data_path=data_path,
+        surrogate_backend="cpu",
+    )
+
+    def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "failed",
+            "evaluation": {"attempted": 1, "successes": 0, "failures": 1, "errors": 0},
+            "status_reason": {
+                "code": "evaluation_non_pob_metrics",
+                "message": "PoB evaluation inactive; non-PoB metrics returned",
+            },
+        }
+
+    def fake_fail(*args: object, **kwargs: object) -> None:
+        pytest.fail("should not run after terminal generation failure")
+
+    monkeypatch.setattr(ml_loop, "run_generation", fake_run_generation)
+    monkeypatch.setattr(ml_loop, "build_dataset_snapshot", fake_fail)
+    monkeypatch.setattr(ml_loop, "train", fake_fail)
+    monkeypatch.setattr(ml_loop, "load_dataset_rows", fake_fail)
+    monkeypatch.setattr(ml_loop, "load_model", fake_fail)
+    monkeypatch.setattr(ml_loop, "evaluate_predictions", fake_fail)
+
+    result = ml_loop.start_loop(args)
+    assert result == 1
+
+    state_path = data_path / "ml_loops" / loop_id / ml_loop.STATE_FILENAME
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "failed"
+    assert state["failed_iteration"] == 1
+    assert state["failed_phase"] == "generation"
+    assert "evaluation_non_pob_metrics" in state["last_error"]
+    assert "non-authoritative metrics" in state["last_error"]
+    failure_path = Path(state["last_failure_checkpoint_path"])
+    assert failure_path.exists()
+    failure = json.loads(failure_path.read_text(encoding="utf-8"))
+    assert "evaluation_non_pob_metrics" in failure["error"]
+
+
 def test_start_loop_endless_respects_stop_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1529,3 +1712,190 @@ def test_main_dispatches_status(tmp_path: Path, capsys: pytest.CaptureFixture[st
     payload = json.loads(output)
     assert payload["error"] == "loop_not_found"
     assert payload["loop_id"] == "missing-main"
+
+
+def test_report_loop_rows_include_expected_columns_and_stats(tmp_path: Path) -> None:
+    loop_id = "report-loop"
+    run_id = "report-loop-iter-0001"
+    fixture = _setup_ml_loop_report_artifacts(tmp_path, loop_id, run_id)
+    report_path = tmp_path / "report.json"
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        data_path=fixture["data_root"],
+        format="json",
+        out=report_path,
+    )
+
+    result = ml_loop.report_loop(args)
+    assert result == 0
+    assert report_path.exists()
+    rows = json.loads(report_path.read_text(encoding="utf-8"))
+    assert isinstance(rows, list) and len(rows) == 1
+    row = rows[0]
+
+    assert row["iteration"] == 1
+    assert row["run_id"] == run_id
+    assert row["generation.counts.candidates"] == 6
+    assert row["generation.counts.selected"] == 4
+    assert row["generation.counts.pruned"] == 2
+    assert row["generation.counts.exploration"] == 1
+    assert row["generation.evaluation_budget"] == 4
+    assert row["generation.surrogate_enabled"] is True
+    assert row["training.backend"] == "cuda-meta"
+    assert row["training.token_learner"] == "token-learner-meta"
+    assert row["training.train_seconds"] == 12.5
+    assert row["training.label_counts"] == {"0": 5, "1": 7}
+    assert row["surrogate.full_dps.median"] == pytest.approx(25.0)
+    assert row["surrogate.full_dps.p95"] == pytest.approx(38.5)
+    assert row["surrogate.full_dps.uniq"] == 4
+    assert row["surrogate.full_dps.degenerate"] is False
+    assert row["surrogate.full_dps.std"] > 0
+    assert row["surrogate.max_hit.median"] == pytest.approx(7.0)
+    assert row["surrogate.max_hit.std"] == pytest.approx(0.0)
+    assert row["surrogate.max_hit.uniq"] == 1
+    assert row["surrogate.max_hit.degenerate"] is True
+    assert row["evaluation.full_dps.median"] == pytest.approx(250.0)
+    assert row["evaluation.full_dps.p95"] == pytest.approx(385.0)
+    assert row["evaluation.full_dps.uniq"] == 4
+    assert row["evaluation.full_dps.std"] > 0
+    assert row["evaluation.gate_pass_0"] == 2
+    assert row["evaluation.gate_pass_1"] == 2
+
+
+def test_bundle_loop_contains_expected_artifacts_and_optional_predictions(tmp_path: Path) -> None:
+    loop_id = "bundle-loop"
+    run_id = "bundle-loop-iter-0001"
+    fixture = _setup_ml_loop_report_artifacts(tmp_path, loop_id, run_id)
+    bundle_path = tmp_path / "bundle.tar.gz"
+    args = argparse.Namespace(
+        loop_id=loop_id, data_path=fixture["data_root"], out=bundle_path, last=None
+    )
+
+    assert ml_loop.bundle_loop(args) == 0
+    with tarfile.open(bundle_path, "r:gz") as archive:
+        members = set(archive.getnames())
+        assert f"ml_loops/{loop_id}/state.json" in members
+        assert f"ml_loops/{loop_id}/iterations.jsonl" in members
+        assert "report.json" in members
+        assert "report.csv" in members
+        assert f"runs/{run_id}/summary.json" in members
+        assert f"runs/{run_id}/surrogate_predictions.json" in members
+        assert f"ml_loops/{loop_id}/champion_model.json" in members
+        assert "backend/tools/ml_loop.py" in members
+        assert "bundle_manifest.json" in members
+
+    fixture["surrogate_predictions_path"].unlink()
+    missing_bundle_path = tmp_path / "bundle-missing.tar.gz"
+    args_missing = argparse.Namespace(
+        loop_id=loop_id, data_path=fixture["data_root"], out=missing_bundle_path, last=None
+    )
+    assert ml_loop.bundle_loop(args_missing) == 0
+
+    with tarfile.open(missing_bundle_path, "r:gz") as archive:
+        members = set(archive.getnames())
+        assert f"runs/{run_id}/surrogate_predictions.json" not in members
+        manifest_member = archive.extractfile("bundle_manifest.json")
+        assert manifest_member is not None
+        manifest_data = json.loads(manifest_member.read())
+        warning = f"surrogate_predictions:{run_id}_missing"
+        assert warning in manifest_data["warnings"]
+
+
+def test_report_and_bundle_respect_last_window(tmp_path: Path) -> None:
+    loop_id = "window-loop"
+    run1 = "window-loop-iter-0001"
+    fixture = _setup_ml_loop_report_artifacts(tmp_path, loop_id, run1)
+    data_root = fixture["data_root"]
+    iterations_path = fixture["iterations_path"]
+    run2 = "window-loop-iter-0002"
+    loop_root = data_root / "ml_loops" / loop_id
+    model_path = loop_root / "models" / "champion" / "model.json"
+    meta_path = loop_root / "models" / "champion" / "meta.json"
+
+    second_record = {
+        "iteration": 2,
+        "run_id": run2,
+        "snapshot": {"snapshot_id": "iter-0002", "row_count": 321},
+        "model": {
+            "model_id": "window-loop-iter-0002",
+            "model_path": str(model_path),
+            "meta_path": str(meta_path),
+            "compute_backend_resolved": "cuda-record",
+            "token_learner_backend": "token-learner-record",
+            "promoted": True,
+        },
+        "evaluation": {"current": {"metric_mae": {"full_dps": 4.0}}},
+    }
+    with iterations_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(second_record) + "\n")
+
+    run2_root = data_root / "runs" / run2
+    run2_root.mkdir(parents=True, exist_ok=True)
+    summary_payload = {
+        "parameters": {
+            "count": 2,
+            "candidate_pool_size": 2,
+            "surrogate_enabled": False,
+        },
+        "surrogate": {
+            "status": "idle",
+            "counts": {"candidates": 2, "selected": 2, "pruned": 0},
+        },
+        "generation": {"attempt_records": [], "records": []},
+        "evaluation": {"attempted": 0, "successes": 0, "failures": 0, "errors": 0, "records": []},
+    }
+    (run2_root / "summary.json").write_text(json.dumps(summary_payload), encoding="utf-8")
+    predictions_payload = {"schema_version": 1, "status": "active", "candidates": []}
+    (run2_root / "surrogate_predictions.json").write_text(
+        json.dumps(predictions_payload), encoding="utf-8"
+    )
+
+    report_path = tmp_path / "window-report.json"
+    report_args = argparse.Namespace(
+        loop_id=loop_id,
+        data_path=data_root,
+        format="json",
+        out=report_path,
+        last=1,
+    )
+
+    assert ml_loop.report_loop(report_args) == 0
+    rows = json.loads(report_path.read_text(encoding="utf-8"))
+    assert len(rows) == 1
+    assert rows[0]["iteration"] == 2
+    assert rows[0]["run_id"] == run2
+
+    bundle_path = tmp_path / "window-bundle.tar.gz"
+    bundle_args = argparse.Namespace(loop_id=loop_id, data_path=data_root, out=bundle_path, last=1)
+    assert ml_loop.bundle_loop(bundle_args) == 0
+
+    with tarfile.open(bundle_path, "r:gz") as archive:
+        members = set(archive.getnames())
+        assert f"runs/{run2}/summary.json" in members
+        assert f"runs/{run1}/summary.json" not in members
+        manifest_member = archive.extractfile("bundle_manifest.json")
+        assert manifest_member is not None
+        manifest_data = json.loads(manifest_member.read())
+        assert manifest_data.get("selected_iterations") == [2]
+
+
+def test_report_loop_csv_output_includes_header_and_warnings(tmp_path: Path) -> None:
+    loop_id = "csv-loop"
+    run_id = "csv-loop-iter-0001"
+    fixture = _setup_ml_loop_report_artifacts(tmp_path, loop_id, run_id)
+    fixture["surrogate_predictions_path"].unlink()
+    report_path = tmp_path / "csv-report.csv"
+    args = argparse.Namespace(
+        loop_id=loop_id, data_path=fixture["data_root"], format="csv", out=report_path
+    )
+
+    assert ml_loop.report_loop(args) == 0
+    with report_path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        assert reader.fieldnames == ml_loop.REPORT_FIELD_ORDER
+        rows = list(reader)
+    assert len(rows) == 1
+    row = rows[0]
+    warnings_value = row.get("warnings")
+    assert isinstance(warnings_value, str)
+    assert "surrogate_predictions_missing" in warnings_value

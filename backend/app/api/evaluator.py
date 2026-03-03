@@ -28,6 +28,10 @@ from backend.engine.worker_pool import WorkerPool, WorkerPoolError
 
 logger = logging.getLogger(__name__)
 
+HARDCODED_WORKER_CMD = "luajit"
+HARDCODED_WORKER_ARGS = "pob/worker/pob_calc_worker.lua"
+HARDCODED_WORKER_CWD = "."
+
 _ALLOWED_STATUS_TRANSITIONS: Dict[BuildStatus, set[BuildStatus]] = {
     BuildStatus.imported: {BuildStatus.queued},
     BuildStatus.queued: {BuildStatus.evaluated, BuildStatus.failed},
@@ -52,9 +56,9 @@ class BuildEvaluator:
         self._repo = repo
         self._base_path = base_path
 
-        # Worker configuration (from settings or provided)
-        self._worker_cmd = worker_cmd or settings.pob_worker_cmd
-        raw_args = (worker_args or settings.pob_worker_args).split()
+        # Worker configuration (hardcoded defaults for this single-machine repo)
+        self._worker_cmd = worker_cmd or HARDCODED_WORKER_CMD
+        raw_args = (worker_args or HARDCODED_WORKER_ARGS).split()
         project_root = Path(__file__).resolve().parents[3]
         if self._worker_cmd in {"luajit", "luajit.exe"} and raw_args:
             script_path = project_root / raw_args[0]
@@ -63,7 +67,7 @@ class BuildEvaluator:
         self._worker_args = raw_args
         self._worker_pool_size = worker_pool_size or settings.pob_worker_pool_size
         # Make worker_cwd absolute to ensure it works regardless of parent process working directory
-        worker_cwd_value = worker_cwd if worker_cwd is not None else settings.pob_worker_cwd
+        worker_cwd_value = worker_cwd if worker_cwd is not None else HARDCODED_WORKER_CWD
         if worker_cwd_value:
             worker_cwd_value = str(project_root / worker_cwd_value)
         self._worker_cwd = worker_cwd_value.strip() if worker_cwd_value is not None else None
@@ -225,7 +229,8 @@ class BuildEvaluator:
                     life=normalized.life,
                     mana=normalized.mana,
                     utility_score=normalized.utility_score,
-                    metrics_source=normalize_metrics_source(payload.get("metrics_source")) or METRICS_SOURCE_POB,
+                    metrics_source=normalize_metrics_source(payload.get("metrics_source"))
+                    or METRICS_SOURCE_POB,
                 )
             )
         if not scenario_rows:
@@ -252,7 +257,9 @@ class BuildEvaluator:
             return mapped
         return {}
 
-    def _annotate_metrics_source(self, payload: Mapping[str, Any] | None, default_source: str) -> dict[str, Any]:
+    def _annotate_metrics_source(
+        self, payload: Mapping[str, Any] | None, default_source: str
+    ) -> dict[str, Any]:
         if not isinstance(payload, Mapping):
             return {}
         normalized_payload = dict(payload)
@@ -260,6 +267,31 @@ class BuildEvaluator:
         normalized_payload["metrics_source"] = normalized or default_source
         return normalized_payload
 
+    def _worker_payload_metrics_source(self, payload: Mapping[str, Any]) -> str:
+        explicit_source = normalize_metrics_source(payload.get("metrics_source"))
+        if explicit_source and explicit_source != METRICS_SOURCE_POB:
+            return explicit_source
+
+        worker_source = str(payload.get("source") or "").strip().lower()
+        if worker_source == "pob_xml_playerstats":
+            return METRICS_SOURCE_FALLBACK
+
+        warnings = payload.get("warnings")
+        warning_items: Sequence[Any]
+        if isinstance(warnings, list):
+            warning_items = warnings
+        elif warnings is None:
+            warning_items = []
+        else:
+            warning_items = [warnings]
+
+        normalized_warnings = {
+            str(item).strip().lower() for item in warning_items if str(item).strip()
+        }
+        if "generation_stub_metrics" in normalized_warnings:
+            return METRICS_SOURCE_STUB
+
+        return explicit_source or METRICS_SOURCE_POB
 
     def register_profiles_requiring_non_stub_metrics(
         self,
@@ -540,7 +572,10 @@ class BuildEvaluator:
                 payload = dict(result_obj)
             else:
                 payload = dict(response)
-            payload = self._annotate_metrics_source(payload, METRICS_SOURCE_POB)
+            payload = self._annotate_metrics_source(
+                payload,
+                self._worker_payload_metrics_source(payload),
+            )
 
             warnings = payload.get("warnings")
             if warnings is None:
