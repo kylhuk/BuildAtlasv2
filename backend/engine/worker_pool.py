@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_WORKER_CMD: Sequence[str] = ("luajit", "pob/worker/worker.lua")
+DEFAULT_WORKER_CMD: Sequence[str] = ("luajit", "PathOfBuilding/worker/worker.lua")
 
 WORKER_TERMINATED_ERROR_CODE = -32000
 WORKER_PROTOCOL_ERROR_CODE = -32001
@@ -30,7 +30,11 @@ def _resolve_luajit_script_path(script_path: Path) -> Path:
     for candidate in candidate_paths:
         if candidate.is_file():
             return candidate
-    return script_path
+
+    # Keep invocation stable under cwd changes even when the script is absent
+    # in the local checkout (for example, when PathOfBuilding assets are not
+    # initialized yet): prefer an absolute project-root path.
+    return PROJECT_ROOT / script_path
 
 
 def _normalize_worker_invocation(
@@ -52,22 +56,15 @@ def _normalize_worker_invocation(
     ]
 
     resolved_cwd = worker_cwd
-    is_legacy_pob_script = (
+    script_parent = resolved_script.parent
+    script_root_name = script_parent.parent.name
+    is_pathofbuilding_worker = (
         resolved_script.name == "worker.lua"
-        and resolved_script.parent.name == "worker"
-        and resolved_script.parent.parent.name == "PathOfBuilding"
+        and script_parent.name == "worker"
+        and script_root_name in {"PathOfBuilding", "pob"}
     )
-    is_new_pob_script = (
-        resolved_script.name == "worker.lua"
-        and resolved_script.parent.name == "worker"
-        and resolved_script.parent.parent.name == "pob"
-    )
-    if resolved_cwd is None:
-        if is_legacy_pob_script:
-            # Worker lua package loading expects PathOfBuilding/src as cwd.
-            resolved_cwd = str(resolved_script.parent.parent / "src")
-        elif is_new_pob_script:
-            resolved_cwd = str(PROJECT_ROOT)
+    if resolved_cwd is None and is_pathofbuilding_worker:
+        resolved_cwd = str(PROJECT_ROOT / "PathOfBuilding" / "src")
 
     return tuple(normalized_cmd), resolved_cwd
 

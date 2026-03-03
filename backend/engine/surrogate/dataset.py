@@ -199,6 +199,8 @@ def _rows_for_build(
             continue
         if exclude_stub_rows and _is_stub_scenario_payload(scenario_payload):
             continue
+        if exclude_stub_rows and not _has_worker_pool_metadata_source(scenario_payload):
+            continue
         row = _build_row(build_id, scenario_label, genome, scenario_payload, build_details)
         if not _matches_filter(row.get("profile_id"), profile_id_filter):
             continue
@@ -220,6 +222,15 @@ def _is_stub_scenario_payload(payload: Mapping[str, Any]) -> bool:
                 return True
     return False
 
+
+def _has_worker_pool_metadata_source(payload: Mapping[str, Any]) -> bool:
+    worker_metadata = payload.get("worker_metadata")
+    if not _is_mapping(worker_metadata):
+        return False
+    source = worker_metadata.get("source")
+    if source is None:
+        return False
+    return str(source).strip().lower() == "worker_pool"
 
 
 def _scenario_metrics_source(payload: Mapping[str, Any]) -> str:
@@ -276,9 +287,7 @@ def _build_row(
 
     row.update(extract_feature_signals(build_details))
     identity_tokens = list(row.get(FEATURE_IDENTITY_TOKENS) or [])
-    identity_tokens = _extend_identity_tokens(
-        identity_tokens, _categorical_identity_tokens(row)
-    )
+    identity_tokens = _extend_identity_tokens(identity_tokens, _categorical_identity_tokens(row))
     row[FEATURE_IDENTITY_TOKENS] = identity_tokens
     return row
 
@@ -310,7 +319,6 @@ def _extend_identity_tokens(tokens: list[str], extras: Sequence[str]) -> list[st
         extended.append(token)
         seen.add(token)
     return extended[:_IDENTITY_TOKEN_LIMIT]
-
 
 
 def _write_rows(rows: Iterable[Mapping[str, Any]], path: Path) -> str:

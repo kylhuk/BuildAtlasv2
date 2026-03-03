@@ -371,6 +371,131 @@ def test_start_loop_executes_two_iterations(
         assert record["iteration"] == iteration
 
 
+def test_start_loop_configures_evaluator_and_passes_it_into_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patch_evaluator_and_repo: list,
+) -> None:
+    loop_id = "evaluator-test"
+    data_path = tmp_path / "data"
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        iterations=1,
+        count=2,
+        seed_start=1,
+        profile_id="pinnacle",
+        ruleset_id="ruleset-smoke",
+        scenario_version=None,
+        price_snapshot_id="price",
+        pob_commit=None,
+        constraints_file=None,
+        data_path=data_path,
+        surrogate_backend="cpu",
+    )
+
+    rows = [{"full_dps": 1.0, "max_hit": 2.0, "utility_score": 3.0}]
+    last_snapshot_id: str | None = None
+    last_snapshot_root: Path | None = None
+    run_kwargs: list[dict[str, object]] = []
+
+    def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        run_kwargs.append(kwargs)
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "completed",
+            "evaluation": {"attempted": 1, "successes": 1, "failures": 0, "errors": 0},
+        }
+
+    def fake_build_dataset_snapshot(
+        *,
+        data_path: Path | str,
+        output_root: Path | str,
+        snapshot_id: str,
+        exclude_stub_rows: bool,
+        profile_id: str | None = None,
+        scenario_id: str | None = None,
+    ) -> SnapshotResult:
+        nonlocal last_snapshot_id, last_snapshot_root
+        last_snapshot_id = snapshot_id
+        snapshot_root = Path(output_root) / snapshot_id
+        last_snapshot_root = snapshot_root
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        dataset_path = snapshot_root / "dataset.jsonl"
+        dataset_path.write_text("[]", encoding="utf-8")
+        manifest_path = snapshot_root / "manifest.json"
+        manifest_path.write_text("{}", encoding="utf-8")
+        return SnapshotResult(
+            snapshot_id=snapshot_id,
+            dataset_path=dataset_path,
+            manifest_path=manifest_path,
+            row_count=len(rows),
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+            dataset_hash="hash",
+        )
+
+    def fake_train(
+        *,
+        dataset_path: Path | str,
+        output_root: Path | str,
+        model_id: str,
+        compute_backend: str,
+        **_: object,
+    ) -> TrainResult:
+        assert last_snapshot_root is not None
+        assert Path(dataset_path) == last_snapshot_root
+        model_root = Path(output_root) / model_id
+        model_root.mkdir(parents=True, exist_ok=True)
+        model_path = model_root / "model.json"
+        model_path.write_text("{}", encoding="utf-8")
+        metrics_path = model_root / "metrics.json"
+        metrics_path.write_text("{}", encoding="utf-8")
+        meta_path = model_root / "meta.json"
+        meta_path.write_text("{}", encoding="utf-8")
+        return TrainResult(
+            model_id=model_id,
+            model_path=model_path,
+            metrics_path=metrics_path,
+            meta_path=meta_path,
+            dataset_snapshot_id=last_snapshot_id or "",
+            dataset_hash="hash",
+            row_count=len(rows),
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+        )
+
+    def fake_load_dataset_rows(dataset_path: Path | str) -> list[dict[str, float]]:
+        assert last_snapshot_root is not None
+        assert Path(dataset_path) == last_snapshot_root
+        return rows
+
+    def fake_load_model(*args: object, **kwargs: object) -> _FakeModel:
+        return _FakeModel()
+
+    def fake_evaluate_predictions(*args: object, **kwargs: object) -> EvaluationResult:
+        return EvaluationResult(
+            row_count=len(rows),
+            metric_mae={"full_dps": 0.0, "max_hit": 0.0},
+            pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+        )
+
+    monkeypatch.setattr(ml_loop, "run_generation", fake_run_generation)
+    monkeypatch.setattr(ml_loop, "build_dataset_snapshot", fake_build_dataset_snapshot)
+    monkeypatch.setattr(ml_loop, "train", fake_train)
+    monkeypatch.setattr(ml_loop, "load_dataset_rows", fake_load_dataset_rows)
+    monkeypatch.setattr(ml_loop, "load_model", fake_load_model)
+    monkeypatch.setattr(ml_loop, "evaluate_predictions", fake_evaluate_predictions)
+
+    result = ml_loop.start_loop(args)
+    assert result == 0
+
+    assert len(patch_evaluator_and_repo) == 1
+    evaluator = patch_evaluator_and_repo[0]
+    assert evaluator.require_worker_calls == ["pinnacle"]
+    assert evaluator.require_non_stub_calls == ["pinnacle"]
+    assert run_kwargs
+    assert run_kwargs[0].get("evaluator") is evaluator
+    assert run_kwargs[0].get("enforce_worker_tripwire") is True
+
+
 def test_start_loop_keeps_champion_when_challenger_regresses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -526,6 +651,37 @@ def test_start_loop_keeps_champion_when_challenger_regresses(
     assert records[0]["model"]["promoted_model_id"] == "champion-loop-iter-0001"
     assert records[1]["model"]["promoted"] is False
     assert records[1]["model"]["promoted_model_id"] == "champion-loop-iter-0001"
+
+
+@pytest.fixture(autouse=True)
+def patch_evaluator_and_repo(monkeypatch):
+    created_evaluators: list["_DummyEvaluator"] = []
+
+    class _DummyClickhouseRepository:
+        def close(self) -> None:
+            pass
+
+    class _DummyEvaluator:
+        def __init__(self, repo, base_path, **_: object) -> None:
+            self.repo = repo
+            self.base_path = base_path
+            self.require_worker_calls: list[str] = []
+            self.require_non_stub_calls: list[str] = []
+            self.closed = False
+            created_evaluators.append(self)
+
+        def require_worker_metrics_for_profile(self, profile_id: str) -> None:
+            self.require_worker_calls.append(profile_id)
+
+        def require_non_stub_metrics_for_profile(self, profile_id: str) -> None:
+            self.require_non_stub_calls.append(profile_id)
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(ml_loop, "ClickhouseRepository", _DummyClickhouseRepository)
+    monkeypatch.setattr(ml_loop, "BuildEvaluator", _DummyEvaluator)
+    return created_evaluators
 
 
 def test_start_loop_resumes_with_next_seed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -931,6 +1087,223 @@ def test_start_loop_skips_when_generation_fails(
     assert record["evaluation"] is None
 
 
+def test_start_loop_skips_when_gate_failure_occurs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop_id = "gate-failure"
+    data_path = tmp_path / "data"
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        iterations=1,
+        count=4,
+        seed_start=2,
+        profile_id="pinnacle",
+        ruleset_id="ruleset-smoke",
+        scenario_version=None,
+        price_snapshot_id="price",
+        pob_commit=None,
+        constraints_file=None,
+        data_path=data_path,
+        surrogate_backend="cpu",
+    )
+
+    def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "failed",
+            "evaluation": {"attempted": 2, "successes": 0, "failures": 2, "errors": 0},
+            "status_reason": {
+                "code": "gate_failure",
+                "message": "gating prevented verified builds",
+            },
+        }
+
+    def fake_fail(*args: object, **kwargs: object) -> None:
+        pytest.fail("should not run after gate failure")
+
+    monkeypatch.setattr(ml_loop, "run_generation", fake_run_generation)
+    monkeypatch.setattr(ml_loop, "build_dataset_snapshot", fake_fail)
+    monkeypatch.setattr(ml_loop, "train", fake_fail)
+    monkeypatch.setattr(ml_loop, "load_dataset_rows", fake_fail)
+    monkeypatch.setattr(ml_loop, "load_model", fake_fail)
+    monkeypatch.setattr(ml_loop, "evaluate_predictions", fake_fail)
+
+    result = ml_loop.start_loop(args)
+    assert result == 0
+
+    state_path = data_path / "ml_loops" / loop_id / ml_loop.STATE_FILENAME
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["last_generation_status"] == "failed"
+    assert state["last_skip_reason_code"] == "gate_failure"
+
+    loop_root = data_path / "ml_loops" / loop_id
+    records = [
+        json.loads(line)
+        for line in (loop_root / ml_loop.ITERATIONS_FILENAME)
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record["iteration"] == 1
+    assert record["iteration_outcome"] == "skipped_generation_unhealthy"
+    assert record["skip_reason_code"] == "gate_failure"
+    assert record["snapshot"] is None
+    assert record["model"] is None
+
+
+def test_status_loop_reports_tripwire_counts(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    patch_evaluator_and_repo: list,
+) -> None:
+    loop_id = "status-tripwire"
+    data_path = tmp_path / "data"
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        iterations=1,
+        count=1,
+        seed_start=1,
+        profile_id="pinnacle",
+        ruleset_id="ruleset-smoke",
+        scenario_version=None,
+        price_snapshot_id="price",
+        pob_commit=None,
+        constraints_file=None,
+        data_path=data_path,
+        surrogate_backend="cpu",
+    )
+
+    rows = [{"full_dps": 1.0, "max_hit": 2.0, "utility_score": 3.0}]
+    last_snapshot_id: str | None = None
+    last_snapshot_root: Path | None = None
+
+    def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        evaluation_payload = {
+            "attempted": 1,
+            "successes": 1,
+            "failures": 0,
+            "errors": 0,
+            "worker_metrics_used_count": 5,
+            "fallback_stub_count": 2,
+            "worker_error_count": 1,
+            "last_worker_error": "worker metadata missing for unknown",
+            "records": [],
+        }
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "completed",
+            "evaluation": evaluation_payload,
+            "generation": {
+                "status": "completed",
+                "status_reason_code": None,
+                "status_reason_message": None,
+                "attempted": 1,
+                "successes": 1,
+                "failures": 0,
+                "errors": 0,
+                "records": [],
+                "attempt_records": [],
+            },
+            "surrogate": {
+                "enabled": False,
+                "status": "disabled",
+                "model_id": None,
+                "model_path": None,
+                "selection_params": {},
+                "counts": {
+                    "candidates": 1,
+                    "selected": 1,
+                    "pruned": 0,
+                },
+            },
+            "paths": {},
+        }
+
+    def fake_build_dataset_snapshot(*args: object, **kwargs: object) -> SnapshotResult:
+        nonlocal last_snapshot_id, last_snapshot_root
+        snapshot_id = "iter-0001"
+        last_snapshot_id = snapshot_id
+        snapshot_root = (
+            Path(kwargs["output_root"]) / snapshot_id if "output_root" in kwargs else tmp_path
+        )
+        last_snapshot_root = snapshot_root
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        dataset = snapshot_root / "dataset.jsonl"
+        dataset.write_text("[]", encoding="utf-8")
+        (snapshot_root / "manifest.json").write_text("{}", encoding="utf-8")
+        return SnapshotResult(
+            snapshot_id=snapshot_id,
+            dataset_path=snapshot_root,
+            manifest_path=snapshot_root / "manifest.json",
+            row_count=len(rows),
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+            dataset_hash="hash",
+        )
+
+    def fake_train(*args: object, **kwargs: object) -> TrainResult:
+        assert last_snapshot_root is not None
+        model_root = Path(kwargs.get("output_root", tmp_path)) / str(
+            kwargs.get("model_id", "model")
+        )
+        model_root.mkdir(parents=True, exist_ok=True)
+        return TrainResult(
+            model_id="model",
+            model_path=model_root / "model.json",
+            metrics_path=model_root / "metrics.json",
+            meta_path=model_root / "meta.json",
+            dataset_snapshot_id=last_snapshot_id or "",
+            dataset_hash="hash",
+            row_count=len(rows),
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+        )
+
+    def fake_load_dataset_rows(dataset_path: Path | str) -> list[dict[str, float]]:
+        return rows
+
+    def fake_load_model(*args: object, **kwargs: object) -> _FakeModel:
+        return _FakeModel()
+
+    def fake_evaluate_predictions(*args: object, **kwargs: object) -> EvaluationResult:
+        return EvaluationResult(
+            row_count=len(rows),
+            metric_mae={"full_dps": 0.0, "max_hit": 0.0},
+            metric_mae_all={"full_dps": 0.0},
+            metric_mae_pass={"full_dps": 0.0},
+            metric_mae_log1p={"full_dps": 0.0},
+            metric_mae_log1p_pass={"full_dps": 0.0},
+            classifier_metrics={"brier": 0.0},
+            pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+        )
+
+    monkeypatch.setattr(ml_loop, "run_generation", fake_run_generation)
+    monkeypatch.setattr(ml_loop, "build_dataset_snapshot", fake_build_dataset_snapshot)
+    monkeypatch.setattr(ml_loop, "train", fake_train)
+    monkeypatch.setattr(ml_loop, "load_dataset_rows", fake_load_dataset_rows)
+    monkeypatch.setattr(ml_loop, "load_model", fake_load_model)
+    monkeypatch.setattr(ml_loop, "evaluate_predictions", fake_evaluate_predictions)
+
+    result = ml_loop.start_loop(args)
+    assert result == 0
+
+    status_args = argparse.Namespace(
+        loop_id=loop_id,
+        data_path=data_path,
+        output_format="human",
+        history=1,
+    )
+    status_result = ml_loop.status_loop(status_args)
+    assert status_result == 0
+
+    output = capsys.readouterr().out
+    assert (
+        "Tripwire counts: worker_metrics=5 fallback_stub=2 worker_errors=1 last_worker_error=worker metadata missing for unknown"
+        in output
+    )
+
+
 def test_start_loop_continues_after_unhealthy_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1147,7 +1520,7 @@ def test_start_loop_fails_fast_on_terminal_generation_failure(
     assert state["failed_iteration"] == 1
     assert state["failed_phase"] == "generation"
     assert "evaluation_non_pob_metrics" in state["last_error"]
-    assert "non-authoritative metrics" in state["last_error"]
+    assert "PoB evaluation inactive" in state["last_error"]
     failure_path = Path(state["last_failure_checkpoint_path"])
     assert failure_path.exists()
     failure = json.loads(failure_path.read_text(encoding="utf-8"))

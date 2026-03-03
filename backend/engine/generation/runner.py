@@ -14,7 +14,7 @@ from statistics import mean, median, pstdev
 from time import monotonic
 from typing import Any, Callable, Literal, Mapping, Sequence
 
-from backend.app.api.evaluator import BuildEvaluator
+from backend.app.api.evaluator import BuildEvaluator, EvaluationProvenance
 from backend.app.api.models import BuildStatus
 from backend.app.db.ch import BuildInsertPayload, ClickhouseRepository, ScenarioMetricRow
 from backend.app.settings import settings
@@ -90,6 +90,29 @@ def _row_metrics_sources(rows: Sequence[ScenarioMetricRow]) -> set[str]:
         if normalized:
             sources.add(normalized)
     return sources
+
+
+def _describe_scenarios(scenarios: Sequence[str]) -> str:
+    if not scenarios:
+        return "unknown"
+    return ", ".join(scenarios)
+
+
+def _record_provenance_counts(
+    provenance: EvaluationProvenance | None,
+    counters: dict[str, int | str | None],
+) -> None:
+    if not provenance:
+        return
+    counters["worker_metrics_used_count"] += provenance.worker_metrics_used_count
+    counters["fallback_stub_count"] += provenance.stub_warning_count
+    counters["worker_error_count"] += provenance.worker_metadata_missing_count
+    if provenance.worker_metadata_missing_count:
+        scenarios_text = _describe_scenarios(provenance.worker_metadata_missing_scenarios)
+        counters["last_worker_error"] = f"worker metadata missing for scenarios {scenarios_text}"
+    elif provenance.stub_warning_count:
+        scenarios_text = _describe_scenarios(provenance.stub_warning_scenarios)
+        counters["last_worker_error"] = f"stub metrics detected for scenarios {scenarios_text}"
 
 
 def _collect_verified_metric_entries(
@@ -1461,6 +1484,7 @@ def run_generation(
     optimizer_iterations: int = 1,
     optimizer_elite_count: int = 2,
     constraints: Mapping[str, Any] | None = None,
+    enforce_worker_tripwire: bool = False,
 ) -> dict[str, Any]:
     if count <= 0:
         raise ValueError("count must be positive")
@@ -1959,6 +1983,13 @@ def run_generation(
     next_progress_count = progress_step
     last_progress_log_at = evaluation_started_at
 
+    evaluation_counters: dict[str, int | str | None] = {
+        "worker_metrics_used_count": 0,
+        "fallback_stub_count": 0,
+        "worker_error_count": 0,
+        "last_worker_error": None,
+    }
+
     if selected_count == 0:
         logger.warning("generation run %s has no candidates selected for evaluation", session_id)
     else:
@@ -1976,15 +2007,61 @@ def run_generation(
         try:
             _persist_candidate(candidate)
             status, rows = evaluator.evaluate_build(candidate.build_id)
+            provenance = evaluator.pop_last_evaluation_provenance()
+            _record_provenance_counts(provenance, evaluation_counters)
             candidate.evaluation_status = status.value
             if rows:
                 candidate.gate_pass = all(getattr(row, "gate_pass", True) for row in rows)
             candidate.verified_metrics_payload = _metrics_payload_from_scenario_rows(rows)
             evaluation_rows.extend(rows)
             metrics_sources = _row_metrics_sources(rows)
-            evaluation_success = status is BuildStatus.evaluated and metrics_sources == {
-                METRICS_SOURCE_POB
-            }
+            tripwire_reason: str | None = None
+            tripwire_message: str | None = None
+            tripwire_details: dict[str, Any] = {}
+            if provenance:
+                if provenance.worker_metadata_missing_count > 0:
+                    tripwire_reason = "worker_metadata_missing"
+                    scenarios_text = _describe_scenarios(
+                        provenance.worker_metadata_missing_scenarios
+                    )
+                    tripwire_message = f"PoB evaluation inactive; worker metadata missing for scenarios {scenarios_text}"
+                    tripwire_details["worker_metadata_missing_scenarios"] = (
+                        provenance.worker_metadata_missing_scenarios
+                    )
+                elif provenance.stub_warning_count > 0:
+                    tripwire_reason = "stub_metrics_detected"
+                    scenarios_text = _describe_scenarios(provenance.stub_warning_scenarios)
+                    tripwire_message = f"PoB evaluation inactive; stub metrics detected for scenarios {scenarios_text}"
+                    tripwire_details["stub_warning_scenarios"] = provenance.stub_warning_scenarios
+            detection_triggered = tripwire_reason is not None
+            if detection_triggered:
+                if enforce_worker_tripwire:
+                    abort_for_non_pob_metrics = True
+                    message_text = (
+                        tripwire_message or "PoB evaluation inactive; non-PoB metrics returned"
+                    )
+                    error_details = {
+                        "build_id": candidate.build_id,
+                        "metrics_sources": sorted(metrics_sources),
+                        **tripwire_details,
+                    }
+                    candidate.evaluation_error = {
+                        "code": "evaluation_non_pob_metrics",
+                        "message": message_text,
+                        "details": error_details,
+                    }
+                    candidate.evaluation_status = BuildStatus.failed.value
+                    if infrastructure_failure_reason is None:
+                        infrastructure_failure_reason = {
+                            "code": "evaluation_non_pob_metrics",
+                            "message": message_text,
+                            "details": error_details,
+                        }
+            evaluation_success = (
+                status is BuildStatus.evaluated
+                and metrics_sources == {METRICS_SOURCE_POB}
+                and not (enforce_worker_tripwire and detection_triggered)
+            )
             if evaluation_success:
                 evaluation_successes += 1
                 if candidate.surrogate_prediction_payload:
@@ -2314,6 +2391,10 @@ def run_generation(
             "successes": evaluation_successes,
             "failures": evaluation_failures,
             "errors": evaluation_errors,
+            "worker_metrics_used_count": evaluation_counters["worker_metrics_used_count"],
+            "fallback_stub_count": evaluation_counters["fallback_stub_count"],
+            "worker_error_count": evaluation_counters["worker_error_count"],
+            "last_worker_error": evaluation_counters["last_worker_error"],
             "records": [
                 record for record in evaluation_records if record["status"] or record["error"]
             ],

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
 
-from backend.app.api.evaluator import BuildEvaluator
+from backend.app.api.evaluator import BuildEvaluator, EvaluationProvenance
 from backend.app.api.errors import APIError
 from backend.app.db.ch import BuildInsertPayload, ScenarioMetricRow
 from backend.engine.archive import load_archive_artifact
@@ -285,7 +285,7 @@ def test_generation_fails_without_verified_metrics(tmp_path: Path) -> None:
 
     assert summary["status"] == "failed"
     reason = summary.get("status_reason")
-    assert reason and reason.get("code") == "no_verified_evaluations"
+    assert reason and reason.get("code") == "evaluation_non_pob_metrics"
 
     assert summary["evaluation"]["successes"] == 0
     assert summary["evaluation"]["failures"] == summary["evaluation"]["attempted"]
@@ -391,6 +391,74 @@ def test_generation_aborts_on_non_pob_metrics(tmp_path: Path) -> None:
     assert reason is not None
     assert reason["code"] == "evaluation_non_pob_metrics"
     assert reason["details"]["metrics_sources"] == ["fallback"]
+
+
+def test_generation_tripwire_counts_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = FakeRepository()
+    evaluator = _fake_evaluator(tmp_path, repo)
+    base_time = datetime.now(UTC)
+
+    row = ScenarioMetricRow(
+        build_id="tripwire-build",
+        ruleset_id=_ruleset_id(),
+        scenario_id="pinnacle_boss",
+        gate_pass=True,
+        gate_fail_reasons=[],
+        pob_warnings=[],
+        evaluated_at=base_time,
+        full_dps=1000.0,
+        max_hit=2500.0,
+        armour=900.0,
+        evasion=450.0,
+        life=3200.0,
+        mana=600.0,
+        utility_score=42.0,
+        metrics_source="pob",
+    )
+
+    def fake_evaluate_build(
+        build_id: str,
+    ) -> tuple[generation_runner.BuildStatus, list[ScenarioMetricRow]]:
+        return generation_runner.BuildStatus.evaluated, [row]
+
+    metadata = EvaluationProvenance(
+        stub_warning_count=2,
+        stub_warning_scenarios=["pinnacle_boss", "pinnacle_mob"],
+        worker_metrics_used_count=1,
+        worker_metadata_missing_count=1,
+        worker_metadata_missing_scenarios=["pinnacle_boss"],
+    )
+    provenance_stack = [metadata]
+
+    def fake_pop() -> EvaluationProvenance | None:
+        return provenance_stack.pop(0) if provenance_stack else None
+
+    monkeypatch.setattr(evaluator, "evaluate_build", fake_evaluate_build)
+    monkeypatch.setattr(evaluator, "pop_last_evaluation_provenance", fake_pop)
+
+    summary = generation_runner.run_generation(
+        count=1,
+        seed_start=701,
+        ruleset_id=_ruleset_id(),
+        profile_id="pinnacle",
+        base_path=tmp_path,
+        repo=repo,
+        evaluator=evaluator,
+        run_id="tripwire-counts",
+        metrics_generator=_verified_metrics_generator,
+        enforce_worker_tripwire=True,
+    )
+
+    evaluation = summary["evaluation"]
+    assert evaluation["worker_metrics_used_count"] == 1
+    assert evaluation["fallback_stub_count"] == 2
+    assert evaluation["worker_error_count"] == 1
+    assert evaluation["last_worker_error"] == "worker metadata missing for scenarios pinnacle_boss"
+    assert summary["status"] == "failed"
+    reason = summary.get("status_reason")
+    assert reason and reason["code"] == "evaluation_non_pob_metrics"
 
 
 def test_uber_optimizer_requires_non_stub_metrics(tmp_path: Path) -> None:

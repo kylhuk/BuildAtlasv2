@@ -27,3 +27,21 @@ def test_pob_worker_pool_size_prefers_env_over_env_file(monkeypatch, tmp_path):
     monkeypatch.delenv("POB_WORKER_POOL_SIZE")
     settings_with_file = Settings(_env_file=str(env_file))
     assert settings_with_file.pob_worker_pool_size == 3
+
+
+
+def test_pob_worker_defaults_point_to_pathofbuilding(monkeypatch):
+    monkeypatch.delenv("POB_WORKER_ARGS", raising=False)
+    monkeypatch.delenv("POB_WORKER_CWD", raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.pob_worker_args == "PathOfBuilding/worker/worker.lua"
+    assert settings.pob_worker_cwd == "PathOfBuilding/src"
+
+
+
+def test_pob_worker_env_overrides_args_and_cwd(monkeypatch):
+    monkeypatch.setenv("POB_WORKER_ARGS", "custom/worker.lua")
+    monkeypatch.setenv("POB_WORKER_CWD", "custom/cwd")
+    settings = Settings(_env_file=None)
+    assert settings.pob_worker_args == "custom/worker.lua"
+    assert settings.pob_worker_cwd == "custom/cwd"

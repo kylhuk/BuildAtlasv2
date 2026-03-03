@@ -15,6 +15,8 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, Mapping, Sequence
 
+from backend.app.api.evaluator import BuildEvaluator
+from backend.app.db.ch import ClickhouseRepository
 from backend.app.settings import settings
 from backend.engine.generation.runner import (
     run_generation,
@@ -264,6 +266,10 @@ def _build_initial_state(
         "last_generation_verified": 0,
         "last_generation_failures": 0,
         "last_generation_errors": 0,
+        "last_worker_metrics_used_count": 0,
+        "last_fallback_stub_count": 0,
+        "last_worker_error_count": 0,
+        "last_worker_error": None,
         "last_iteration_outcome": None,
         "skipped_iterations_total": 0,
         "last_skipped_iteration": None,
@@ -445,6 +451,12 @@ def _build_iteration_record(
             "successes": _coerce_int(evaluation_info.get("successes")),
             "failures": _coerce_int(evaluation_info.get("failures")),
             "errors": _coerce_int(evaluation_info.get("errors")),
+            "worker_metrics_used_count": _coerce_int(
+                evaluation_info.get("worker_metrics_used_count")
+            ),
+            "fallback_stub_count": _coerce_int(evaluation_info.get("fallback_stub_count")),
+            "worker_error_count": _coerce_int(evaluation_info.get("worker_error_count")),
+            "last_worker_error": evaluation_info.get("last_worker_error"),
         },
         "snapshot": {
             "snapshot_id": snapshot.snapshot_id,
@@ -531,6 +543,12 @@ def _build_generation_skip_record(
             "successes": _coerce_int(evaluation_info.get("successes")),
             "failures": _coerce_int(evaluation_info.get("failures")),
             "errors": _coerce_int(evaluation_info.get("errors")),
+            "worker_metrics_used_count": _coerce_int(
+                evaluation_info.get("worker_metrics_used_count")
+            ),
+            "fallback_stub_count": _coerce_int(evaluation_info.get("fallback_stub_count")),
+            "worker_error_count": _coerce_int(evaluation_info.get("worker_error_count")),
+            "last_worker_error": evaluation_info.get("last_worker_error"),
         },
         "snapshot": None,
         "model": None,
@@ -556,6 +574,10 @@ def _build_summary_payload(state: Mapping[str, Any]) -> dict[str, Any]:
         "last_skipped_iteration": state.get("last_skipped_iteration"),
         "last_skip_reason_code": state.get("last_skip_reason_code"),
         "last_skip_reason_message": state.get("last_skip_reason_message"),
+        "last_worker_metrics_used_count": state.get("last_worker_metrics_used_count"),
+        "last_fallback_stub_count": state.get("last_fallback_stub_count"),
+        "last_worker_error_count": state.get("last_worker_error_count"),
+        "last_worker_error": state.get("last_worker_error"),
     }
 
 
@@ -684,12 +706,19 @@ def start_loop(args: argparse.Namespace) -> int:
             last_failure_checkpoint_path=None,
         )
 
+    repo: ClickhouseRepository | None = None
+    evaluator: BuildEvaluator | None = None
+
     stop_triggered = False
     current_iteration = 0
     iteration = start_iteration
     current_run_id: str | None = None
     iteration_seed_start: int | None = None
     try:
+        repo = ClickhouseRepository()
+        evaluator = BuildEvaluator(repo=repo, base_path=data_root)
+        evaluator.require_worker_metrics_for_profile(profile_id)
+        evaluator.require_non_stub_metrics_for_profile(profile_id)
         while True:
             if total_iterations is not None and iteration > total_iterations:
                 break
@@ -761,6 +790,8 @@ def start_loop(args: argparse.Namespace) -> int:
                 run_id=current_run_id,
                 base_path=data_root,
                 constraints=constraints,
+                repo=repo,
+                evaluator=evaluator,
                 run_mode="standard",
                 surrogate_enabled=bool(active_surrogate_model_path),
                 surrogate_model_path=active_surrogate_model_path,
@@ -770,6 +801,7 @@ def start_loop(args: argparse.Namespace) -> int:
                 surrogate_exploration_pct=surrogate_exploration_pct,
                 optimizer_iterations=optimizer_iterations,
                 optimizer_elite_count=optimizer_elite_count,
+                enforce_worker_tripwire=True,
             )
             _log_loop_phase(
                 loop_id,
@@ -787,6 +819,12 @@ def start_loop(args: argparse.Namespace) -> int:
             verified_count = _coerce_int(evaluation_summary.get("successes")) or 0
             failures_count = _coerce_int(evaluation_summary.get("failures")) or 0
             errors_count = _coerce_int(evaluation_summary.get("errors")) or 0
+            worker_metrics_used_count = (
+                _coerce_int(evaluation_summary.get("worker_metrics_used_count")) or 0
+            )
+            fallback_stub_count = _coerce_int(evaluation_summary.get("fallback_stub_count")) or 0
+            worker_error_count = _coerce_int(evaluation_summary.get("worker_error_count")) or 0
+            last_worker_error = evaluation_summary.get("last_worker_error")
             generation_status = run_summary.get("status")
             state = _persist_state(
                 state_path,
@@ -800,6 +838,10 @@ def start_loop(args: argparse.Namespace) -> int:
                 last_generation_verified=verified_count,
                 last_generation_failures=failures_count,
                 last_generation_errors=errors_count,
+                last_worker_metrics_used_count=worker_metrics_used_count,
+                last_fallback_stub_count=fallback_stub_count,
+                last_worker_error_count=worker_error_count,
+                last_worker_error=last_worker_error,
             )
             if generation_status != "completed" or verified_count <= 0:
                 reason_code = status_reason.get("code") or "unknown"
@@ -815,6 +857,8 @@ def start_loop(args: argparse.Namespace) -> int:
                     iteration,
                     failure_message,
                 )
+                if reason_code == "evaluation_non_pob_metrics":
+                    raise RuntimeError(failure_message)
                 timestamp = _now()
                 skipped_record = _build_generation_skip_record(
                     iteration=iteration,
@@ -1120,6 +1164,11 @@ def start_loop(args: argparse.Namespace) -> int:
         summary_state = _load_state(state_path)
         print(json.dumps(_build_summary_payload(summary_state)))
         return 1
+    finally:
+        if evaluator is not None:
+            evaluator.close()
+        if repo is not None:
+            repo.close()
 
 
 def stop_loop(args: argparse.Namespace) -> int:
@@ -1875,6 +1924,15 @@ def _render_status_human(
     reason_message = state.get("last_generation_status_reason_message")
     if reason_message:
         summary_lines.append(f"Last generation reason: {reason_message}")
+    summary_lines.append(
+        (
+            "Tripwire counts: "
+            f"worker_metrics={_format_count(state.get('last_worker_metrics_used_count'))} "
+            f"fallback_stub={_format_count(state.get('last_fallback_stub_count'))} "
+            f"worker_errors={_format_count(state.get('last_worker_error_count'))} "
+            f"last_worker_error={state.get('last_worker_error') or 'N/A'}"
+        )
+    )
 
     last_error = state.get("last_error")
     if last_error:
@@ -1954,7 +2012,11 @@ def _render_status_human(
     summary_lines.append("Recent iterations:")
     metric_headers = " ".join(f"mae.{metric}" for metric in METRIC_TARGETS)
     summary_lines.append(
-        (f"iter  run_status   verified/attempted  promoted improved pass_mean  {metric_headers}")
+        (
+            "iter  run_status   verified/attempted  promoted improved pass_mean"
+            " worker/fallback/errors  "
+            f"{metric_headers}"
+        )
     )
     tail = records[-max(1, history) :]
     for record in tail:
@@ -1972,6 +2034,11 @@ def _render_status_human(
         row_skip_reason = _classifier_skip_reason_from_payload(current)
         row_pass_mean = _numeric(pass_probability.get("mean"))
         row_pass_display = None if row_skip_reason else row_pass_mean
+        worker_tripwire_counts = (
+            f"{_format_count(generation.get('worker_metrics_used_count'))}/"
+            f"{_format_count(generation.get('fallback_stub_count'))}/"
+            f"{_format_count(generation.get('worker_error_count'))}"
+        )
         metric_values = " ".join(
             f"{_format_float(_numeric(metrics.get(metric))):>12}" for metric in METRIC_TARGETS
         )
@@ -1981,7 +2048,8 @@ def _render_status_human(
             f"{verified_attempted_value:>19} "
             f"{_format_bool(model.get('promoted')):>9} "
             f"{_format_bool(improvement.get('improved')):>8} "
-            f"{_format_float(row_pass_display):>9} {metric_values}"
+            f"{_format_float(row_pass_display):>9} "
+            f"{worker_tripwire_counts:>22} {metric_values}"
         )
 
     best_record = max(records, key=lambda record: _record_pass_mean(record) or -1.0)

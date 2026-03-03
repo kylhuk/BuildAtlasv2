@@ -120,17 +120,121 @@ def test_snapshot_filters_stub_rows(tmp_path: Path) -> None:
                 "intelligence": 120,
             },
             "metrics_source": METRICS_SOURCE_POB,
+            "worker_metadata": {
+                "source": "worker_pool",
+            },
+        }
+    }
+    missing_worker_metadata_metrics = {
+        "pob": {
+            "metrics": {
+                "full_dps": 3050.0,
+                "max_hit": 4750.0,
+                "utility_score": 2.1,
+            },
+            "defense": {
+                "armour": 3200,
+                "evasion": 2100,
+                "resists": {
+                    "fire": 75,
+                    "cold": 75,
+                    "lightning": 75,
+                    "chaos": 75,
+                },
+            },
+            "resources": {
+                "life": 9100,
+                "mana": 2100,
+            },
+            "reservation": {
+                "reserved_percent": 55,
+                "available_percent": 85,
+            },
+            "attributes": {
+                "strength": 121,
+                "dexterity": 121,
+                "intelligence": 121,
+            },
+            "metrics_source": METRICS_SOURCE_POB,
+        }
+    }
+    non_worker_source_metrics = {
+        "pob": {
+            **missing_worker_metadata_metrics["pob"],
+            "worker_metadata": {
+                "source": "artifact_cache",
+            },
         }
     }
     _create_build(builds_root, "stub-build", genome, stub_metrics)
     _create_build(builds_root, "pob-build", genome, pob_metrics)
+    _create_build(
+        builds_root,
+        "pob-missing-worker-metadata",
+        genome,
+        missing_worker_metadata_metrics,
+    )
+    _create_build(builds_root, "pob-non-worker-source", genome, non_worker_source_metrics)
     output_root = data_root / "datasets" / "ep-v4"
-    result = build_dataset_snapshot(data_root, output_root, "snapshot-filter", exclude_stub_rows=True)
+    result = build_dataset_snapshot(
+        data_root, output_root, "snapshot-filter", exclude_stub_rows=True
+    )
     lines = result.dataset_path.read_text(encoding="utf-8").splitlines()
     assert result.row_count == 1
     row = json.loads(lines[0])
     assert row["build_id"] == "pob-build"
     assert row["metrics_source"] == METRICS_SOURCE_POB
+
+
+def test_snapshot_keeps_missing_worker_metadata_when_stub_filter_disabled(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    builds_root = data_root / "builds"
+    genome = {
+        "schema_version": "v0",
+        "seed": 3,
+        "class": "Templar",
+        "ascendancy": "Inquisitor",
+        "main_skill_package": "spark",
+        "defense_archetype": "hybrid",
+        "budget_tier": "starter",
+        "profile_id": "alpha",
+    }
+    metrics = {
+        "pob": {
+            "metrics": {
+                "full_dps": 1800.0,
+                "max_hit": 2500.0,
+                "utility_score": 1.5,
+            },
+            "defense": {
+                "armour": 1800,
+                "evasion": 1600,
+            },
+            "resources": {
+                "life": 4800,
+                "mana": 1400,
+            },
+            "reservation": {
+                "reserved_percent": 52,
+                "available_percent": 76,
+            },
+            "attributes": {
+                "strength": 110,
+                "dexterity": 90,
+                "intelligence": 130,
+            },
+            "metrics_source": METRICS_SOURCE_POB,
+        }
+    }
+    _create_build(builds_root, "pob-no-worker-metadata", genome, metrics)
+    output_root = data_root / "datasets" / "ep-v4"
+    result = build_dataset_snapshot(
+        data_root,
+        output_root,
+        "snapshot-no-worker-metadata",
+        exclude_stub_rows=False,
+    )
+    assert result.row_count == 1
 
 
 def test_snapshot_round_trip(tmp_path: Path) -> None:

@@ -293,11 +293,47 @@ def test_worker_pool_resolves_luajit_script_path_and_defaults_cwd() -> None:
         pool.close()
 
     project_root = Path(__file__).resolve().parents[2]
-    expected_worker_script = str(project_root / "pob/worker/worker.lua")
+    expected_worker_script = str(project_root / "PathOfBuilding/worker/worker.lua")
     assert module.popen_args[0][0][0] == "luajit"
     assert module.popen_args[0][0][1] == expected_worker_script
-    assert module.popen_kwargs[0].get("cwd") == str(project_root)
+    assert module.popen_kwargs[0].get("cwd") == str(project_root / "PathOfBuilding/src")
 
+
+
+
+
+def test_worker_pool_legacy_pob_script_defaults_to_pathofbuilding_src() -> None:
+    def responder_factory() -> Callable[[MockProcess, Dict[str, Any]], None]:
+        def responder(process: MockProcess, request: Dict[str, Any]) -> None:
+            process.stdout.push_line(
+                json.dumps(
+                    {
+                        "id": request["id"],
+                        "ok": True,
+                        "result": {
+                            "payload": request["params"],
+                        },
+                    }
+                )
+            )
+
+        return responder
+
+    module = MockSubprocessModule(responder_factory)
+    project_root = Path(__file__).resolve().parents[2]
+    pool = WorkerPool(
+        num_workers=1,
+        worker_cmd=["luajit", "pob/worker/worker.lua"],
+        subprocess_module=module,
+    )
+    try:
+        pool.evaluate_batch([{"value": "test"}])
+    finally:
+        pool.close()
+
+    assert module.popen_args[0][0][0] == "luajit"
+    assert module.popen_args[0][0][1].endswith("pob/worker/worker.lua")
+    assert module.popen_kwargs[0].get("cwd") == str(project_root / "PathOfBuilding/src")
 
 
 def test_worker_pool_preserves_legacy_pob_cwd_when_using_pathofbuilding() -> None:

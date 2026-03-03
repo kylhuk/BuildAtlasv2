@@ -5,10 +5,10 @@ import logging
 import xml.etree.ElementTree as ET
 import zlib
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, is_dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
 
 from backend.app.api.errors import APIError
 from backend.app.api.models import BuildStatus
@@ -29,8 +29,8 @@ from backend.engine.worker_pool import WorkerPool, WorkerPoolError
 logger = logging.getLogger(__name__)
 
 HARDCODED_WORKER_CMD = "luajit"
-HARDCODED_WORKER_ARGS = "pob/worker/pob_calc_worker.lua"
-HARDCODED_WORKER_CWD = "."
+HARDCODED_WORKER_ARGS = "PathOfBuilding/worker/worker.lua"
+HARDCODED_WORKER_CWD = "PathOfBuilding/src"
 
 _ALLOWED_STATUS_TRANSITIONS: Dict[BuildStatus, set[BuildStatus]] = {
     BuildStatus.imported: {BuildStatus.queued},
@@ -39,6 +39,14 @@ _ALLOWED_STATUS_TRANSITIONS: Dict[BuildStatus, set[BuildStatus]] = {
     BuildStatus.failed: {BuildStatus.queued},
 }
 
+
+@dataclass
+class EvaluationProvenance:
+    stub_warning_count: int
+    stub_warning_scenarios: list[str]
+    worker_metrics_used_count: int
+    worker_metadata_missing_count: int
+    worker_metadata_missing_scenarios: list[str]
 
 class BuildEvaluator:
     def __init__(
@@ -80,6 +88,7 @@ class BuildEvaluator:
             self.register_profiles_requiring_worker_metrics(profiles_requiring_worker_metrics)
         self._pool: WorkerPool | None = None
         self._pool_lock = __import__("threading").Lock()
+        self._last_evaluation_provenance: EvaluationProvenance | None = None
 
     def _get_worker_pool(self) -> WorkerPool:
         with self._pool_lock:
@@ -202,6 +211,12 @@ class BuildEvaluator:
         evaluated_at = datetime.now(timezone.utc)
         scenario_rows: List[ScenarioMetricRow] = []
         ruleset_id = build.get("ruleset_id") or ""
+        worker_required = self._profile_requires_worker_metrics(profile_id)
+        stub_warning_count = 0
+        stub_warning_scenarios: list[str] = []
+        worker_metrics_used_count = 0
+        worker_metadata_missing_count = 0
+        worker_metadata_missing_scenarios: list[str] = []
         for template in templates:
             payload = raw_metrics_map.get(template.scenario_id)
             if payload is None:
@@ -233,8 +248,29 @@ class BuildEvaluator:
                     or METRICS_SOURCE_POB,
                 )
             )
+            warnings_lower = {
+                str(item).strip().lower()
+                for item in normalized.warnings
+                if str(item).strip()
+            }
+            if "generation_stub_metrics" in warnings_lower:
+                stub_warning_count += 1
+                stub_warning_scenarios.append(template.scenario_id)
+            worker_source = self._worker_metadata_source(payload)
+            if worker_source == "worker_pool":
+                worker_metrics_used_count += 1
+            elif worker_required:
+                worker_metadata_missing_count += 1
+                worker_metadata_missing_scenarios.append(template.scenario_id)
         if not scenario_rows:
             raise APIError(400, "no_scenarios", "no scenario rows generated for build")
+        self._last_evaluation_provenance = EvaluationProvenance(
+            stub_warning_count=stub_warning_count,
+            stub_warning_scenarios=stub_warning_scenarios,
+            worker_metrics_used_count=worker_metrics_used_count,
+            worker_metadata_missing_count=worker_metadata_missing_count,
+            worker_metadata_missing_scenarios=worker_metadata_missing_scenarios,
+        )
         return scenario_rows
 
     def _map_raw_metrics(self, raw_metrics: Any) -> dict[str, Any]:
@@ -292,6 +328,18 @@ class BuildEvaluator:
             return METRICS_SOURCE_STUB
 
         return explicit_source or METRICS_SOURCE_POB
+
+    def _worker_metadata_source(self, payload: Mapping[str, Any]) -> str | None:
+        metadata = payload.get("worker_metadata")
+        if not isinstance(metadata, Mapping):
+            return None
+        source = str(metadata.get("source") or "").strip().lower()
+        return source or None
+
+    def pop_last_evaluation_provenance(self) -> EvaluationProvenance | None:
+        provenance = self._last_evaluation_provenance
+        self._last_evaluation_provenance = None
+        return provenance
 
     def register_profiles_requiring_non_stub_metrics(
         self,
