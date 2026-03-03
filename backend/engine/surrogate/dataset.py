@@ -11,6 +11,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence, TypeGuard
 
+from backend.engine.metrics_source import METRICS_SOURCE_POB, normalize_metrics_source
+
 FEATURE_SCHEMA_VERSION = "v4"
 _DATASET_FILENAME = "dataset.jsonl"
 _MANIFEST_FILENAME = "manifest.json"
@@ -206,6 +208,8 @@ def _rows_for_build(
 
 
 def _is_stub_scenario_payload(payload: Mapping[str, Any]) -> bool:
+    if _scenario_metrics_source(payload) != METRICS_SOURCE_POB:
+        return True
     warning_fields = (
         payload.get("warnings"),
         payload.get("pob_warnings"),
@@ -215,6 +219,15 @@ def _is_stub_scenario_payload(payload: Mapping[str, Any]) -> bool:
             if warning.strip().lower() == "generation_stub_metrics":
                 return True
     return False
+
+
+
+def _scenario_metrics_source(payload: Mapping[str, Any]) -> str:
+    source_value = payload.get("metrics_source")
+    normalized = normalize_metrics_source(source_value)
+    if normalized:
+        return normalized
+    return METRICS_SOURCE_POB
 
 
 def _build_row(
@@ -252,6 +265,7 @@ def _build_row(
         # FL-03: Include gate_pass for ML training
         "gate_pass": scenario_data.get("gate_pass"),
         "gate_fail_reasons": scenario_data.get("gate_fail_reasons", []),
+        "metrics_source": _scenario_metrics_source(scenario_data),
     }
 
     for resist in _RESIST_KEYS:

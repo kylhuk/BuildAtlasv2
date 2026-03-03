@@ -17,6 +17,12 @@ from backend.app.settings import settings
 from backend.engine.artifacts.store import read_build_artifacts, write_build_artifacts
 from backend.engine.evaluation.gates import evaluate_gates
 from backend.engine.evaluation.normalized import NormalizedMetrics, map_worker_output
+from backend.engine.metrics_source import (
+    METRICS_SOURCE_FALLBACK,
+    METRICS_SOURCE_POB,
+    METRICS_SOURCE_STUB,
+    normalize_metrics_source,
+)
 from backend.engine.scenarios.loader import ScenarioTemplate, list_templates
 from backend.engine.worker_pool import WorkerPool, WorkerPoolError
 
@@ -219,6 +225,7 @@ class BuildEvaluator:
                     life=normalized.life,
                     mana=normalized.mana,
                     utility_score=normalized.utility_score,
+                    metrics_source=normalize_metrics_source(payload.get("metrics_source")) or METRICS_SOURCE_POB,
                 )
             )
         if not scenario_rows:
@@ -227,7 +234,11 @@ class BuildEvaluator:
 
     def _map_raw_metrics(self, raw_metrics: Any) -> dict[str, Any]:
         if isinstance(raw_metrics, Mapping):
-            return dict(raw_metrics)
+            return {
+                scenario_id: self._annotate_metrics_source(payload, METRICS_SOURCE_STUB)
+                for scenario_id, payload in raw_metrics.items()
+                if isinstance(payload, Mapping)
+            }
         if isinstance(raw_metrics, list):
             mapped: dict[str, Any] = {}
             for entry in raw_metrics:
@@ -237,9 +248,18 @@ class BuildEvaluator:
                 if not isinstance(scenario_id, str):
                     continue
                 payload = entry.get("payload") or entry
-                mapped[scenario_id] = payload
+                mapped[scenario_id] = self._annotate_metrics_source(payload, METRICS_SOURCE_STUB)
             return mapped
         return {}
+
+    def _annotate_metrics_source(self, payload: Mapping[str, Any] | None, default_source: str) -> dict[str, Any]:
+        if not isinstance(payload, Mapping):
+            return {}
+        normalized_payload = dict(payload)
+        normalized = normalize_metrics_source(normalized_payload.get("metrics_source"))
+        normalized_payload["metrics_source"] = normalized or default_source
+        return normalized_payload
+
 
     def register_profiles_requiring_non_stub_metrics(
         self,
@@ -298,6 +318,10 @@ class BuildEvaluator:
     def _is_stub_metrics_payload(self, payload: Any) -> bool:
         if not isinstance(payload, Mapping):
             return False
+        source_value = payload.get("metrics_source")
+        normalized_source = normalize_metrics_source(source_value)
+        if normalized_source and normalized_source != METRICS_SOURCE_POB:
+            return True
         warnings = payload.get("warnings") or payload.get("pob_warnings")
         if warnings is None:
             return False
@@ -516,6 +540,7 @@ class BuildEvaluator:
                 payload = dict(result_obj)
             else:
                 payload = dict(response)
+            payload = self._annotate_metrics_source(payload, METRICS_SOURCE_POB)
 
             warnings = payload.get("warnings")
             if warnings is None:
@@ -595,6 +620,7 @@ class BuildEvaluator:
                 "intelligence": stats.get("int"),
             },
             "warnings": [],
+            "metrics_source": METRICS_SOURCE_FALLBACK,
         }
 
     def _iter_player_stats(self, xml_payload: str) -> Sequence[Any]:

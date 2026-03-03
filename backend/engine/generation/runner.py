@@ -8,8 +8,9 @@ import uuid
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from math import isclose, isfinite, sqrt
 from pathlib import Path
-from statistics import median, pstdev
+from statistics import mean, median, pstdev
 from time import monotonic
 from typing import Any, Callable, Literal, Mapping, Sequence
 
@@ -49,8 +50,16 @@ from backend.engine.passives.builder import PassiveTreePlan, build_passive_tree_
 from backend.engine.scenarios.loader import ScenarioTemplate, list_templates
 from backend.engine.skills.catalog import GemPlan, SkillCatalog, load_default_skill_catalog
 from backend.engine.sockets.planner import SocketPlan, plan_sockets
+from backend.engine.metrics_source import (
+    METRICS_SOURCE_FALLBACK,
+    METRICS_SOURCE_POB,
+    METRICS_SOURCE_STUB,
+    METRICS_SOURCE_VALUES,
+    normalize_metrics_source,
+)
 from backend.engine.surrogate import load_model
 from backend.engine.surrogate.dataset import extract_feature_signals
+
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +70,113 @@ def _phase_log(message: str, *args: object) -> None:
         return
     logger.warning(message, *args)
 
+
+STUB_TRIPWIRE_EXACT_MATCH_COUNT = 3
+STUB_TRIPWIRE_CORRELATED_ROWS = 4
+STUB_TRIPWIRE_CORRELATION_THRESHOLD = 0.995
+STUB_TRIPWIRE_SLOPE_TOLERANCE = 0.01
+STUB_TRIPWIRE_FULL_DPS_SLOPE = 120.0
+STUB_TRIPWIRE_MAX_HIT_SLOPE = 2.0
+STUB_TRIPWIRE_MAX_HIT_BASE = 4500.0
+STUB_TRIPWIRE_MAX_HIT_INTERCEPT_TOLERANCE = 50.0
+
+
+def _row_metrics_sources(rows: Sequence[ScenarioMetricRow]) -> set[str]:
+    sources: set[str] = set()
+    for row in rows:  # pragma: no cover - defensive typing
+        normalized = normalize_metrics_source(getattr(row, "metrics_source", None), METRICS_SOURCE_STUB)
+        if normalized:
+            sources.add(normalized)
+    return sources
+
+
+def _collect_verified_metric_entries(candidates: Sequence[Candidate]) -> list[tuple[int, float | None, float | None]]:
+    entries: list[tuple[int, float | None, float | None]] = []
+    for candidate in candidates:
+        if candidate.evaluation_status != BuildStatus.evaluated.value:
+            continue
+        metrics_payload = candidate.verified_metrics_payload
+        if not isinstance(metrics_payload, Mapping):
+            continue
+        for scenario_data in metrics_payload.values():
+            if not isinstance(scenario_data, Mapping):
+                continue
+            metrics_section = scenario_data.get("metrics")
+            if not isinstance(metrics_section, Mapping):
+                continue
+            full_dps = _coerce_float(metrics_section.get("full_dps"))
+            max_hit = _coerce_float(metrics_section.get("max_hit"))
+            entries.append((candidate.seed, full_dps, max_hit))
+            break
+    return entries
+
+
+def _linear_trend_matches(
+    entries: Sequence[tuple[int, float | None, float | None]],
+    metric_index: int,
+    slope_target: float,
+    intercept_target: float | None = None,
+) -> bool:
+    filtered: list[tuple[int, float]] = []
+    for seed, full, max_hit in entries:
+        value = full if metric_index == 1 else max_hit
+        if value is None:
+            continue
+        filtered.append((seed, value))
+    if len(filtered) < STUB_TRIPWIRE_CORRELATED_ROWS:
+        return False
+    seeds = [pair[0] for pair in filtered]
+    values = [pair[1] for pair in filtered]
+    mean_seed = mean(seeds)
+    mean_value = mean(values)
+    covariance = sum((seed - mean_seed) * (value - mean_value) for seed, value in filtered)
+    variance_seed = sum((seed - mean_seed) ** 2 for seed in seeds)
+    variance_value = sum((value - mean_value) ** 2 for value in values)
+    if variance_seed <= 0 or variance_value <= 0:
+        return False
+    slope = covariance / variance_seed
+    if not isfinite(covariance):
+        return False
+    correlation = covariance / sqrt(variance_seed * variance_value)
+    if not isfinite(correlation) or abs(correlation) < STUB_TRIPWIRE_CORRELATION_THRESHOLD:
+        return False
+    if abs(slope - slope_target) > abs(slope_target) * STUB_TRIPWIRE_SLOPE_TOLERANCE:
+        return False
+    if intercept_target is not None:
+        intercept = mean_value - slope * mean_seed
+        if abs(intercept - intercept_target) > STUB_TRIPWIRE_MAX_HIT_INTERCEPT_TOLERANCE:
+            return False
+    return True
+
+
+def _assert_no_stub_metrics(entries: Sequence[tuple[int, float | None, float | None]]) -> None:
+    if not entries:
+        return
+    full_matches = sum(
+        1
+        for seed, full, _ in entries
+        if full is not None and isclose(full, STUB_TRIPWIRE_FULL_DPS_SLOPE * seed, abs_tol=1e-3)
+    )
+    if full_matches >= STUB_TRIPWIRE_EXACT_MATCH_COUNT:
+        raise ValueError("PoB evaluation inactive; stub metrics detected")
+    max_matches = sum(
+        1
+        for seed, _, max_hit in entries
+        if max_hit is not None and isclose(
+            max_hit, STUB_TRIPWIRE_MAX_HIT_BASE + STUB_TRIPWIRE_MAX_HIT_SLOPE * seed, abs_tol=1e-3
+        )
+    )
+    if max_matches >= STUB_TRIPWIRE_EXACT_MATCH_COUNT:
+        raise ValueError("PoB evaluation inactive; stub metrics detected")
+    if _linear_trend_matches(entries, metric_index=1, slope_target=STUB_TRIPWIRE_FULL_DPS_SLOPE):
+        raise ValueError("PoB evaluation inactive; stub metrics detected")
+    if _linear_trend_matches(
+        entries,
+        metric_index=2,
+        slope_target=STUB_TRIPWIRE_MAX_HIT_SLOPE,
+        intercept_target=STUB_TRIPWIRE_MAX_HIT_BASE,
+    ):
+        raise ValueError("PoB evaluation inactive; stub metrics detected")
 
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -210,12 +326,16 @@ def _metrics_payload_from_scenario_rows(rows: Sequence[Any]) -> dict[str, Any]:
         utility_score = _coerce_float(getattr(row, "utility_score", None))
         if utility_score is None and isinstance(row, Mapping):
             utility_score = _coerce_float(row.get("utility_score"))
+        source_value = getattr(row, "metrics_source", None)
+        normalized_source = normalize_metrics_source(source_value, METRICS_SOURCE_STUB)
+        source_name = normalized_source or METRICS_SOURCE_STUB
         payload[str(scenario_id)] = {
             "metrics": {
                 "full_dps": full_dps or 0.0,
                 "max_hit": max_hit or 0.0,
                 "utility_score": utility_score or 0.0,
-            }
+            },
+            "metrics_source": source_name,
         }
     return payload
 
@@ -1854,7 +1974,11 @@ def run_generation(
                 candidate.gate_pass = all(getattr(row, "gate_pass", True) for row in rows)
             candidate.verified_metrics_payload = _metrics_payload_from_scenario_rows(rows)
             evaluation_rows.extend(rows)
-            if status is BuildStatus.evaluated:
+            metrics_sources = _row_metrics_sources(rows)
+            evaluation_success = (
+                status is BuildStatus.evaluated and metrics_sources == {METRICS_SOURCE_POB}
+            )
+            if evaluation_success:
                 evaluation_successes += 1
                 if candidate.surrogate_prediction_payload:
                     _persist_surrogate_prediction(
@@ -1864,11 +1988,20 @@ def run_generation(
                     )
             else:
                 evaluation_failures += 1
+                if metrics_sources != {METRICS_SOURCE_POB} and not candidate.evaluation_error:
+                    candidate.evaluation_error = {
+                        "code": "metrics_source_mismatch",
+                        "message": "non-PoB metrics discarded",
+                        "details": {
+                            "metrics_sources": sorted(metrics_sources),
+                        },
+                    }
+                candidate.evaluation_status = BuildStatus.failed.value
             evaluation_records.append(
                 {
                     "build_id": candidate.build_id,
                     "status": candidate.evaluation_status,
-                    "error": None,
+                    "error": candidate.evaluation_error,
                 }
             )
         except Exception as exc:  # pylint: disable=broad-except
@@ -1927,6 +2060,8 @@ def run_generation(
         evaluation_errors,
         max(0.0, monotonic() - evaluation_started_at),
     )
+
+    _assert_no_stub_metrics(_collect_verified_metric_entries(candidates))
 
     valid_generation_records: list[dict[str, Any]] = []
     generation_attempt_records: list[dict[str, Any]] = []
@@ -2002,7 +2137,7 @@ def run_generation(
             "seed": candidate.seed,
             "budget_tier": candidate.budget_tier,
             "status": candidate.evaluation_status,
-            "metrics_source": "verified",
+            "metrics_source": METRICS_SOURCE_POB,
         }
         if candidate.failures:
             metadata["failures"] = list(candidate.failures)
@@ -2276,8 +2411,16 @@ def _benchmark_summary_from_rows(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "scenarios": {},
     }
+    global_source_counts: dict[str, int] = {source: 0 for source in METRICS_SOURCE_VALUES}
     for scenario_id, entries in grouped.items():
         sample_count = len(entries)
+        source_counts: dict[str, int] = {source: 0 for source in METRICS_SOURCE_VALUES}
+        for entry in entries:
+            source_value = getattr(entry, "metrics_source", METRICS_SOURCE_STUB)
+            normalized_source = normalize_metrics_source(source_value, METRICS_SOURCE_STUB)
+            key = normalized_source or METRICS_SOURCE_STUB
+            source_counts[key] = source_counts.get(key, 0) + 1
+            global_source_counts[key] = global_source_counts.get(key, 0) + 1
         summary_payload["scenarios"][scenario_id] = {
             "samples": sample_count,
             "median_full_dps": _median_or_zero([entry.full_dps for entry in entries]),
@@ -2288,9 +2431,10 @@ def _benchmark_summary_from_rows(
                 if sample_count
                 else 0.0
             ),
+            "metrics_source_counts": source_counts,
         }
+    summary_payload["metrics_source_counts"] = global_source_counts
     return summary_payload
-
 
 def _median_or_zero(values: Sequence[float]) -> float:
     if not values:

@@ -3,6 +3,8 @@ import random
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+import pytest
+
 from typing import Any, Sequence
 
 from backend.engine.generation.runner import (
@@ -13,6 +15,7 @@ from backend.engine.generation.runner import (
     _optimizer_objectives_from_payload,
     _select_optimizer_elites,
     _select_surrogate_optimizer_elites,
+    _assert_no_stub_metrics,
     _build_worker_xml_payload,
     _load_surrogate_predictor,
 )
@@ -394,3 +397,26 @@ def test_select_surrogate_elites_tie_breaker_depends_on_rng() -> None:
     elites = _select_surrogate_optimizer_elites([tie_a, tie_b], 2, rng=random.Random(0))
     order = [candidate.build_id for candidate, _ in elites]
     assert order != ["tie-a", "tie-b"]
+
+
+
+def test_stub_tripwire_detects_exact_stub_metrics() -> None:
+    entries = [
+        (1, 120.0, 4502.0),
+        (2, 240.0, 4504.0),
+        (3, 360.0, 4506.0),
+    ]
+    with pytest.raises(ValueError, match="PoB evaluation inactive; stub metrics detected"):
+        _assert_no_stub_metrics(entries)
+
+
+
+def test_stub_tripwire_detects_linear_stub_metrics() -> None:
+    entries = [
+        (5, 600.1, 4510.0),
+        (10, 1200.2, 4520.0),
+        (15, 1800.3, 4530.0),
+        (20, 2400.4, 4540.0),
+    ]
+    with pytest.raises(ValueError, match="PoB evaluation inactive; stub metrics detected"):
+        _assert_no_stub_metrics(entries)

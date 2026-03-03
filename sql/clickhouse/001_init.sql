@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS scenario_metrics (
     evasion Float64,
     life Float64,
     mana Float64,
-    utility_score Float64
+    utility_score Float64,
+    metrics_source String DEFAULT 'pob'
 ) ENGINE = MergeTree()
 ORDER BY (scenario_id, ruleset_id, gate_pass, evaluated_at);

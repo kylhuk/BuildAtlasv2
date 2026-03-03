@@ -501,6 +501,7 @@ def _build_generation_skip_record(
     *,
     reason_code: str,
     reason_message: str,
+    iteration_outcome: str = "skipped_generation_unhealthy",
 ) -> dict[str, Any]:
     run_status_reason = _as_dict(run_summary.get("status_reason"))
     evaluation_info = _as_dict(run_summary.get("evaluation"))
@@ -509,7 +510,7 @@ def _build_generation_skip_record(
         "timestamp_utc": timestamp,
         "run_id": run_summary.get("run_id"),
         "run_status": run_summary.get("status"),
-        "iteration_outcome": "skipped_generation_unhealthy",
+        "iteration_outcome": iteration_outcome,
         "skip_reason_code": reason_code,
         "skip_reason_message": reason_message,
         "skipped_phases": ["snapshot", "train", "evaluate"],
@@ -885,6 +886,59 @@ def start_loop(args: argparse.Namespace) -> int:
                     profile_id=None,
                     scenario_id=snapshot_scenario_id,
                 )
+            if snapshot.row_count <= 0:
+                reason_code = "snapshot_not_trained"
+                reason_message = (
+                    f"snapshot {snapshot.snapshot_id} filtered to zero verified builds; not trained"
+                )
+                _log_loop_phase(
+                    loop_id,
+                    "snapshot_skipped",
+                    iteration=iteration,
+                    detail=reason_message,
+                )
+                timestamp = _now()
+                skip_record = _build_generation_skip_record(
+                    iteration=iteration,
+                    timestamp=timestamp,
+                    run_summary=run_summary,
+                    reason_code=reason_code,
+                    reason_message=reason_message,
+                    iteration_outcome="skipped_snapshot_empty",
+                )
+                skip_record["snapshot"] = {
+                    "snapshot_id": snapshot.snapshot_id,
+                    "dataset_path": str(snapshot.dataset_path),
+                    "manifest_path": str(snapshot.manifest_path),
+                    "row_count": snapshot.row_count,
+                    "dataset_hash": snapshot.dataset_hash,
+                    "feature_schema_version": snapshot.feature_schema_version,
+                }
+                _append_iteration_record(iterations_path, skip_record)
+                checkpoint_path = _iteration_checkpoint_path(loop_root, iteration)
+                checkpoint_path.write_text(json.dumps(skip_record), encoding="utf-8")
+                print(json.dumps(skip_record))
+                skipped_total = (_coerce_int(state.get("skipped_iterations_total")) or 0) + 1
+                _persist_state(
+                    state_path,
+                    state,
+                    phase="idle",
+                    iteration=iteration,
+                    last_error=reason_message,
+                    last_iteration_outcome="skipped_snapshot_empty",
+                    skipped_iterations_total=skipped_total,
+                    last_skipped_iteration=iteration,
+                    last_skip_reason_code=reason_code,
+                    last_skip_reason_message=reason_message,
+                    last_snapshot_id=snapshot.snapshot_id,
+                    failed_iteration=None,
+                    failed_phase=None,
+                    failed_at_utc=None,
+                    last_failure_checkpoint_path=None,
+                )
+                iteration += 1
+                continue
+
             _log_loop_phase(
                 loop_id,
                 "snapshot_complete",
@@ -901,12 +955,6 @@ def start_loop(args: argparse.Namespace) -> int:
                 last_snapshot_id=snapshot.snapshot_id,
             )
             snapshot_root = snapshot.dataset_path.parent
-            if snapshot.row_count <= 0:
-                raise ValueError(
-                    "snapshot "
-                    f"{snapshot.snapshot_id} has no rows; "
-                    "no verified builds available for training"
-                )
             previous_model_path = state.get("last_model_path")
             model_id = f"{loop_id}-iter-{iteration:04d}"
             _log_loop_phase(loop_id, "train", iteration=iteration, detail=f"model_id={model_id}")

@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Sequence
 
 import clickhouse_connect
+from backend.engine.metrics_source import METRICS_SOURCE_POB
 from clickhouse_connect.driver.client import Client
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -45,6 +46,7 @@ SCENARIO_METRIC_COLUMNS = [
     "life",
     "mana",
     "utility_score",
+    "metrics_source",
 ]
 
 BUILD_COST_COLUMNS = [
@@ -95,6 +97,7 @@ class ScenarioMetricRow(BaseModel):
     life: float
     mana: float
     utility_score: float
+    metrics_source: str = Field(default=METRICS_SOURCE_POB)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -241,6 +244,7 @@ class ClickhouseRepository:
                     row.life,
                     row.mana,
                     row.utility_score,
+                    row.metrics_source,
                 ]
             )
         self._client.insert(

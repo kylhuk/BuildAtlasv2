@@ -7,6 +7,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Mapping
 
+from backend.engine.metrics_source import METRICS_SOURCE_POB, METRICS_SOURCE_STUB
 from backend.engine.surrogate.dataset import (
     FEATURE_AFFIX_TOTAL_LINES,
     FEATURE_GEM_MAIN_LINK_REQUIREMENT,
@@ -40,6 +41,96 @@ def _create_build(
     _write_json(build_dir / "metrics_raw.json", metrics)
     if build_details is not None:
         _write_json(build_dir / "build_details.json", build_details)
+
+
+def test_snapshot_filters_stub_rows(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    builds_root = data_root / "builds"
+    genome = {
+        "schema_version": "v0",
+        "seed": 1,
+        "class": "Witch",
+        "ascendancy": "Occultist",
+        "main_skill_package": "arc",
+        "defense_archetype": "armour",
+        "budget_tier": "starter",
+        "profile_id": "alpha",
+    }
+    stub_metrics = {
+        "stub": {
+            "metrics": {
+                "full_dps": 120.0,
+                "max_hit": 4502.0,
+                "utility_score": 1.0,
+            },
+            "defense": {
+                "armour": 1000,
+                "evasion": 500,
+                "resists": {
+                    "fire": 70,
+                    "cold": 70,
+                    "lightning": 70,
+                    "chaos": 70,
+                },
+            },
+            "resources": {
+                "life": 1000,
+                "mana": 200,
+            },
+            "reservation": {
+                "reserved_percent": 50,
+                "available_percent": 90,
+            },
+            "attributes": {
+                "strength": 10,
+                "dexterity": 10,
+                "intelligence": 10,
+            },
+            "metrics_source": METRICS_SOURCE_STUB,
+        }
+    }
+    pob_metrics = {
+        "pob": {
+            "metrics": {
+                "full_dps": 3000.0,
+                "max_hit": 4700.0,
+                "utility_score": 2.0,
+            },
+            "defense": {
+                "armour": 3000,
+                "evasion": 2000,
+                "resists": {
+                    "fire": 75,
+                    "cold": 75,
+                    "lightning": 75,
+                    "chaos": 75,
+                },
+            },
+            "resources": {
+                "life": 9000,
+                "mana": 2000,
+            },
+            "reservation": {
+                "reserved_percent": 55,
+                "available_percent": 85,
+            },
+            "attributes": {
+                "strength": 120,
+                "dexterity": 120,
+                "intelligence": 120,
+            },
+            "metrics_source": METRICS_SOURCE_POB,
+        }
+    }
+    _create_build(builds_root, "stub-build", genome, stub_metrics)
+    _create_build(builds_root, "pob-build", genome, pob_metrics)
+    output_root = data_root / "datasets" / "ep-v4"
+    result = build_dataset_snapshot(data_root, output_root, "snapshot-filter", exclude_stub_rows=True)
+    lines = result.dataset_path.read_text(encoding="utf-8").splitlines()
+    assert result.row_count == 1
+    row = json.loads(lines[0])
+    assert row["build_id"] == "pob-build"
+    assert row["metrics_source"] == METRICS_SOURCE_POB
 
 
 def test_snapshot_round_trip(tmp_path: Path) -> None:
