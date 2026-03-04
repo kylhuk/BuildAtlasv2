@@ -29,6 +29,26 @@ class GateEvaluation:
     gate_fail_reasons: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class GateSlackMetrics:
+    resist_fire_slack: float
+    resist_cold_slack: float
+    resist_lightning_slack: float
+    resist_chaos_slack: float
+    attr_strength_slack: float
+    attr_dexterity_slack: float
+    attr_intelligence_slack: float
+    max_hit_slack: float
+    full_dps_slack: float
+    reservation_slack: float
+    min_gate_slack: float
+    num_gate_violations: int
+
+    @property
+    def passes_all_gates(self) -> bool:
+        return self.num_gate_violations == 0
+
+
 def _extract_resist_failures(
     metrics: NormalizedMetrics,
     thresholds: ScenarioGateThresholds,
@@ -95,9 +115,68 @@ def evaluate_gates(
     return GateEvaluation(gate_pass=not unique_reasons, gate_fail_reasons=unique_reasons)
 
 
+def compute_gate_slacks(
+    metrics: NormalizedMetrics,
+    thresholds: ScenarioGateThresholds,
+) -> GateSlackMetrics:
+    # Resists
+    fire_slack = metrics.resists.fire - thresholds.resists.get("fire", 0.0)
+    cold_slack = metrics.resists.cold - thresholds.resists.get("cold", 0.0)
+    lightning_slack = metrics.resists.lightning - thresholds.resists.get("lightning", 0.0)
+    chaos_slack = metrics.resists.chaos - thresholds.resists.get("chaos", 0.0)
+
+    # Attributes
+    str_slack = metrics.attributes.strength - thresholds.attributes.get("strength", 0.0)
+    dex_slack = metrics.attributes.dexterity - thresholds.attributes.get("dexterity", 0.0)
+    int_slack = metrics.attributes.intelligence - thresholds.attributes.get("intelligence", 0.0)
+
+    # Max Hit & DPS
+    max_hit_slack = metrics.max_hit - thresholds.min_max_hit
+    full_dps_slack = metrics.full_dps - thresholds.min_full_dps
+
+    # Reservation
+    # available_percent >= reserved_percent AND reserved_percent <= max_percent
+    # We use the tighter of the two constraints for slack
+    res_feasibility_slack = (
+        metrics.reservation.available_percent - metrics.reservation.reserved_percent
+    )
+    res_limit_slack = thresholds.reservation.max_percent - metrics.reservation.reserved_percent
+    reservation_slack = min(res_feasibility_slack, res_limit_slack)
+
+    slacks = [
+        fire_slack,
+        cold_slack,
+        lightning_slack,
+        chaos_slack,
+        str_slack,
+        dex_slack,
+        int_slack,
+        max_hit_slack,
+        full_dps_slack,
+        reservation_slack,
+    ]
+
+    return GateSlackMetrics(
+        resist_fire_slack=fire_slack,
+        resist_cold_slack=cold_slack,
+        resist_lightning_slack=lightning_slack,
+        resist_chaos_slack=chaos_slack,
+        attr_strength_slack=str_slack,
+        attr_dexterity_slack=dex_slack,
+        attr_intelligence_slack=int_slack,
+        max_hit_slack=max_hit_slack,
+        full_dps_slack=full_dps_slack,
+        reservation_slack=reservation_slack,
+        min_gate_slack=min(slacks),
+        num_gate_violations=sum(1 for s in slacks if s < 0),
+    )
+
+
 __all__ = [
     "GateEvaluation",
+    "GateSlackMetrics",
     "evaluate_gates",
+    "compute_gate_slacks",
     "GATE_REASON_RESIST_FIRE",
     "GATE_REASON_RESIST_COLD",
     "GATE_REASON_RESIST_LIGHTNING",
