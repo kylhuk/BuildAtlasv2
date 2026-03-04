@@ -8,6 +8,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from functools import partial
 from math import isclose, isfinite, sqrt
 from pathlib import Path
 from statistics import mean, median, pstdev
@@ -53,7 +54,7 @@ from backend.engine.metrics_source import (
     normalize_metrics_source,
 )
 from backend.engine.passives.builder import PassiveTreePlan, build_passive_tree_plan
-from backend.engine.scenarios.loader import ScenarioTemplate, list_templates
+from backend.engine.scenarios.loader import ScenarioGateThresholds, ScenarioTemplate, list_templates
 from backend.engine.skeletons.expansion import expand_skeleton
 from backend.engine.skills.catalog import GemPlan, SkillCatalog, load_default_skill_catalog
 from backend.engine.sockets.planner import SocketPlan, plan_sockets
@@ -614,6 +615,8 @@ def _surrogate_rank_key(
 def _calculate_min_gate_slack(
     candidate: Candidate,
     templates: Sequence[ScenarioTemplate],
+    *,
+    gate_thresholds: ScenarioGateThresholds | None = None,
 ) -> float:
     """Calculate minimum gate slack across all scenarios.
 
@@ -639,8 +642,9 @@ def _calculate_min_gate_slack(
         if not isinstance(metrics, Mapping):
             continue
 
-        thresholds = template.gate_thresholds
+        effective_thresholds = gate_thresholds or template.gate_thresholds
 
+        thresholds = effective_thresholds
         # Check DPS gate
         full_dps = _coerce_float(metrics.get("full_dps"))
         if full_dps is not None and thresholds.min_full_dps > 0:
@@ -773,11 +777,14 @@ def _point_budget_for(genome: GenomeV0) -> int:
 def _default_metrics_generator(
     seed: int,
     templates: Sequence[ScenarioTemplate],
+    *,
+    gate_thresholds: ScenarioGateThresholds | None = None,
 ) -> Mapping[str, Any]:
     base = max(seed, 1)
     payload: dict[str, Any] = {}
     for template in templates:
-        thresholds = template.gate_thresholds
+        effective_thresholds = gate_thresholds or template.gate_thresholds
+        thresholds = effective_thresholds
         reserved = max(0.0, thresholds.reservation.max_percent - 5)
         available = min(100.0, reserved + 10)
         resists = {
@@ -1288,7 +1295,10 @@ def _attribute_precheck_failed(report: RepairReport) -> bool:
 
 
 def _reservation_precheck_failed(
-    metrics: Mapping[str, Any], templates: Sequence[ScenarioTemplate]
+    metrics: Mapping[str, Any],
+    templates: Sequence[ScenarioTemplate],
+    *,
+    gate_thresholds: ScenarioGateThresholds | None = None,
 ) -> bool:
     for template in templates:
         payload = metrics.get(template.scenario_id)
@@ -1300,7 +1310,8 @@ def _reservation_precheck_failed(
         reserved_value = _coerce_float(reservation.get("reserved_percent"))
         if reserved_value is None:
             continue
-        if reserved_value > template.gate_thresholds.reservation.max_percent:
+        effective_thresholds = gate_thresholds or template.gate_thresholds
+        if reserved_value > effective_thresholds.reservation.max_percent:
             return True
     return False
 
@@ -1647,6 +1658,8 @@ def generate_from_skeleton(
     passive_planner = passive_planner or (lambda g, b: build_passive_tree_plan(g, b))
     template_builder = template_builder or build_item_templates
     metrics_generator = metrics_generator or _default_metrics_generator
+    if gate_thresholds is not None and metrics_generator is _default_metrics_generator:
+        metrics_generator = partial(_default_metrics_generator, gate_thresholds=gate_thresholds)
 
     gem_plan = catalog.build_plan(genome)
     passive_plan = passive_planner(genome, _point_budget_for(genome))
@@ -1694,6 +1707,7 @@ def run_generation(
     seed_start: int,
     ruleset_id: str,
     profile_id: str,
+    gate_thresholds: ScenarioGateThresholds | None = None,
     skeleton_id: str | None = None,
     run_id: str | None = None,
     base_path: Path | None = None,
@@ -1803,6 +1817,8 @@ def run_generation(
     )
     template_builder = template_builder or build_item_templates
     metrics_generator = metrics_generator or _default_metrics_generator
+    if gate_thresholds is not None and metrics_generator is _default_metrics_generator:
+        metrics_generator = partial(_default_metrics_generator, gate_thresholds=gate_thresholds)
     used_seeds: set[int] = set()
     optimizer_stage_reports: list[dict[str, Any]] = []
     optimizer_selection_history: list[dict[str, Any]] = []
@@ -1847,7 +1863,9 @@ def run_generation(
                 failures.append("socket_precheck_failed")
             if _attribute_precheck_failed(template_plan.repair_report):
                 failures.append("attribute_precheck_failed")
-            if _reservation_precheck_failed(metrics_payload, templates):
+            if _reservation_precheck_failed(
+                metrics_payload, templates, gate_thresholds=gate_thresholds
+            ):
                 failures.append("reservation_precheck_failed")
             if _gem_completeness_precheck_failed(build_details_payload):
                 failures.append("gem_completeness_precheck_failed")
@@ -2054,7 +2072,9 @@ def run_generation(
             # Calculate gate slack for all candidates
             candidate_slacks: list[tuple[Candidate, float]] = []
             for candidate in evaluable_candidates:
-                slack = _calculate_min_gate_slack(candidate, templates)
+                slack = _calculate_min_gate_slack(
+                    candidate, templates, gate_thresholds=gate_thresholds
+                )
                 candidate_slacks.append((candidate, slack))
 
             # Sort by slack (descending) and select top candidates
