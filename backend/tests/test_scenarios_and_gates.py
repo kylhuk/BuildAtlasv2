@@ -147,6 +147,24 @@ def test_gate_evaluation_passes_and_reports_failure_reasons():
     assert GATE_REASON_MAX_HIT in failure_reasons
     assert GATE_REASON_RESERVATION in failure_reasons
 
+    slacks = failure_evaluation.gate_slacks
+    assert slacks.resist_fire_slack < 0
+    assert slacks.max_hit_slack < 0
+    assert slacks.reservation_slack < 0
+    assert slacks.num_gate_violations >= 3
+    assert slacks.min_gate_slack == min(
+        slacks.resist_fire_slack,
+        slacks.resist_cold_slack,
+        slacks.resist_lightning_slack,
+        slacks.resist_chaos_slack,
+        slacks.attr_strength_slack,
+        slacks.attr_dexterity_slack,
+        slacks.attr_intelligence_slack,
+        slacks.max_hit_slack,
+        slacks.full_dps_slack,
+        slacks.reservation_slack,
+    )
+
 
 def test_uber_pinnacle_full_dps_gate():
     template = load_template("uber_pinnacle", "v0")

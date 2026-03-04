@@ -19,7 +19,6 @@ from typing import Any, Mapping, Sequence
 from backend.app.api.evaluator import BuildEvaluator
 from backend.app.db.ch import ClickhouseRepository
 from backend.app.settings import settings
-from backend.engine.evaluation import GateEvaluation
 from backend.engine.generation.runner import (
     _run_summary_path,
     load_run_summary,
@@ -460,6 +459,7 @@ def _build_iteration_record(
             "worker_error_count": _coerce_int(evaluation_info.get("worker_error_count")),
             "last_worker_error": evaluation_info.get("last_worker_error"),
         },
+        "gate_fail_analysis": run_summary.get("gate_fail_analysis"),
         "snapshot": {
             "snapshot_id": snapshot.snapshot_id,
             "dataset_path": str(snapshot.dataset_path),
@@ -552,6 +552,7 @@ def _build_generation_skip_record(
             "worker_error_count": _coerce_int(evaluation_info.get("worker_error_count")),
             "last_worker_error": evaluation_info.get("last_worker_error"),
         },
+        "gate_fail_analysis": run_summary.get("gate_fail_analysis"),
         "snapshot": None,
         "model": None,
         "evaluation": None,
@@ -583,31 +584,77 @@ def _build_summary_payload(state: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def compute_gate_fail_histogram(evaluations: Sequence[GateEvaluation]) -> dict[str, Any]:
+def compute_gate_fail_histogram(evaluations: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Count failures per gate across all evaluations."""
     fail_counts: Counter[str] = Counter()
     total_evaluated = len(evaluations)
 
     for ev in evaluations:
-        for reason in ev.gate_fail_reasons:
+        for reason in ev.get("gate_fail_reasons", []):
             fail_counts[reason] += 1
 
-    top_10 = fail_counts.most_common(10)
+    # Sort by count descending
+    sorted_fails = sorted(fail_counts.items(), key=lambda item: item[1], reverse=True)
+
     return {
         "total_evaluated": total_evaluated,
-        "total_failures": sum(fail_counts.values()),
-        "gate_fail_histogram": dict(top_10),
+        "gate_fail_histogram": dict(sorted_fails),
         "gate_fail_percentages": {
             reason: f"{(count / total_evaluated * 100):.1f}%" if total_evaluated > 0 else "0.0%"
-            for reason, count in top_10
+            for reason, count in sorted_fails
         },
     }
 
 
-def generate_run_summary(evaluations: Sequence[GateEvaluation]) -> dict[str, Any]:
+def compute_slack_quantiles(evaluations: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Compute quantiles for min_gate_slack across all evaluations."""
+    if not evaluations:
+        return {}
+
+    slacks = []
+    for ev in evaluations:
+        gate_slacks = ev.get("gate_slacks")
+        if isinstance(gate_slacks, Mapping):
+            slack = gate_slacks.get("min_gate_slack")
+            if slack is not None:
+                slacks.append(float(slack))
+
+    if not slacks:
+        return {}
+
+    slacks.sort()
+    n = len(slacks)
+
+    def get_quantile(q: float) -> float:
+        if not slacks:
+            return 0.0
+        position = (n - 1) * q
+        lower_index = int(position)
+        upper_index = lower_index + 1 if lower_index < n - 1 else lower_index
+        lower_value = slacks[lower_index]
+        upper_value = slacks[upper_index]
+        if lower_index == upper_index:
+            return float(lower_value)
+        weight = position - lower_index
+        return float(lower_value + (upper_value - lower_value) * weight)
+
+    return {
+        "min_gate_slack": {
+            "min": float(slacks[0]),
+            "p10": get_quantile(0.1),
+            "median": float(statistics.median(slacks)),
+            "p90": get_quantile(0.9),
+            "max": float(slacks[-1]),
+            "mean": float(statistics.mean(slacks)),
+        }
+    }
+
+
+def generate_run_summary(evaluations: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Generates a summary of the run including gate failure analysis."""
     return {
         "gate_fail_analysis": compute_gate_fail_histogram(evaluations),
+        "slack_quantiles": compute_slack_quantiles(evaluations),
     }
 
 
@@ -862,9 +909,11 @@ def start_loop(args: argparse.Namespace) -> int:
             # TASK 0.3: Add gate fail analysis to run summary
             gate_evals_raw = run_summary.get("evaluation", {}).get("gate_evaluations", [])
             gate_evaluations = [
-                GateEvaluation(
-                    gate_pass=e["gate_pass"], gate_fail_reasons=tuple(e["gate_fail_reasons"])
-                )
+                {
+                    "gate_pass": e.get("gate_pass"),
+                    "gate_fail_reasons": e.get("gate_fail_reasons", []),
+                    "gate_slacks": e.get("gate_slacks", {}),
+                }
                 for e in gate_evals_raw
             ]
             run_summary.update(generate_run_summary(gate_evaluations))

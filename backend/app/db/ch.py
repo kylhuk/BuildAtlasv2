@@ -124,6 +124,7 @@ class ScenarioMetricRow(BaseModel):
     life: float
     mana: float
     utility_score: float
+    gate_slacks: Dict[str, Any] = Field(default_factory=dict)
     metrics_source: str = Field(default=METRICS_SOURCE_POB)
 
     model_config = ConfigDict(extra="forbid")

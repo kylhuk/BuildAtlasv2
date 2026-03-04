@@ -27,6 +27,7 @@ _RESIST_REASON_MAPPING = {
 class GateEvaluation:
     gate_pass: bool
     gate_fail_reasons: tuple[str, ...]
+    gate_slacks: GateSlackMetrics
 
 
 @dataclass(frozen=True)
@@ -112,7 +113,12 @@ def evaluate_gates(
     failures.extend(_extract_full_dps_failure(metrics, thresholds))
 
     unique_reasons = tuple(dict.fromkeys(failures))
-    return GateEvaluation(gate_pass=not unique_reasons, gate_fail_reasons=unique_reasons)
+    slacks = compute_gate_slacks(metrics, thresholds)
+    return GateEvaluation(
+        gate_pass=not unique_reasons,
+        gate_fail_reasons=unique_reasons,
+        gate_slacks=slacks,
+    )
 
 
 def compute_gate_slacks(

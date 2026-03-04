@@ -195,6 +195,7 @@ class BuildEvaluator:
                 gate_eval = evaluate_gates(normalized, template.gate_thresholds)
                 payload["gate_pass"] = gate_eval.gate_pass
                 payload["gate_fail_reasons"] = list(gate_eval.gate_fail_reasons)
+                payload["gate_slacks"] = asdict(gate_eval.gate_slacks)
 
         write_build_artifacts(
             build_id,
@@ -242,6 +243,7 @@ class BuildEvaluator:
                     life=normalized.life,
                     mana=normalized.mana,
                     utility_score=normalized.utility_score,
+                    gate_slacks=asdict(gate_eval.gate_slacks),
                     metrics_source=self._worker_payload_metrics_source(payload),
                 )
             )

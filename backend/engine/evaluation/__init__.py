@@ -10,6 +10,8 @@ from .gates import (
     GATE_REASON_RESIST_FIRE,
     GATE_REASON_RESIST_LIGHTNING,
     GateEvaluation,
+    GateSlackMetrics,
+    compute_gate_slacks,
     evaluate_gates,
 )
 from .normalized import (
@@ -22,7 +24,9 @@ from .normalized import (
 
 __all__ = [
     "GateEvaluation",
+    "GateSlackMetrics",
     "evaluate_gates",
+    "compute_gate_slacks",
     "NormalizedMetrics",
     "NormalizedReservation",
     "NormalizedAttributes",
