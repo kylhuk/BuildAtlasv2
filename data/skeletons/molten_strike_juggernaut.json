@@ -1,0 +1,26 @@
+{
+  "skeleton_id": "molten_strike_juggernaut",
+  "class_name": "marauder",
+  "ascendancy": "Juggernaut",
+  "main_skill": "Molten Strike",
+  "skill_links": [
+    "Multistrike Support",
+    "Elemental Damage with Attacks",
+    "Added Fire Damage",
+    "Inspiration",
+    "Ancestral Call Support"
+  ],
+  "aura_package": [
+    "Determination",
+    "Anger",
+    "Herald of Ash"
+  ],
+  "defense_layer": "armour",
+  "budget_tier": "endgame",
+  "target_gates": {
+    "max_hit_phys": 25000,
+    "max_hit_ele": 50000
+  },
+  "required_uniques": [],
+  "tree_path": "skeletons/molten_strike_juggernaut.tree"
+}

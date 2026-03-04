@@ -1,0 +1,26 @@
+{
+  "skeleton_id": "spark_inquisitor",
+  "class_name": "templar",
+  "ascendancy": "Inquisitor",
+  "main_skill": "Spark",
+  "skill_links": [
+    "Spell Echo",
+    "Pierce",
+    "Inspiration",
+    "Increased Critical Damage",
+    "Increased Critical Strikes"
+  ],
+  "aura_package": [
+    "Determination",
+    "Zealotry",
+    "Herald of Ice"
+  ],
+  "defense_layer": "hybrid",
+  "budget_tier": "midgame",
+  "target_gates": {
+    "max_hit_phys": 12000,
+    "max_hit_ele": 35000
+  },
+  "required_uniques": [],
+  "tree_path": "skeletons/spark_inquisitor.tree"
+}

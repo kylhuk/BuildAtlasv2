@@ -1,0 +1,26 @@
+{
+  "skeleton_id": "boneshatter_juggernaut",
+  "class_name": "marauder",
+  "ascendancy": "Juggernaut",
+  "main_skill": "Boneshatter",
+  "skill_links": [
+    "Melee Physical Damage",
+    "Brutality",
+    "Fortify",
+    "Close Combat",
+    "Ruthless"
+  ],
+  "aura_package": [
+    "Determination",
+    "Pride",
+    "Dread Banner"
+  ],
+  "defense_layer": "armour",
+  "budget_tier": "starter",
+  "target_gates": {
+    "max_hit_phys": 20000,
+    "max_hit_ele": 45000
+  },
+  "required_uniques": [],
+  "tree_path": "skeletons/boneshatter_juggernaut.tree"
+}

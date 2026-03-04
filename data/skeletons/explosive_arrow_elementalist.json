@@ -1,0 +1,26 @@
+{
+  "skeleton_id": "explosive_arrow_elementalist",
+  "class_name": "witch",
+  "ascendancy": "Elementalist",
+  "main_skill": "Explosive Arrow",
+  "skill_links": [
+    "Ballista Totem Support",
+    "Elemental Damage with Attacks",
+    "Ignite Proliferation",
+    "Burning Damage",
+    "Lifetap"
+  ],
+  "aura_package": [
+    "Determination",
+    "Grace",
+    "Precision"
+  ],
+  "defense_layer": "evasion",
+  "budget_tier": "starter",
+  "target_gates": {
+    "max_hit_phys": 10000,
+    "max_hit_ele": 30000
+  },
+  "required_uniques": [],
+  "tree_path": "skeletons/explosive_arrow_elementalist.tree"
+}

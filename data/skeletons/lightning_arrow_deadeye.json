@@ -1,0 +1,26 @@
+{
+  "skeleton_id": "lightning_arrow_deadeye",
+  "class_name": "ranger",
+  "ascendancy": "Deadeye",
+  "main_skill": "Lightning Arrow",
+  "skill_links": [
+    "Elemental Damage with Attacks",
+    "Added Lightning Damage",
+    "Greater Multiple Projectiles",
+    "Inspiration",
+    "Mirage Archer"
+  ],
+  "aura_package": [
+    "Grace",
+    "Anger",
+    "Herald of Ice"
+  ],
+  "defense_layer": "evasion",
+  "budget_tier": "starter",
+  "target_gates": {
+    "max_hit_phys": 7000,
+    "max_hit_ele": 22000
+  },
+  "required_uniques": [],
+  "tree_path": "skeletons/lightning_arrow_deadeye.tree"
+}

@@ -1,0 +1,26 @@
+{
+  "skeleton_id": "rf_juggernaut",
+  "class_name": "marauder",
+  "ascendancy": "Juggernaut",
+  "main_skill": "Righteous Fire",
+  "skill_links": [
+    "Elemental Focus",
+    "Burning Damage",
+    "Efficacy",
+    "Swift Affliction",
+    "Increased Area of Effect"
+  ],
+  "aura_package": [
+    "Determination",
+    "Purity of Elements",
+    "Malevolence"
+  ],
+  "defense_layer": "armour",
+  "budget_tier": "starter",
+  "target_gates": {
+    "max_hit_phys": 15000,
+    "max_hit_ele": 40000
+  },
+  "required_uniques": [],
+  "tree_path": "skeletons/rf_juggernaut.tree"
+}

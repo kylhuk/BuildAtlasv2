@@ -1,0 +1,28 @@
+{
+  "skeleton_id": "shockwave_totem_hierophant",
+  "class_name": "templar",
+  "ascendancy": "Hierophant",
+  "main_skill": "Shockwave Totem",
+  "skill_links": [
+    "Multiple Totems Support",
+    "Increased Critical Strikes",
+    "Increased Critical Damage",
+    "Added Cold Damage",
+    "Elemental Damage with Attacks"
+  ],
+  "aura_package": [
+    "Determination",
+    "Zealotry",
+    "Herald of Purity"
+  ],
+  "defense_layer": "hybrid",
+  "budget_tier": "midgame",
+  "target_gates": {
+    "max_hit_phys": 10000,
+    "max_hit_ele": 30000
+  },
+  "required_uniques": [
+    "Astral Projector"
+  ],
+  "tree_path": "skeletons/shockwave_totem_hierophant.tree"
+}

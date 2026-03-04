@@ -1,0 +1,26 @@
+{
+  "skeleton_id": "cyclone_slayer",
+  "class_name": "duelist",
+  "ascendancy": "Slayer",
+  "main_skill": "Cyclone",
+  "skill_links": [
+    "Infused Channelling",
+    "Melee Physical Damage",
+    "Brutality",
+    "Pulverise",
+    "Fortify"
+  ],
+  "aura_package": [
+    "Pride",
+    "Dread Banner",
+    "Flesh and Stone"
+  ],
+  "defense_layer": "armour",
+  "budget_tier": "starter",
+  "target_gates": {
+    "max_hit_phys": 12000,
+    "max_hit_ele": 30000
+  },
+  "required_uniques": [],
+  "tree_path": "skeletons/cyclone_slayer.tree"
+}

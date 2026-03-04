@@ -1,0 +1,25 @@
+{
+  "skeleton_id": "bane_occultist",
+  "class_name": "witch",
+  "ascendancy": "Occultist",
+  "main_skill": "Bane",
+  "skill_links": [
+    "Despair",
+    "Temporal Chains",
+    "Efficacy",
+    "Void Manipulation",
+    "Swift Affliction"
+  ],
+  "aura_package": [
+    "Determination",
+    "Malevolence"
+  ],
+  "defense_layer": "energy_shield",
+  "budget_tier": "starter",
+  "target_gates": {
+    "max_hit_phys": 10000,
+    "max_hit_ele": 30000
+  },
+  "required_uniques": [],
+  "tree_path": "skeletons/bane_occultist.tree"
+}

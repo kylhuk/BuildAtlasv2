@@ -1,0 +1,28 @@
+{
+  "skeleton_id": "flicker_strike_raider",
+  "class_name": "ranger",
+  "ascendancy": "Raider",
+  "main_skill": "Flicker Strike",
+  "skill_links": [
+    "Multistrike Support",
+    "Melee Physical Damage",
+    "Close Combat",
+    "Ice Bite Support",
+    "Elemental Damage with Attacks"
+  ],
+  "aura_package": [
+    "Grace",
+    "Hatred",
+    "Herald of Ice"
+  ],
+  "defense_layer": "evasion",
+  "budget_tier": "midgame",
+  "target_gates": {
+    "max_hit_phys": 8000,
+    "max_hit_ele": 25000
+  },
+  "required_uniques": [
+    "Farrul's Fur"
+  ],
+  "tree_path": "skeletons/flicker_strike_raider.tree"
+}

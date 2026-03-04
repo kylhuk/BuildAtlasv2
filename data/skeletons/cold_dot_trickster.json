@@ -1,0 +1,26 @@
+{
+  "skeleton_id": "cold_dot_trickster",
+  "class_name": "shadow",
+  "ascendancy": "Trickster",
+  "main_skill": "Vortex",
+  "skill_links": [
+    "Elemental Focus",
+    "Efficacy",
+    "Swift Affliction",
+    "Controlled Destruction",
+    "Hypothermia"
+  ],
+  "aura_package": [
+    "Grace",
+    "Determination",
+    "Malevolence"
+  ],
+  "defense_layer": "hybrid",
+  "budget_tier": "starter",
+  "target_gates": {
+    "max_hit_phys": 12000,
+    "max_hit_ele": 35000
+  },
+  "required_uniques": [],
+  "tree_path": "skeletons/cold_dot_trickster.tree"
+}

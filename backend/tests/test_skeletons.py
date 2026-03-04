@@ -72,3 +72,37 @@ def test_skeleton_from_to_dict():
     skeleton = Skeleton.from_dict(data)
     assert skeleton.skeleton_id == "test_id"
     assert skeleton.to_dict() == data
+
+
+def test_list_skeletons(tmp_path, monkeypatch):
+    from backend.engine.skeletons.loader import list_skeletons
+    from backend.app.settings import settings
+    import json
+
+    # Create a temporary skeletons directory
+    skeletons_dir = tmp_path / "skeletons"
+    skeletons_dir.mkdir()
+
+    # Create a dummy skeleton file
+    skeleton_data = {
+        "skeleton_id": "test_id",
+        "class_name": "marauder",
+        "ascendancy": "Juggernaut",
+        "main_skill": "Cyclone",
+        "skill_links": ["Cyclone"],
+        "aura_package": ["Determination"],
+        "defense_layer": "armour",
+        "budget_tier": "starter",
+        "target_gates": {"dps": 1000000},
+        "required_uniques": [],
+        "tree_path": "some/path",
+    }
+    with open(skeletons_dir / "test_id.json", "w") as f:
+        json.dump(skeleton_data, f)
+
+    # Mock settings.data_path
+    monkeypatch.setattr(settings, "data_path", tmp_path)
+
+    skeletons = list_skeletons()
+    assert len(skeletons) == 1
+    assert skeletons[0].skeleton_id == "test_id"

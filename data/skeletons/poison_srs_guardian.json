@@ -1,0 +1,29 @@
+{
+  "skeleton_id": "poison_srs_guardian",
+  "class_name": "templar",
+  "ascendancy": "Guardian",
+  "main_skill": "Summon Raging Spirit",
+  "skill_links": [
+    "Unleash",
+    "Minion Damage",
+    "Melee Splash",
+    "Multistrike",
+    "Void Manipulation"
+  ],
+  "aura_package": [
+    "Determination",
+    "Envy",
+    "Haste"
+  ],
+  "defense_layer": "armour",
+  "budget_tier": "midgame",
+  "target_gates": {
+    "max_hit_phys": 15000,
+    "max_hit_ele": 40000
+  },
+  "required_uniques": [
+    "The Covenant",
+    "United in Dream"
+  ],
+  "tree_path": "skeletons/poison_srs_guardian.tree"
+}

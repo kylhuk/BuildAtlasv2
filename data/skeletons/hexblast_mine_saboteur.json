@@ -1,0 +1,28 @@
+{
+  "skeleton_id": "hexblast_mine_saboteur",
+  "class_name": "shadow",
+  "ascendancy": "Saboteur",
+  "main_skill": "Hexblast",
+  "skill_links": [
+    "High-Impact Mine Support",
+    "Minefield Support",
+    "Void Manipulation",
+    "Trap and Mine Damage",
+    "Charged Mines Support"
+  ],
+  "aura_package": [
+    "Grace",
+    "Determination",
+    "Skitterbots"
+  ],
+  "defense_layer": "evasion",
+  "budget_tier": "midgame",
+  "target_gates": {
+    "max_hit_phys": 9000,
+    "max_hit_ele": 28000
+  },
+  "required_uniques": [
+    "Sandstorm Visage"
+  ],
+  "tree_path": "skeletons/hexblast_mine_saboteur.tree"
+}

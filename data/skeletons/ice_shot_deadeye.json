@@ -1,0 +1,28 @@
+{
+  "skeleton_id": "ice_shot_deadeye",
+  "class_name": "ranger",
+  "ascendancy": "Deadeye",
+  "main_skill": "Ice Shot",
+  "skill_links": [
+    "Elemental Damage with Attacks",
+    "Added Cold Damage",
+    "Greater Multiple Projectiles",
+    "Inspiration",
+    "Mirage Archer"
+  ],
+  "aura_package": [
+    "Grace",
+    "Hatred",
+    "Herald of Ice"
+  ],
+  "defense_layer": "evasion",
+  "budget_tier": "midgame",
+  "target_gates": {
+    "max_hit_phys": 8000,
+    "max_hit_ele": 25000
+  },
+  "required_uniques": [
+    "Hyrri's Ire"
+  ],
+  "tree_path": "skeletons/ice_shot_deadeye.tree"
+}

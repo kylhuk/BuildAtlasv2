@@ -1,0 +1,28 @@
+{
+  "skeleton_id": "splitting_steel_champion",
+  "class_name": "duelist",
+  "ascendancy": "Champion",
+  "main_skill": "Splitting Steel",
+  "skill_links": [
+    "Vicious Projectiles",
+    "Brutality",
+    "Maim Support",
+    "Chance to Bleed",
+    "Lifetap"
+  ],
+  "aura_package": [
+    "Determination",
+    "Grace",
+    "Pride"
+  ],
+  "defense_layer": "armour",
+  "budget_tier": "midgame",
+  "target_gates": {
+    "max_hit_phys": 18000,
+    "max_hit_ele": 40000
+  },
+  "required_uniques": [
+    "Perseverance"
+  ],
+  "tree_path": "skeletons/splitting_steel_champion.tree"
+}

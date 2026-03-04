@@ -1,0 +1,26 @@
+{
+  "skeleton_id": "penance_brand_inquisitor",
+  "class_name": "templar",
+  "ascendancy": "Inquisitor",
+  "main_skill": "Penance Brand of Dissipation",
+  "skill_links": [
+    "Swiftbrand Support",
+    "Spell Echo",
+    "Concentrated Effect",
+    "Increased Critical Damage",
+    "Inspiration"
+  ],
+  "aura_package": [
+    "Determination",
+    "Zealotry",
+    "Herald of Ash"
+  ],
+  "defense_layer": "armour",
+  "budget_tier": "endgame",
+  "target_gates": {
+    "max_hit_phys": 15000,
+    "max_hit_ele": 40000
+  },
+  "required_uniques": [],
+  "tree_path": "skeletons/penance_brand_inquisitor.tree"
+}

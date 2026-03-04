@@ -1,0 +1,28 @@
+{
+  "skeleton_id": "wardloop_ascendant",
+  "class_name": "scion",
+  "ascendancy": "Ascendant",
+  "main_skill": "Ice Spear",
+  "skill_links": [
+    "Cast when Damage Taken Support",
+    "Greater Multiple Projectiles",
+    "Inspiration",
+    "Increased Critical Damage",
+    "Elemental Focus"
+  ],
+  "aura_package": [
+    "Hatred",
+    "Zealotry"
+  ],
+  "defense_layer": "hybrid",
+  "budget_tier": "endgame",
+  "target_gates": {
+    "max_hit_phys": 5000,
+    "max_hit_ele": 20000
+  },
+  "required_uniques": [
+    "Olroth's Resolve",
+    "The Traitor"
+  ],
+  "tree_path": "skeletons/wardloop_ascendant.tree"
+}

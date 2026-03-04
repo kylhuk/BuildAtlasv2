@@ -1,0 +1,26 @@
+{
+  "skeleton_id": "impending_doom_occultist",
+  "class_name": "witch",
+  "ascendancy": "Occultist",
+  "main_skill": "Impending Doom",
+  "skill_links": [
+    "Spell Cascade Support",
+    "Void Manipulation",
+    "Unbound Ailments",
+    "Deadly Ailments",
+    "Added Chaos Damage"
+  ],
+  "aura_package": [
+    "Determination",
+    "Grace",
+    "Malevolence"
+  ],
+  "defense_layer": "hybrid",
+  "budget_tier": "midgame",
+  "target_gates": {
+    "max_hit_phys": 12000,
+    "max_hit_ele": 35000
+  },
+  "required_uniques": [],
+  "tree_path": "skeletons/impending_doom_occultist.tree"
+}

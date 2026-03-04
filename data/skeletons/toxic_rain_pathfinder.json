@@ -1,0 +1,26 @@
+{
+  "skeleton_id": "toxic_rain_pathfinder",
+  "class_name": "ranger",
+  "ascendancy": "Pathfinder",
+  "main_skill": "Toxic Rain",
+  "skill_links": [
+    "Vicious Projectiles",
+    "Void Manipulation",
+    "Efficacy",
+    "Swift Affliction",
+    "Mirage Archer"
+  ],
+  "aura_package": [
+    "Grace",
+    "Determination",
+    "Herald of Agony"
+  ],
+  "defense_layer": "evasion",
+  "budget_tier": "starter",
+  "target_gates": {
+    "max_hit_phys": 10000,
+    "max_hit_ele": 30000
+  },
+  "required_uniques": [],
+  "tree_path": "skeletons/toxic_rain_pathfinder.tree"
+}

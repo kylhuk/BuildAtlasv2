@@ -1,0 +1,26 @@
+{
+  "skeleton_id": "ice_trap_saboteur",
+  "class_name": "shadow",
+  "ascendancy": "Saboteur",
+  "main_skill": "Ice Trap",
+  "skill_links": [
+    "Cluster Traps Support",
+    "Trap and Mine Damage",
+    "Added Cold Damage",
+    "Increased Critical Strikes",
+    "Inspiration"
+  ],
+  "aura_package": [
+    "Grace",
+    "Hatred",
+    "Skitterbots"
+  ],
+  "defense_layer": "evasion",
+  "budget_tier": "starter",
+  "target_gates": {
+    "max_hit_phys": 8000,
+    "max_hit_ele": 25000
+  },
+  "required_uniques": [],
+  "tree_path": "skeletons/ice_trap_saboteur.tree"
+}

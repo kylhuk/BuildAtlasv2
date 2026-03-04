@@ -1,0 +1,26 @@
+{
+  "skeleton_id": "detonate_dead_elementalist",
+  "class_name": "witch",
+  "ascendancy": "Elementalist",
+  "main_skill": "Detonate Dead",
+  "skill_links": [
+    "Elemental Focus",
+    "Burning Damage",
+    "Ignite Proliferation",
+    "Unbound Ailments",
+    "Deadly Ailments"
+  ],
+  "aura_package": [
+    "Determination",
+    "Grace",
+    "Defiance Banner"
+  ],
+  "defense_layer": "hybrid",
+  "budget_tier": "starter",
+  "target_gates": {
+    "max_hit_phys": 12000,
+    "max_hit_ele": 35000
+  },
+  "required_uniques": [],
+  "tree_path": "skeletons/detonate_dead_elementalist.tree"
+}

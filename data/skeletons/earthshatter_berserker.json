@@ -1,0 +1,26 @@
+{
+  "skeleton_id": "earthshatter_berserker",
+  "class_name": "marauder",
+  "ascendancy": "Berserker",
+  "main_skill": "Earthshatter",
+  "skill_links": [
+    "Melee Physical Damage",
+    "Brutality",
+    "Fortify",
+    "Pulverise",
+    "Fist of War Support"
+  ],
+  "aura_package": [
+    "Determination",
+    "Pride",
+    "Blood and Sand"
+  ],
+  "defense_layer": "armour",
+  "budget_tier": "starter",
+  "target_gates": {
+    "max_hit_phys": 15000,
+    "max_hit_ele": 35000
+  },
+  "required_uniques": [],
+  "tree_path": "skeletons/earthshatter_berserker.tree"
+}

@@ -1,0 +1,25 @@
+{
+  "skeleton_id": "archmage_frostblink_hierophant",
+  "class_name": "templar",
+  "ascendancy": "Hierophant",
+  "main_skill": "Frostblink of Wintry Blast",
+  "skill_links": [
+    "Archmage Support",
+    "Spell Echo",
+    "Increased Critical Strikes",
+    "Increased Critical Damage",
+    "Inspiration"
+  ],
+  "aura_package": [
+    "Eternal Blessing Support",
+    "Zealotry"
+  ],
+  "defense_layer": "energy_shield",
+  "budget_tier": "midgame",
+  "target_gates": {
+    "max_hit_phys": 10000,
+    "max_hit_ele": 35000
+  },
+  "required_uniques": [],
+  "tree_path": "skeletons/archmage_frostblink_hierophant.tree"
+}

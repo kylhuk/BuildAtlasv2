@@ -1,0 +1,26 @@
+{
+  "skeleton_id": "vortex_occultist",
+  "class_name": "witch",
+  "ascendancy": "Occultist",
+  "main_skill": "Vortex",
+  "skill_links": [
+    "Elemental Focus",
+    "Burning Damage",
+    "Efficacy",
+    "Swift Affliction",
+    "Controlled Destruction"
+  ],
+  "aura_package": [
+    "Determination",
+    "Malevolence",
+    "Herald of Ice"
+  ],
+  "defense_layer": "energy_shield",
+  "budget_tier": "starter",
+  "target_gates": {
+    "max_hit_phys": 10000,
+    "max_hit_ele": 30000
+  },
+  "required_uniques": [],
+  "tree_path": "skeletons/vortex_occultist.tree"
+}
