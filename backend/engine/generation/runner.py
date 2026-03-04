@@ -2511,6 +2511,10 @@ def run_generation(
             "records": [
                 record for record in evaluation_records if record["status"] or record["error"]
             ],
+            "gate_evaluations": [
+                {"gate_pass": row.gate_pass, "gate_fail_reasons": list(row.gate_fail_reasons)}
+                for row in evaluation_rows
+            ],
         },
         "surrogate": {
             "enabled": surrogate_summary["enabled"],

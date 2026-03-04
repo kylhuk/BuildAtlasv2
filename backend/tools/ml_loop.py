@@ -10,6 +10,7 @@ import re
 import statistics
 import tarfile
 import tempfile
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
@@ -18,6 +19,7 @@ from typing import Any, Mapping, Sequence
 from backend.app.api.evaluator import BuildEvaluator
 from backend.app.db.ch import ClickhouseRepository
 from backend.app.settings import settings
+from backend.engine.evaluation import GateEvaluation
 from backend.engine.generation.runner import (
     _run_summary_path,
     load_run_summary,
@@ -581,6 +583,34 @@ def _build_summary_payload(state: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def compute_gate_fail_histogram(evaluations: Sequence[GateEvaluation]) -> dict[str, Any]:
+    """Count failures per gate across all evaluations."""
+    fail_counts: Counter[str] = Counter()
+    total_evaluated = len(evaluations)
+
+    for ev in evaluations:
+        for reason in ev.gate_fail_reasons:
+            fail_counts[reason] += 1
+
+    top_10 = fail_counts.most_common(10)
+    return {
+        "total_evaluated": total_evaluated,
+        "total_failures": sum(fail_counts.values()),
+        "gate_fail_histogram": dict(top_10),
+        "gate_fail_percentages": {
+            reason: f"{(count / total_evaluated * 100):.1f}%" if total_evaluated > 0 else "0.0%"
+            for reason, count in top_10
+        },
+    }
+
+
+def generate_run_summary(evaluations: Sequence[GateEvaluation]) -> dict[str, Any]:
+    """Generates a summary of the run including gate failure analysis."""
+    return {
+        "gate_fail_analysis": compute_gate_fail_histogram(evaluations),
+    }
+
+
 def _resolve_ruleset_id(args: argparse.Namespace) -> str:
     if args.ruleset_id:
         return args.ruleset_id
@@ -829,6 +859,16 @@ def start_loop(args: argparse.Namespace) -> int:
                 optimizer_elite_count=optimizer_elite_count,
                 enforce_worker_tripwire=True,
             )
+            # TASK 0.3: Add gate fail analysis to run summary
+            gate_evals_raw = run_summary.get("evaluation", {}).get("gate_evaluations", [])
+            gate_evaluations = [
+                GateEvaluation(
+                    gate_pass=e["gate_pass"], gate_fail_reasons=tuple(e["gate_fail_reasons"])
+                )
+                for e in gate_evals_raw
+            ]
+            run_summary.update(generate_run_summary(gate_evaluations))
+
             _log_loop_phase(
                 loop_id,
                 "generation_complete",
