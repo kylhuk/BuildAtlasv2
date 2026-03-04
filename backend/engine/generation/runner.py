@@ -2577,6 +2577,8 @@ def run_generation(
         base_path=base_path,
     )
     summary["benchmark"] = benchmark_payload
+    summary["slack_quantiles"] = compute_slack_quantiles(summary)
+    summary["paths"]["benchmark_summary"] = str(benchmark_path)
     summary["paths"]["benchmark_summary"] = str(benchmark_path)
 
     ml_payload = _build_ml_lifecycle_payload(
@@ -2705,6 +2707,54 @@ def _median_or_zero(values: Sequence[float]) -> float:
     if not values:
         return 0.0
     return float(median(values))
+
+
+def compute_slack_quantiles(run_summary: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Compute quantiles for min_gate_slack across all evaluated candidates."""
+    generation = run_summary.get("generation")
+    if not isinstance(generation, Mapping):
+        return None
+    attempt_records = generation.get("attempt_records")
+    if not isinstance(attempt_records, Sequence):
+        return None
+
+    slacks: list[float] = []
+    for record in attempt_records:
+        if not isinstance(record, Mapping):
+            continue
+        # Extract min_gate_slack from record if available
+        slack = _coerce_float(record.get("min_gate_slack"))
+        if slack is not None:
+            slacks.append(slack)
+
+    if not slacks:
+        return None
+
+    sorted_slacks = sorted(slacks)
+
+    def _safe_percentile(values: Sequence[float], percentile: float) -> float | None:
+        if not values:
+            return None
+        position = (len(values) - 1) * percentile
+        lower_index = int(position)
+        upper_index = lower_index + 1 if lower_index < len(values) - 1 else lower_index
+        lower_value = values[lower_index]
+        upper_value = values[upper_index]
+        if lower_index == upper_index:
+            return float(lower_value)
+        weight = position - lower_index
+        return float(lower_value + (upper_value - lower_value) * weight)
+
+    return {
+        "min_gate_slack": {
+            "min": float(sorted_slacks[0]),
+            "p10": _safe_percentile(sorted_slacks, 0.1),
+            "median": float(median(sorted_slacks)),
+            "p90": _safe_percentile(sorted_slacks, 0.9),
+            "max": float(sorted_slacks[-1]),
+            "mean": float(mean(slacks)),
+        }
+    }
 
 
 def _build_ml_lifecycle_payload(
