@@ -347,20 +347,20 @@ class TestCurriculumScheduler:
         scheduler = CurriculumScheduler(initial_phase=CurriculumPhase.BOSSING)
         for _ in range(100):
             scheduler.record_evaluation(gate_passed=False)
-        scheduler.record_evaluation(gate_passed=True)
-        scheduler.record_evaluation(gate_passed=True)
+        for _ in range(5):
+            scheduler.record_evaluation(gate_passed=True)
 
         summary = scheduler.get_state_summary()
 
         assert summary["current_phase"] == "BOSSING"
         assert summary["phase_number"] == 2
         assert "Bossing" in summary["phase_description"]
-        assert summary["total_samples"] == 102
-        assert summary["feasible_samples"] == 2
-        assert summary["phase_samples"] == 2
-        assert summary["phase_feasible_samples"] == 2
-        assert "1.96%" in summary["overall_feasibility"]
-        assert "100.00%" in summary["phase_feasibility"]
+        assert summary["total_samples"] == 105
+        assert summary["feasible_samples"] == 5
+        assert summary["phase_samples"] == 105
+        assert summary["phase_feasible_samples"] == 5
+        assert "4.76%" in summary["overall_feasibility"]
+        assert "4.76%" in summary["phase_feasibility"]
 
 
 class TestCurriculumIntegration:
