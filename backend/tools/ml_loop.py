@@ -2738,6 +2738,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     start_parser.add_argument("--profile-id", default="pinnacle", help="Scenario profile")
     start_parser.add_argument(
+        "--gate-profile",
+        default=None,
+        choices=["resistances", "full"],
+        help="Enable gate checking: 'resistances' for resistance gates only, 'full' for all gates (default: None - no gates)",
+    )
+    start_parser.add_argument(
         "--skeleton-id",
         default=None,
         help="Optional skeleton identifier for feasibility-first generation",
