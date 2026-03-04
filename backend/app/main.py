@@ -14,6 +14,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Literal, Mapping, Sequence
 
+import orjson
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -66,7 +67,18 @@ from backend.engine.artifacts.store import (
 from backend.engine.build_details import build_details_from_import
 from backend.engine.generation.runner import run_generation
 
-app = FastAPI(title="BuildAtlas Backend")
+
+class CustomJSONResponse(JSONResponse):
+    """Custom JSON response that uses orjson when enabled, standard json otherwise."""
+
+    def render(self, content: Any) -> bytes:
+        if settings.use_orjson:
+            return orjson.dumps(content)
+        else:
+            return json.dumps(content).encode("utf-8")
+
+
+app = FastAPI(title="BuildAtlas Backend", default_response_class=CustomJSONResponse)
 
 app.add_middleware(
     CORSMiddleware,

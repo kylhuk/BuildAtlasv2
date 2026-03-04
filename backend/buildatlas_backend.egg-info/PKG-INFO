@@ -7,6 +7,8 @@ Requires-Python: >=3.11
 Description-Content-Type: text/markdown
 Requires-Dist: fastapi>=0.110
 Requires-Dist: uvicorn>=0.23
+Requires-Dist: uvloop>=0.19
+Requires-Dist: httptools>=0.6
 Requires-Dist: pydantic-settings>=2.4
 Requires-Dist: clickhouse-connect>=0.5
 Provides-Extra: dev
@@ -17,6 +19,10 @@ Provides-Extra: ml
 Requires-Dist: numpy; extra == "ml"
 Requires-Dist: scikit-learn; extra == "ml"
 Requires-Dist: torch; extra == "ml"
+Provides-Extra: performance
+Requires-Dist: orjson>=3.9.0; extra == "performance"
+Requires-Dist: xxhash>=3.2.0; extra == "performance"
+Requires-Dist: aiofiles>=23.0.0; extra == "performance"
 
 BuildAtlas backend package metadata file.
 

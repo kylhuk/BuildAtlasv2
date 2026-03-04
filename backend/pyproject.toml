@@ -10,8 +10,13 @@ requires-python = ">=3.11"
 dependencies = [
 	"fastapi>=0.110",
 	"uvicorn>=0.23",
+	"uvloop>=0.19",
+	"httptools>=0.6",
 	"pydantic-settings>=2.4",
-	"clickhouse-connect>=0.5"
+	"clickhouse-connect>=0.5",
+	"orjson>=3.9.0",
+	"xxhash>=3.2.0",
+	"aiofiles>=23.0.0"
 ]
 
 [project.optional-dependencies]
