@@ -97,9 +97,7 @@ PHASE_CONFIGS = {
     ),
 }
 
-FEASIBILITY_TRANSITION_THRESHOLD = 0.10  # Transition when feasibility > 10%
-MIN_SAMPLES_PER_PHASE = 100  # Minimum samples before considering transition
-MAX_SAMPLES_PER_PHASE = 1000  # Maximum samples before forcing transition
+FEASIBILITY_TRANSITION_THRESHOLD = 0.25  # Transition when 25% of builds pass gates
 
 
 @dataclass(frozen=True)
@@ -127,20 +125,13 @@ class CurriculumState:
         return self.phase_feasible_samples / self.phase_samples
 
     @property
-    def max_samples_exceeded(self) -> bool:
-        """Check if maximum samples for current phase exceeded."""
-        return self.phase_samples >= MAX_SAMPLES_PER_PHASE
-
-    @property
     def should_transition(self) -> bool:
-        """Check if phase transition criteria are met."""
+        """Progress purely based on metric achievement.
+
+        Transitions when enough builds pass gates (25%).
+        No arbitrary min/max sample limits - runs as long as needed.
+        """
         if self.current_phase == CurriculumPhase.UBER:
-            return False  # Already at hardest phase
-        # Force transition if max samples exceeded
-        if self.max_samples_exceeded:
-            return True
-        # Don't transition if insufficient samples (unless max exceeded)
-        if self.phase_samples < MIN_SAMPLES_PER_PHASE:
             return False
         return self.phase_feasibility > FEASIBILITY_TRANSITION_THRESHOLD
 
@@ -265,6 +256,4 @@ __all__ = [
     "CurriculumScheduler",
     "PHASE_CONFIGS",
     "FEASIBILITY_TRANSITION_THRESHOLD",
-    "MIN_SAMPLES_PER_PHASE",
-    "MAX_SAMPLES_PER_PHASE",
 ]
