@@ -254,6 +254,7 @@ def _build_initial_state(
     total_iterations: int | None,
     seed_start_base: int,
     seed_window_size: int,
+    level_interval: int = 10,
 ) -> dict[str, Any]:
     now = _now()
     return {
@@ -263,6 +264,8 @@ def _build_initial_state(
         "phase": "initialized",
         "iteration": 0,
         "total_iterations": total_iterations,
+        "level_interval": level_interval,
+        "character_level": 1,
         "stop_requested": False,
         "started_at_utc": now,
         "updated_at_utc": now,
@@ -897,11 +900,23 @@ def start_loop(args: argparse.Namespace) -> int:
                     state_path,
                     backup_exc,
                 )
-            state = _build_initial_state(loop_id, total_iterations, args.seed_start, generate_count)
+            state = _build_initial_state(
+                loop_id,
+                total_iterations,
+                args.seed_start,
+                generate_count,
+                getattr(args, "level_interval", 10),
+            )
             _write_state(state_path, state)
             state_exists = False
     else:
-        state = _build_initial_state(loop_id, total_iterations, args.seed_start, generate_count)
+        state = _build_initial_state(
+            loop_id,
+            total_iterations,
+            args.seed_start,
+            generate_count,
+            getattr(args, "level_interval", 10),
+        )
         _write_state(state_path, state)
 
     _ensure_seed_metadata(state_path, state, args)
@@ -1281,6 +1296,8 @@ def start_loop(args: argparse.Namespace) -> int:
                     ),
                 )
                 iteration += 1
+                # Calculate character level based on iteration and interval
+                state["character_level"] = 1 + (iteration // state.get("level_interval", 10))
                 continue
             _persist_state(
                 state_path,
@@ -1546,6 +1563,7 @@ def start_loop(args: argparse.Namespace) -> int:
                 total_iterations,
                 args.seed_start,
                 _resolve_generate_count(args),
+                getattr(args, "level_interval", 10),
             )
             _write_state(state_path, failure_state)
         failure_checkpoint = _write_failure_checkpoint(
@@ -2373,6 +2391,13 @@ def _render_status_human(
     reason_message = state.get("last_generation_status_reason_message")
     if reason_message:
         summary_lines.append(f"Last generation reason: {reason_message}")
+    summary_lines.append(
+        (
+            "Character Level: "
+            f"{state.get('character_level', 1)} "
+            f"(interval: {state.get('level_interval', 10)})"
+        )
+    )
     summary_lines.append(
         (
             "Tripwire counts: "
