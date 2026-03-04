@@ -102,6 +102,8 @@ def build_dataset_snapshot(
     exclude_stub_rows: bool = False,
     profile_id: str | None = None,
     scenario_id: str | None = None,
+    evolutionary_selection: bool = False,
+    survival_rate: float = 0.9,
 ) -> SnapshotResult:
     """Build a dataset snapshot from the given data/artifacts root."""
 
@@ -125,6 +127,32 @@ def build_dataset_snapshot(
             scenario_id=scenario_id,
         )
     )
+
+    # Evolutionary selection: kill bottom 10% by fitness (FullDPS × MaxHit)
+    evolutionary_stats = None
+    if evolutionary_selection and rows:
+        original_count = len(rows)
+        # Calculate fitness score for each row
+        rows_with_fitness = []
+        for row in rows:
+            full_dps = float(row.get("full_dps") or 0)
+            max_hit = float(row.get("max_hit") or 0)
+            fitness = full_dps * max_hit
+            rows_with_fitness.append((fitness, row))
+
+        # Sort by fitness descending and keep top survival_rate
+        rows_with_fitness.sort(key=lambda x: x[0], reverse=True)
+        keep_count = max(1, int(len(rows_with_fitness) * survival_rate))
+        rows = [row for _, row in rows_with_fitness[:keep_count]]
+
+        killed_count = original_count - len(rows)
+        evolutionary_stats = {
+            "original_count": original_count,
+            "killed_count": killed_count,
+            "survival_rate": survival_rate,
+            "final_count": len(rows),
+        }
+
     dataset_path = snapshot_dir / _DATASET_FILENAME
     dataset_hash = _write_rows(rows, dataset_path)
 
@@ -136,6 +164,8 @@ def build_dataset_snapshot(
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "dataset_hash": dataset_hash,
     }
+    if evolutionary_stats:
+        manifest["evolutionary_stats"] = evolutionary_stats
     manifest_path = snapshot_dir / _MANIFEST_FILENAME
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=True, indent=2), encoding="utf-8")
 
