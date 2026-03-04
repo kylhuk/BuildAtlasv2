@@ -57,7 +57,7 @@ dev:
 	@$(MAKE) -j2 --output-sync=line backend-dev ui-dev
 
 backend-dev:
-	$(BACKEND_RUN) python -m uvicorn backend.app.main:app --reload --host 0.0.0.0 --port $(BACKEND_PORT)
+	$(BACKEND_RUN) python -m uvicorn backend.app.main:app --reload --host 0.0.0.0 --port $(BACKEND_PORT) --workers 1 --loop uvloop --http httptools --lifespan on
 
 ui-dev:
 	npm --prefix $(UI_DIR) run dev
