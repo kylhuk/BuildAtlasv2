@@ -25,6 +25,13 @@ from statistics import mean, median, pstdev
 from time import monotonic
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+try:
+    import torch
+    import torch.nn as nn
+except ImportError:
+    torch = None  # type: ignore
+    nn = None  # type: ignore
+
 from backend.engine.surrogate.dataset import (
     FEATURE_IDENTITY_CROSS_TOKENS,
     FEATURE_IDENTITY_TOKENS,
@@ -181,6 +188,56 @@ class EvaluationResult:
     metric_mae_pass: Mapping[str, float] = field(default_factory=dict)
     metric_mae_log1p_pass: Mapping[str, float] = field(default_factory=dict)
     classifier_metrics: Mapping[str, float | None] = field(default_factory=dict)
+    slack_regressor_metrics: Mapping[str, float | None] = field(default_factory=dict)
+    labeled_count_pass: int = 0
+    gate_slack_metrics: Mapping[str, float | None] = field(default_factory=dict)
+
+
+if nn is not None:
+
+    class SlackRegressor(nn.Module):
+        """Predicts min_gate_slack (continuous)"""
+
+        def __init__(self, input_dim: int):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(input_dim, 128),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(128, 64),
+                nn.ReLU(),
+                nn.Linear(64, 1),  # Predict scalar slack
+            )
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.net(x)
+
+else:
+
+    class SlackRegressor:  # type: ignore
+        def __init__(self, *args: Any, **kwargs: Any):
+            pass
+
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            return None
+
+        def to(self, *args: Any, **kwargs: Any) -> "SlackRegressor":
+            return self
+
+        def load_state_dict(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def eval(self) -> None:
+            pass
+
+        def train(self) -> None:
+            pass
+
+        def state_dict(self) -> dict[str, Any]:
+            return {}
+
+        def parameters(self) -> Iterable[Any]:
+            return []
 
 
 @dataclass
@@ -202,6 +259,7 @@ class SurrogateModel:
     identity_cross_token_effects: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
     target_transforms: Mapping[str, str] = field(default_factory=dict)
     classifier: Mapping[str, Any] | None = None
+    slack_regressor: Mapping[str, Any] | None = None
 
     def to_dict(self) -> Mapping[str, Any]:
         return {
@@ -224,6 +282,7 @@ class SurrogateModel:
             "trained_at_utc": self.trained_at_utc,
             "target_transforms": self.target_transforms,
             "classifier": self.classifier,
+            "slack_regressor": self.slack_regressor,
         }
 
     @classmethod
@@ -258,6 +317,10 @@ class SurrogateModel:
         classifier: Mapping[str, Any] | None = (
             dict(classifier_payload) if isinstance(classifier_payload, Mapping) else None
         )
+        slack_regressor_payload = payload.get("slack_regressor")
+        slack_regressor: Mapping[str, Any] | None = (
+            dict(slack_regressor_payload) if isinstance(slack_regressor_payload, Mapping) else None
+        )
 
         return cls(
             model_id=str(payload.get("model_id", "")),
@@ -282,6 +345,7 @@ class SurrogateModel:
             trained_at_utc=str(payload.get("trained_at_utc", "")),
             target_transforms=target_transforms,
             classifier=classifier,
+            slack_regressor=slack_regressor,
         )
 
     def predict_many(self, rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
@@ -289,6 +353,7 @@ class SurrogateModel:
         for row in rows:
             metrics = {metric: self._predict_metric(row, metric) for metric in METRIC_TARGETS}
             classifier_probability = self._classifier_probability(row)
+            slack_prediction = self._slack_prediction(row)
             results.append(
                 {
                     "metrics": metrics,
@@ -297,6 +362,7 @@ class SurrogateModel:
                         if classifier_probability is not None
                         else self._pass_probability(metrics.get(self.pass_metric))
                     ),
+                    "min_gate_slack": slack_prediction,
                 }
             )
         return results
@@ -391,6 +457,46 @@ class SurrogateModel:
             if 0 <= index < len(weights):
                 logit += weights[index] * value
         return _sigmoid(logit)
+
+    def _slack_prediction(self, row: Mapping[str, Any]) -> float | None:
+        payload = self.slack_regressor
+        if not isinstance(payload, Mapping) or torch is None or nn is None:
+            return None
+
+        input_dim = payload.get("input_dim")
+        state_dict_raw = payload.get("state_dict")
+        if not input_dim or not isinstance(state_dict_raw, Mapping):
+            return None
+
+        signal_features = payload.get("signal_features")
+        if not isinstance(signal_features, Sequence) or isinstance(signal_features, (str, bytes)):
+            signal_features = FEATURE_SIGNAL_KEYS
+        signal_feature_keys = [str(feature) for feature in signal_features]
+
+        identity_hash_dim = int(payload.get("identity_hash_dim", CLASSIFIER_HASH_DIM))
+        cross_hash_dim = int(payload.get("cross_hash_dim", CLASSIFIER_HASH_DIM))
+
+        # Reconstruct model
+        model = SlackRegressor(input_dim)
+        state_dict = {k: torch.tensor(v) for k, v in state_dict_raw.items()}
+        model.load_state_dict(state_dict)
+        model.eval()
+
+        features = _classifier_feature_vector(
+            row,
+            signal_feature_keys=signal_feature_keys,
+            identity_hash_dim=max(0, identity_hash_dim),
+            cross_hash_dim=max(0, cross_hash_dim),
+        )
+
+        X = torch.zeros((1, input_dim), dtype=torch.float32)
+        for idx, val in features.items():
+            if 0 <= idx < input_dim:
+                X[0, idx] = val
+
+        with torch.no_grad():
+            prediction = model(X)
+            return float(prediction.item())
 
 
 def _normalize_niche_label(value: Any) -> str:
@@ -697,6 +803,8 @@ def train(
 
     classifier_model = None
     classifier_metrics = None
+    slack_regressor_payload = None
+    slack_regressor_metrics = None
     classifier_stage_started_at: float | None = None
     classifier_meta = {
         "classifier_enabled": include_failures,
@@ -708,6 +816,10 @@ def train(
         "classifier_cv_used_folds": 0,
         "classifier_cv_status": "skipped",
         "classifier_cv_skip_reason": "not implemented for sgd logistic",
+        "slack_regressor_status": "disabled" if not include_failures else "skipped",
+        "slack_regressor_skip_reason": (
+            "include_failures disabled" if not include_failures else None
+        ),
     }
     if include_failures:
         classifier_stage_started_at = monotonic()
@@ -721,6 +833,7 @@ def train(
         classifier_meta["classifier_train_samples"] = len(classification_rows)
         if not classification_rows:
             classifier_meta["classifier_skip_reason"] = "no gate_pass labels available"
+            classifier_meta["slack_regressor_skip_reason"] = "no gate_pass labels available"
         else:
             labels = [1 if row.get("gate_pass") else 0 for row in classification_rows]
             label_counts = Counter(labels)
@@ -750,13 +863,34 @@ def train(
                     classifier_model = CLASSIFIER_BACKEND
                     classifier_meta["classifier_status"] = "trained"
                     classifier_meta["classifier_skip_reason"] = None
-                    model = SurrogateModel(
-                        **model_kwargs,
-                        identity_token_effects=identity_effects,
-                        identity_cross_token_effects=cross_effects,
-                        token_learner_backend=token_learner_backend,
-                        classifier=classifier_payload,
+
+            # Train Slack Regressor
+            if torch is not None:
+                try:
+                    slack_regressor_payload, slack_regressor_metrics = _train_slack_regressor(
+                        classification_rows,
+                        signal_feature_keys=list(FEATURE_SIGNAL_KEYS),
+                        identity_hash_dim=CLASSIFIER_HASH_DIM,
+                        cross_hash_dim=CLASSIFIER_HASH_DIM,
+                        compute_backend=resolved_backend,
                     )
+                except Exception as exc:
+                    classifier_meta["slack_regressor_skip_reason"] = str(exc)
+                    classifier_meta["slack_regressor_status"] = "failed"
+                else:
+                    classifier_meta["slack_regressor_status"] = "trained"
+                    classifier_meta["slack_regressor_skip_reason"] = None
+            else:
+                classifier_meta["slack_regressor_skip_reason"] = "torch not available"
+
+            model = SurrogateModel(
+                **model_kwargs,
+                identity_token_effects=identity_effects,
+                identity_cross_token_effects=cross_effects,
+                token_learner_backend=token_learner_backend,
+                classifier=classifier_payload,
+                slack_regressor=slack_regressor_payload,
+            )
 
     classifier_elapsed = (
         max(0.0, monotonic() - classifier_stage_started_at)
@@ -790,6 +924,7 @@ def train(
         "metric_mae_log1p_pass": evaluation.metric_mae_log1p_pass,
         "pass_probability": evaluation.pass_probability,
         "classifier_metrics": evaluation.classifier_metrics,
+        "slack_regressor_metrics": evaluation.slack_regressor_metrics,
         "split": {
             "train_rows": len(resolved_train_rows),
             "val_rows": len(resolved_val_rows),
@@ -833,6 +968,9 @@ def train(
     if classifier_model and classifier_metrics:
         meta_payload["classifier"] = classifier_model
         meta_payload["classifier_metrics"] = classifier_metrics
+    if slack_regressor_payload and slack_regressor_metrics:
+        meta_payload["slack_regressor"] = "torch_mlp_v1"
+        meta_payload["slack_regressor_metrics"] = slack_regressor_metrics
 
     model_path, metrics_path, meta_path = _write_model_artifacts_atomic(
         model_root,
@@ -902,6 +1040,7 @@ def evaluate_predictions(
     metric_log_errors_all: dict[str, list[float]] = {metric: [] for metric in METRIC_TARGETS}
     metric_log_errors_pass: dict[str, list[float]] = {metric: [] for metric in METRIC_TARGETS}
     pass_probs: list[float] = []
+    slack_errors: list[float] = []
     classifier_labels: list[int] = []
     classifier_probs: list[float] = []
     row_list = list(rows)
@@ -912,6 +1051,12 @@ def evaluate_predictions(
         if isinstance(gate_pass, bool):
             classifier_labels.append(1 if gate_pass else 0)
             classifier_probs.append(pass_probs[-1])
+
+        actual_slack = _to_number(row.get("min_gate_slack"))
+        predicted_slack = _to_number(prediction.get("min_gate_slack"))
+        if actual_slack is not None and predicted_slack is not None:
+            slack_errors.append(abs(predicted_slack - actual_slack))
+
         predicted_metrics = prediction.get("metrics", {})
         is_pass_row = gate_pass is True
         for metric in METRIC_TARGETS:
@@ -943,6 +1088,14 @@ def evaluate_predictions(
     }
     pass_summary = _stat_summary(pass_probs)
     classifier_metrics = _classifier_eval_metrics(classifier_labels, classifier_probs)
+    slack_regressor_metrics = {
+        "mae": mean(slack_errors) if slack_errors else None,
+        "count": float(len(slack_errors)),
+    }
+    gate_slack_metrics = {
+        "min_gate_slack_mae": slack_regressor_metrics.get("mae"),
+    }
+    labeled_count_pass = int(classifier_metrics.get("positive_count") or 0)
     return EvaluationResult(
         row_count=len(row_list),
         metric_mae=metric_mae_all,
@@ -952,6 +1105,9 @@ def evaluate_predictions(
         metric_mae_log1p=metric_mae_log1p_all,
         metric_mae_log1p_pass=metric_mae_log1p_pass,
         classifier_metrics=classifier_metrics,
+        slack_regressor_metrics=slack_regressor_metrics,
+        labeled_count_pass=labeled_count_pass,
+        gate_slack_metrics=gate_slack_metrics,
     )
 
 
@@ -1123,6 +1279,99 @@ def _classifier_feature_vector(
             vector[feature_index] = vector.get(feature_index, 0.0) + 1.0
 
     return vector
+
+
+def _train_slack_regressor(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    signal_feature_keys: Sequence[str],
+    identity_hash_dim: int,
+    cross_hash_dim: int,
+    epochs: int = 100,
+    learning_rate: float = 0.001,
+    batch_size: int = 32,
+    compute_backend: str = COMPUTE_BACKEND_CPU,
+) -> tuple[dict[str, Any], dict[str, float]]:
+    if torch is None or nn is None:
+        raise ImportError("torch is required for SlackRegressor")
+
+    device = torch.device("cuda" if compute_backend == COMPUTE_BACKEND_CUDA else "cpu")
+
+    # Filter rows that have min_gate_slack
+    valid_rows = []
+    targets = []
+    for row in rows:
+        slack = _to_number(row.get("min_gate_slack"))
+        if slack is not None:
+            valid_rows.append(row)
+            targets.append(slack)
+
+    if not valid_rows:
+        raise ValueError("no rows with min_gate_slack available for regression")
+
+    input_dim = len(signal_feature_keys) + max(0, identity_hash_dim) + max(0, cross_hash_dim)
+    model = SlackRegressor(input_dim).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = nn.MSELoss()
+
+    # Vectorize features
+    vectors = [
+        _classifier_feature_vector(
+            row,
+            signal_feature_keys=signal_feature_keys,
+            identity_hash_dim=identity_hash_dim,
+            cross_hash_dim=cross_hash_dim,
+        )
+        for row in valid_rows
+    ]
+
+    # Convert to tensors
+    X = torch.zeros((len(vectors), input_dim), dtype=torch.float32, device=device)
+    for i, vec in enumerate(vectors):
+        for idx, val in vec.items():
+            if 0 <= idx < input_dim:
+                X[i, idx] = val
+
+    y = torch.tensor(targets, dtype=torch.float32, device=device).view(-1, 1)
+
+    model.train()
+    for epoch in range(epochs):
+        permutation = torch.randperm(X.size()[0])
+        for i in range(0, X.size()[0], batch_size):
+            indices = permutation[i : i + batch_size]
+            batch_x, batch_y = X[indices], y[indices]
+
+            optimizer.zero_grad()
+            outputs = model(batch_x)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+
+    model.eval()
+    with torch.no_grad():
+        predictions = model(X)
+        mse = criterion(predictions, y).item()
+        mae = torch.mean(torch.abs(predictions - y)).item()
+
+    # Serialize state dict
+    state_dict = {k: v.cpu().tolist() for k, v in model.state_dict().items()}
+
+    payload = {
+        "backend": "torch_mlp_v1",
+        "input_dim": input_dim,
+        "signal_features": list(signal_feature_keys),
+        "identity_hash_dim": identity_hash_dim,
+        "cross_hash_dim": cross_hash_dim,
+        "state_dict": state_dict,
+    }
+
+    metrics = {
+        "train_samples": float(len(valid_rows)),
+        "train_mse": float(mse),
+        "train_mae": float(mae),
+    }
+
+    return payload, metrics
 
 
 def _train_logistic_classifier(

@@ -276,6 +276,7 @@ def _build_row(
         # FL-03: Include gate_pass for ML training
         "gate_pass": scenario_data.get("gate_pass"),
         "gate_fail_reasons": scenario_data.get("gate_fail_reasons", []),
+        "gate_slacks": scenario_data.get("gate_slacks", {}),
         "metrics_source": _scenario_metrics_source(scenario_data),
     }
 

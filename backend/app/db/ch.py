@@ -46,6 +46,13 @@ SCENARIO_METRIC_COLUMNS = [
     "life",
     "mana",
     "utility_score",
+    "gate_slacks.resist_fire_slack",
+    "gate_slacks.resist_cold_slack",
+    "gate_slacks.resist_lightning_slack",
+    "gate_slacks.resist_chaos_slack",
+    "gate_slacks.max_hit_slack",
+    "gate_slacks.min_gate_slack",
+    "gate_slacks.num_gate_violations",
     "metrics_source",
 ]
 
@@ -274,7 +281,7 @@ class ClickhouseRepository:
     ) -> list[list[Any]]:
         formatted: list[list[Any]] = []
         for row in rows:
-            entry = [
+            entry: list[Any] = [
                 row.build_id,
                 row.ruleset_id,
                 row.scenario_id,
@@ -290,6 +297,18 @@ class ClickhouseRepository:
                 row.mana,
                 row.utility_score,
             ]
+            slacks = row.gate_slacks
+            entry.extend(
+                [
+                    [float(slacks.get("resist_fire_slack", 0.0))],
+                    [float(slacks.get("resist_cold_slack", 0.0))],
+                    [float(slacks.get("resist_lightning_slack", 0.0))],
+                    [float(slacks.get("resist_chaos_slack", 0.0))],
+                    [float(slacks.get("max_hit_slack", 0.0))],
+                    [float(slacks.get("min_gate_slack", 0.0))],
+                    [int(slacks.get("num_gate_violations", 0))],
+                ]
+            )
             if include_metrics_source:
                 entry.append(row.metrics_source)
             formatted.append(entry)
@@ -337,7 +356,11 @@ class ClickhouseRepository:
 
     def fetch_scenario_metric_rows(self, ruleset_id: str) -> List[Dict[str, Any]]:
         query = (
-            "SELECT scenario_id, gate_pass, full_dps, max_hit, utility_score "
+            "SELECT scenario_id, gate_pass, full_dps, max_hit, utility_score, "
+            "gate_slacks.resist_fire_slack, gate_slacks.resist_cold_slack, "
+            "gate_slacks.resist_lightning_slack, gate_slacks.resist_chaos_slack, "
+            "gate_slacks.max_hit_slack, gate_slacks.min_gate_slack, "
+            "gate_slacks.num_gate_violations "
             "FROM scenario_metrics "
             "WHERE ruleset_id = {ruleset_id:String}"
         )

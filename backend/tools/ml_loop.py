@@ -397,28 +397,45 @@ def _compute_improvement(
     }
 
 
-def _promotion_score(evaluation: EvaluationResult) -> dict[str, float | None]:
-    log1p_pass = (
-        dict(evaluation.metric_mae_log1p_pass)
-        if evaluation.metric_mae_log1p_pass
-        else dict(evaluation.metric_mae_log1p)
-    )
-    full_dps = _numeric(log1p_pass.get("full_dps"))
-    max_hit = _numeric(log1p_pass.get("max_hit"))
-    regression_terms = [value for value in (full_dps, max_hit) if value is not None]
-    regression_component = (
-        sum(regression_terms) / len(regression_terms) if regression_terms else None
-    )
-    classifier_metrics = dict(evaluation.classifier_metrics)
-    brier = _numeric(classifier_metrics.get("brier"))
-    classifier_penalty = brier * PROMOTION_CLASSIFIER_BRIER_WEIGHT if brier is not None else 0.0
-    total = regression_component + classifier_penalty if regression_component is not None else None
-    return {
-        "regression_log1p_pass": regression_component,
-        "classifier_brier": brier,
-        "classifier_penalty": classifier_penalty,
-        "total": total,
-    }
+def _promotion_score(evaluation: EvaluationResult) -> dict[str, Any]:
+    pass_row_count = evaluation.labeled_count_pass or 0
+
+    if pass_row_count == 0:
+        # ZERO PASSES: Use slack-based metrics
+        slack_metrics = evaluation.gate_slack_metrics or {}
+        min_slack_mae = slack_metrics.get("min_gate_slack_mae")
+
+        # Composite: primarily slack, secondarily overall MAE
+        return {
+            "mode": "zero_pass_slack",
+            "regression_component": min_slack_mae,
+            "total": min_slack_mae,
+        }
+    else:
+        # HAS PASSES: Use original logic
+        log1p_pass = (
+            dict(evaluation.metric_mae_log1p_pass)
+            if evaluation.metric_mae_log1p_pass
+            else dict(evaluation.metric_mae_log1p)
+        )
+        full_dps = _numeric(log1p_pass.get("full_dps"))
+        max_hit = _numeric(log1p_pass.get("max_hit"))
+        regression_terms = [value for value in (full_dps, max_hit) if value is not None]
+        regression_component = (
+            sum(regression_terms) / len(regression_terms) if regression_terms else None
+        )
+        classifier_metrics = dict(evaluation.classifier_metrics)
+        brier = _numeric(classifier_metrics.get("brier"))
+        classifier_penalty = brier * PROMOTION_CLASSIFIER_BRIER_WEIGHT if brier is not None else 0.0
+        total = (
+            regression_component + classifier_penalty if regression_component is not None else None
+        )
+        return {
+            "regression_log1p_pass": regression_component,
+            "classifier_brier": brier,
+            "classifier_penalty": classifier_penalty,
+            "total": total,
+        }
 
 
 def _build_iteration_record(
