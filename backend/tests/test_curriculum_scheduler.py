@@ -285,15 +285,15 @@ class TestCurriculumScheduler:
     def test_record_evaluation_feasible(self):
         """Test recording feasible evaluation."""
         scheduler = CurriculumScheduler()
-        # Record one feasible sample - this will trigger transition (100% > 10%)
+        # Record one feasible sample
         scheduler.record_evaluation(gate_passed=True)
 
-        # After transition, phase counters are reset
+        # With guardrails (MIN_SAMPLES_PER_PHASE=100), no transition occurs yet
         assert scheduler.state.total_samples == 1
         assert scheduler.state.feasible_samples == 1
-        # Phase counters are reset after transition
-        assert scheduler.state.phase_samples == 0
-        assert scheduler.state.phase_feasible_samples == 0
+        # Phase counters NOT reset (no transition with guardrails)
+        assert scheduler.state.phase_samples == 1
+        assert scheduler.state.phase_feasible_samples == 1
 
     def test_record_evaluation_infeasible(self):
         """Test recording infeasible evaluation."""

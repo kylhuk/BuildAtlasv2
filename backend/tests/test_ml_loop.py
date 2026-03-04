@@ -2674,4 +2674,6 @@ def test_ml_loop_curriculum_integration(
     state = json.loads(state_path.read_text(encoding="utf-8"))
     curriculum_state = state.get("curriculum", {})
     assert isinstance(curriculum_state, dict)
-    assert curriculum_state.get("phase") in {"BOSSING", "PINNACLE", "UBER"}
+    # With guardrails (MIN_SAMPLES_PER_PHASE=100), phase stays at MAPPING after 2 iterations
+    # (Only 6 samples total, need 100 to trigger transition)
+    assert curriculum_state.get("phase") == "MAPPING"
