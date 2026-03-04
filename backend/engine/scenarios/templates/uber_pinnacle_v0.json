@@ -13,9 +13,9 @@
   },
   "gate_thresholds": {
     "resists": {
-      "fire": 82,
-      "cold": 82,
-      "lightning": 82,
+      "fire": 75,
+      "cold": 75,
+      "lightning": 75,
       "chaos": 68
     },
     "reservation": {
