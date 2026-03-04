@@ -12,6 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+import orjson
 import xxhash
 
 from app.settings import settings
@@ -250,7 +251,10 @@ class WorkerProcess:
 
     def _write_payload(self, payload: Dict[str, Any]) -> None:
         assert self._process is not None
-        self._process.stdin.write(json.dumps(payload))
+        if settings.use_orjson:
+            self._process.stdin.write(orjson.dumps(payload).decode("utf-8"))
+        else:
+            self._process.stdin.write(json.dumps(payload))
         self._process.stdin.write("\n")
         self._process.stdin.flush()
 
@@ -284,8 +288,11 @@ class WorkerProcess:
             if not line:
                 continue
             try:
-                decoded = json.loads(line)
-            except json.JSONDecodeError as exc:
+                if settings.use_orjson:
+                    decoded = orjson.loads(line)
+                else:
+                    decoded = json.loads(line)
+            except (json.JSONDecodeError, orjson.JSONDecodeError) as exc:
                 # LuaJIT worker startup may emit plain-text status logs on stdout.
                 if _is_worker_log_line(line):
                     continue
