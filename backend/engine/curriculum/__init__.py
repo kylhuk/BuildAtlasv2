@@ -8,6 +8,7 @@ from backend.engine.curriculum.scheduler import (
     FEASIBILITY_TRANSITION_THRESHOLD,
     PHASE_CONFIGS,
 )
+from backend.engine.curriculum.manager import CurriculumManager
 
 __all__ = [
     "CurriculumPhase",
@@ -16,4 +17,5 @@ __all__ = [
     "CurriculumScheduler",
     "PHASE_CONFIGS",
     "FEASIBILITY_TRANSITION_THRESHOLD",
+    "CurriculumManager",
 ]
