@@ -11,6 +11,7 @@ import statistics
 import tarfile
 import tempfile
 from collections import Counter
+from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
@@ -37,6 +38,7 @@ from backend.engine.ruleset import (
     scenario_version_from_profile,
 )
 from backend.engine.scenarios.loader import list_templates
+from backend.engine.curriculum import CurriculumManager, CurriculumPhase
 from backend.engine.surrogate import (
     EvaluationResult,
     SnapshotResult,
@@ -231,8 +233,19 @@ def _validation_split_rows(
 def _persist_state(state_path: Path, state: dict[str, Any], **updates: Any) -> dict[str, Any]:
     if updates:
         state.update(updates)
+
+    curriculum_manager = state.get("_curriculum_manager")
+    if isinstance(curriculum_manager, CurriculumManager):
+        state["curriculum"] = curriculum_manager.get_state()
+
     state["updated_at_utc"] = _now()
-    _write_state(state_path, state)
+
+    transient_curriculum = state.pop("_curriculum_manager", None)
+    try:
+        _write_state(state_path, state)
+    finally:
+        if transient_curriculum is not None:
+            state["_curriculum_manager"] = transient_curriculum
     return state
 
 
@@ -787,6 +800,18 @@ def _retrain_surrogate_if_needed(
         return False, None
 
 
+def load_thresholds_for_profile(profile_id: str):
+    templates = [template for template in list_templates() if template.profile_id == profile_id]
+    if not templates:
+        raise ValueError(f"no scenario templates for profile_id={profile_id}")
+    if len(templates) == 1:
+        return templates[0].gate_thresholds
+    for template in templates:
+        if template.scenario_id == profile_id:
+            return template.gate_thresholds
+    return templates[-1].gate_thresholds
+
+
 def start_loop(args: argparse.Namespace) -> int:
     loop_id = _validate_loop_id(args.loop_id)
     if args.iterations < 0:
@@ -886,6 +911,32 @@ def start_loop(args: argparse.Namespace) -> int:
         logger.error(
             "ml loop %s state reload failed, continuing with in-memory state: %s", loop_id, exc
         )
+        # Initialize curriculum manager
+    curriculum_enabled = getattr(args, "curriculum_enabled", True)
+    curriculum_initial_phase = getattr(args, "curriculum_initial_phase", "MAPPING")
+    initial_phase = CurriculumPhase[curriculum_initial_phase] if curriculum_initial_phase else None
+
+    if isinstance(state.get("curriculum"), Mapping):
+        curriculum = CurriculumManager.from_state(dict(state["curriculum"]))
+    else:
+        curriculum = CurriculumManager(enabled=curriculum_enabled, initial_phase=initial_phase)
+
+    # Attach manager transiently so _persist_state can serialize it.
+    state["_curriculum_manager"] = curriculum
+    _persist_state(state_path, state)
+
+    base_thresholds = None
+    if curriculum.enabled:
+        try:
+            base_thresholds = load_thresholds_for_profile(profile_id)
+        except Exception as exc:
+            logger.warning(
+                "ml loop %s unable to load base gate thresholds for curriculum: %s",
+                loop_id,
+                exc,
+            )
+            base_thresholds = None
+
     target_text = "endless" if total_iterations is None else str(total_iterations)
     _log_loop_phase(
         loop_id,
@@ -951,6 +1002,7 @@ def start_loop(args: argparse.Namespace) -> int:
                 break
             current_iteration = iteration
             state = _load_state(state_path)
+            state["_curriculum_manager"] = curriculum
             if state.get("stop_requested"):
                 stop_triggered = True
                 _persist_state(state_path, state, status="stopped", phase="stopped")
@@ -1010,11 +1062,17 @@ def start_loop(args: argparse.Namespace) -> int:
                         predictor_name if predictor_name else "surrogate_predictor"
                     )
                     surrogate_predictor = _surrogate_predictor_wrapper
+            effective_thresholds = (
+                curriculum.get_thresholds(base_thresholds)
+                if curriculum.enabled and base_thresholds is not None
+                else None
+            )
             run_summary = run_generation(
                 count=generate_count,
                 seed_start=iteration_seed_start,
                 ruleset_id=ruleset_id,
                 profile_id=profile_id,
+                gate_thresholds=effective_thresholds,
                 skeleton_id=getattr(args, "skeleton_id", None),
                 run_id=current_run_id,
                 base_path=data_root,
@@ -1058,6 +1116,27 @@ def start_loop(args: argparse.Namespace) -> int:
             evaluation_summary = _as_dict(run_summary.get("evaluation"))
             attempted_count = _coerce_int(evaluation_summary.get("attempted")) or 0
             verified_count = _coerce_int(evaluation_summary.get("successes")) or 0
+
+            if run_summary.get("status") == "completed":
+                # Record curriculum feasibility + handle transitions
+                gate_passes: list[bool] = []
+                for entry in gate_evals_raw:
+                    if not isinstance(entry, Mapping):
+                        continue
+                    if not entry.get("selected_for_evaluation", True):
+                        continue
+                    gate_passes.append(bool(entry.get("gate_pass", False)))
+
+                transition_info = curriculum.record_iteration(gate_passes)
+                if transition_info.get("transitioned"):
+                    _log_loop_phase(
+                        loop_id,
+                        "curriculum_transition",
+                        iteration=iteration,
+                        detail=(
+                            f"{transition_info.get('from_phase')} -> {transition_info.get('to_phase')}"
+                        ),
+                    )
 
             # TASK 3.4: Update archive with verified builds
             if archive is not None and verified_count > 0:
@@ -1416,6 +1495,7 @@ def start_loop(args: argparse.Namespace) -> int:
 
             # Check if online learning retrain is needed
             state = _load_state(state_path)
+            state["_curriculum_manager"] = curriculum
             was_retrained, new_model_path = _retrain_surrogate_if_needed(
                 state=state,
                 state_path=state_path,
@@ -2261,6 +2341,11 @@ def _render_status_human(
         f"Started: {state.get('started_at_utc')}",
         f"Updated: {state.get('updated_at_utc')}",
         (
+            "Curriculum: "
+            f"enabled={_format_bool(_as_dict(state.get('curriculum')).get('enabled', True))} "
+            f"phase={(_as_dict(state.get('curriculum')).get('phase') or ('UBER' if _as_dict(state.get('curriculum')).get('enabled') is False else 'MAPPING'))}"
+        ),
+        (
             "Last IDs: "
             f"run={state.get('last_run_id')} snapshot={state.get('last_snapshot_id')} "
             f"model={state.get('last_model_id')}"
@@ -2638,6 +2723,19 @@ def _build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Deterministic seed offset for generation",
     )
+    start_parser.add_argument(
+        "--curriculum-enabled",
+        type=lambda x: x.lower() in ("true", "1", "yes"),
+        default=True,
+        help="Enable progressive curriculum learning (default: True)",
+    )
+    start_parser.add_argument(
+        "--curriculum-initial-phase",
+        choices=["MAPPING", "BOSSING", "PINNACLE", "UBER"],
+        default="MAPPING",
+        help="Starting curriculum phase (default: MAPPING)",
+    )
+
     start_parser.add_argument("--profile-id", default="pinnacle", help="Scenario profile")
     start_parser.add_argument(
         "--skeleton-id",
