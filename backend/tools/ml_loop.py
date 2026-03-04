@@ -19,6 +19,12 @@ from typing import Any, Mapping, Sequence
 from backend.app.api.evaluator import BuildEvaluator
 from backend.app.db.ch import ClickhouseRepository
 from backend.app.settings import settings
+from backend.engine.archive import (
+    ArchiveStore,
+    descriptor_values_from_metrics,
+    persist_archive,
+    score_from_metrics,
+)
 from backend.engine.generation.runner import (
     _run_summary_path,
     load_run_summary,
@@ -825,19 +831,27 @@ def start_loop(args: argparse.Namespace) -> int:
             last_failure_checkpoint_path=None,
         )
 
-    repo: ClickhouseRepository | None = None
-    evaluator: BuildEvaluator | None = None
+     repo: ClickhouseRepository | None = None
+     evaluator: BuildEvaluator | None = None
+     archive: ArchiveStore | None = None
 
-    stop_triggered = False
-    current_iteration = 0
-    iteration = start_iteration
-    current_run_id: str | None = None
-    iteration_seed_start: int | None = None
-    try:
-        repo = ClickhouseRepository()
-        evaluator = BuildEvaluator(repo=repo, base_path=data_root)
-        evaluator.require_worker_metrics_for_profile(profile_id)
-        evaluator.require_non_stub_metrics_for_profile(profile_id)
+     stop_triggered = False
+     current_iteration = 0
+     iteration = start_iteration
+     current_run_id: str | None = None
+     iteration_seed_start: int | None = None
+     try:
+         repo = ClickhouseRepository()
+         evaluator = BuildEvaluator(repo=repo, base_path=data_root)
+         evaluator.require_worker_metrics_for_profile(profile_id)
+         evaluator.require_non_stub_metrics_for_profile(profile_id)
+         # Initialize ME-MAP-Elites archive for QD
+         archive = ArchiveStore()
+         _log_loop_phase(
+             loop_id,
+             "archive_initialized",
+             detail=f"axes={len(archive.axes)} total_bins={archive.total_bins}",
+         )
         while True:
             if total_iterations is not None and iteration > total_iterations:
                 break
@@ -934,22 +948,83 @@ def start_loop(args: argparse.Namespace) -> int:
                 }
                 for e in gate_evals_raw
             ]
-            run_summary.update(generate_run_summary(gate_evaluations))
+             run_summary.update(generate_run_summary(gate_evaluations))
 
-            _log_loop_phase(
-                loop_id,
-                "generation_complete",
-                iteration=iteration,
-                detail=(
-                    f"run_id={run_summary.get('run_id')} status={run_summary.get('status')} "
-                    f"verified={run_summary.get('evaluation', {}).get('successes')} "
-                    f"elapsed={max(0.0, monotonic() - generation_started_at):.1f}s"
-                ),
-            )
-            status_reason = _as_dict(run_summary.get("status_reason"))
-            evaluation_summary = _as_dict(run_summary.get("evaluation"))
-            attempted_count = _coerce_int(evaluation_summary.get("attempted")) or 0
-            verified_count = _coerce_int(evaluation_summary.get("successes")) or 0
+             _log_loop_phase(
+                 loop_id,
+                 "generation_complete",
+                 iteration=iteration,
+                 detail=(
+                     f"run_id={run_summary.get('run_id')} status={run_summary.get('status')} "
+                     f"verified={run_summary.get('evaluation', {}).get('successes')} "
+                     f"elapsed={max(0.0, monotonic() - generation_started_at):.1f}s"
+                 ),
+             )
+             status_reason = _as_dict(run_summary.get("status_reason"))
+             evaluation_summary = _as_dict(run_summary.get("evaluation"))
+             attempted_count = _coerce_int(evaluation_summary.get("attempted")) or 0
+             verified_count = _coerce_int(evaluation_summary.get("successes")) or 0
+             
+             # TASK 3.4: Update archive with verified builds
+             if archive is not None and verified_count > 0:
+                 candidates_data = run_summary.get("candidates", [])
+                 archive_updated_count = 0
+                 for candidate_data in candidates_data:
+                     if not isinstance(candidate_data, Mapping):
+                         continue
+                     # Only add verified builds to archive
+                     if not candidate_data.get("selected_for_evaluation"):
+                         continue
+                     if candidate_data.get("evaluation_status") != "verified":
+                         continue
+                     
+                     build_id = candidate_data.get("build_id")
+                     metrics_payload = candidate_data.get("verified_metrics_payload")
+                     if not build_id or not isinstance(metrics_payload, Mapping):
+                         continue
+                     
+                     # Extract behavior characteristics (BCs) from metrics
+                     score = score_from_metrics(metrics_payload)
+                     descriptor = descriptor_values_from_metrics(metrics_payload, archive.axes)
+                     
+                     # Add metadata for tracking
+                     metadata = {
+                         "iteration": iteration,
+                         "run_id": current_run_id,
+                         "main_skill": candidate_data.get("main_skill_package"),
+                         "class_name": candidate_data.get("class_name"),
+                         "ascendancy": candidate_data.get("ascendancy"),
+                     }
+                     
+                     # Insert into archive (returns True if inserted/replaced)
+                     if archive.insert(build_id, score=score, descriptor=descriptor, metadata=metadata):
+                         archive_updated_count += 1
+                 
+                 if archive_updated_count > 0:
+                     _log_loop_phase(
+                         loop_id,
+                         "archive_updated",
+                         iteration=iteration,
+                         detail=(
+                             f"added={archive_updated_count} "
+                             f"coverage={archive.metrics().coverage:.2%} "
+                             f"qd_score={archive.metrics().qd_score:.1f}"
+                         ),
+                     )
+                     # Persist archive to disk
+                     try:
+                         persist_archive(
+                             run_id=current_run_id or f"{loop_id}-iter-{iteration:04d}",
+                             store=archive,
+                             base_path=data_root,
+                         )
+                     except Exception as exc:
+                         logger.warning(
+                             "ml loop %s iteration %d failed to persist archive: %s",
+                             loop_id,
+                             iteration,
+                             exc,
+                         )
             failures_count = _coerce_int(evaluation_summary.get("failures")) or 0
             errors_count = _coerce_int(evaluation_summary.get("errors")) or 0
             worker_metrics_used_count = (

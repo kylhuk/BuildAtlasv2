@@ -2,6 +2,7 @@
 
 from .dataset import FEATURE_SCHEMA_VERSION, SnapshotResult, build_dataset_snapshot
 from .model import (
+    EnsembleSurrogate,
     EvaluationResult,
     SurrogateModel,
     TrainResult,
@@ -16,6 +17,7 @@ __all__ = [
     "FEATURE_SCHEMA_VERSION",
     "SnapshotResult",
     "build_dataset_snapshot",
+    "EnsembleSurrogate",
     "EvaluationResult",
     "SurrogateModel",
     "TrainResult",

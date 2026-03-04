@@ -611,6 +611,60 @@ def _surrogate_rank_key(
     return (-full_dps, max_hit_sort, -probability_sort, tie_breaker)
 
 
+def _calculate_min_gate_slack(
+    candidate: Candidate,
+    templates: Sequence[ScenarioTemplate],
+) -> float:
+    """Calculate minimum gate slack across all scenarios.
+
+    Gate slack = how much margin the candidate has before failing a gate.
+    Returns the minimum slack across all scenarios (bottleneck).
+    Higher slack = better candidate.
+    """
+    if not templates:
+        return 0.0
+
+    metrics_payload = candidate.metrics_payload
+    if not isinstance(metrics_payload, Mapping):
+        return 0.0
+
+    min_slack = float("inf")
+
+    for template in templates:
+        scenario_data = metrics_payload.get(template.scenario_id)
+        if not isinstance(scenario_data, Mapping):
+            continue
+
+        metrics = scenario_data.get("metrics")
+        if not isinstance(metrics, Mapping):
+            continue
+
+        thresholds = template.gate_thresholds
+
+        # Check DPS gate
+        full_dps = _coerce_float(metrics.get("full_dps"))
+        if full_dps is not None and thresholds.min_full_dps > 0:
+            dps_slack = full_dps / max(1.0, thresholds.min_full_dps)
+            min_slack = min(min_slack, dps_slack)
+
+        # Check max_hit gate
+        max_hit = _coerce_float(metrics.get("max_hit"))
+        if max_hit is not None and thresholds.min_max_hit > 0:
+            hit_slack = max_hit / max(1.0, thresholds.min_max_hit)
+            min_slack = min(min_slack, hit_slack)
+
+        # Check reservation gate
+        reservation_data = scenario_data.get("reservation")
+        if isinstance(reservation_data, Mapping):
+            reserved_pct = _coerce_float(reservation_data.get("reserved_percent"))
+            if reserved_pct is not None:
+                max_reserved = thresholds.reservation.max_percent
+                reservation_slack = (max_reserved - reserved_pct) / max(1.0, max_reserved)
+                min_slack = min(min_slack, reservation_slack)
+
+    return min_slack if min_slack != float("inf") else 0.0
+
+
 def _select_surrogate_optimizer_elites(
     candidates: Sequence[Candidate],
     elite_count: int,

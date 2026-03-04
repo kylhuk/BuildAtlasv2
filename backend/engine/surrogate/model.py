@@ -1111,6 +1111,116 @@ def evaluate_predictions(
     )
 
 
+@dataclass
+class EnsembleSurrogate:
+    """Ensemble of 5 surrogate models with uncertainty quantification.
+
+    Combines predictions from multiple models to estimate both mean prediction
+    and uncertainty (variance across models). Supports UCB acquisition function
+    for active learning: mean + 2*std.
+    """
+
+    models: list[SurrogateModel]
+    ensemble_id: str = field(default_factory=lambda: f"ensemble-{_default_model_id()}")
+
+    def __post_init__(self) -> None:
+        if len(self.models) != 5:
+            raise ValueError(f"EnsembleSurrogate requires exactly 5 models, got {len(self.models)}")
+
+    def predict_many(self, rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+        """Predict with uncertainty quantification.
+
+        Returns predictions with:
+        - metrics: mean predictions across ensemble
+        - metrics_std: standard deviation of predictions
+        - pass_probability: mean pass probability
+        - pass_probability_std: std of pass probabilities
+        - ucb_full_dps: upper confidence bound for full_dps (mean + 2*std)
+        - min_gate_slack: mean slack prediction
+        """
+        results: list[Mapping[str, Any]] = []
+
+        for row in rows:
+            # Collect predictions from all models
+            model_predictions = [model.predict_many([row])[0] for model in self.models]
+
+            # Extract metrics from each model
+            metrics_by_model: dict[str, list[float]] = {metric: [] for metric in METRIC_TARGETS}
+            pass_probs: list[float] = []
+            slack_predictions: list[float | None] = []
+
+            for pred in model_predictions:
+                pred_metrics = pred.get("metrics", {})
+                for metric in METRIC_TARGETS:
+                    value = pred_metrics.get(metric)
+                    if value is not None:
+                        metrics_by_model[metric].append(value)
+
+                pass_prob = pred.get("pass_probability")
+                if pass_prob is not None:
+                    pass_probs.append(pass_prob)
+
+                slack = pred.get("min_gate_slack")
+                slack_predictions.append(slack)
+
+            # Compute mean and std for metrics
+            metrics_mean: dict[str, float] = {}
+            metrics_std: dict[str, float] = {}
+            for metric in METRIC_TARGETS:
+                values = metrics_by_model[metric]
+                if values:
+                    metrics_mean[metric] = mean(values)
+                    metrics_std[metric] = pstdev(values) if len(values) > 1 else 0.0
+                else:
+                    metrics_mean[metric] = 0.0
+                    metrics_std[metric] = 0.0
+
+            # Compute pass probability stats
+            pass_prob_mean = mean(pass_probs) if pass_probs else 0.0
+            pass_prob_std = pstdev(pass_probs) if len(pass_probs) > 1 else 0.0
+
+            # Compute slack prediction (mean of non-None values)
+            valid_slacks = [s for s in slack_predictions if s is not None]
+            slack_mean = mean(valid_slacks) if valid_slacks else None
+
+            # UCB acquisition: mean + 2*std for exploration
+            ucb_full_dps = metrics_mean.get("full_dps", 0.0) + 2.0 * metrics_std.get(
+                "full_dps", 0.0
+            )
+
+            results.append(
+                {
+                    "metrics": metrics_mean,
+                    "metrics_std": metrics_std,
+                    "pass_probability": pass_prob_mean,
+                    "pass_probability_std": pass_prob_std,
+                    "ucb_full_dps": ucb_full_dps,
+                    "min_gate_slack": slack_mean,
+                }
+            )
+
+        return results
+
+    def to_dict(self) -> Mapping[str, Any]:
+        """Serialize ensemble to dictionary."""
+        return {
+            "ensemble_id": self.ensemble_id,
+            "model_count": len(self.models),
+            "models": [model.to_dict() for model in self.models],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "EnsembleSurrogate":
+        """Deserialize ensemble from dictionary."""
+        models = [
+            SurrogateModel.from_dict(model_payload) for model_payload in payload.get("models", [])
+        ]
+        return cls(
+            models=models,
+            ensemble_id=str(payload.get("ensemble_id", f"ensemble-{_default_model_id()}")),
+        )
+
+
 def _normalize_target_transform(value: Any) -> str:
     if isinstance(value, str) and value.strip().lower() == TARGET_TRANSFORM_LOG1P:
         return TARGET_TRANSFORM_LOG1P
