@@ -6,6 +6,7 @@ from .items import (
     build_item_templates,
     export_slot_template_text,
 )
+from .skeletons import Skeleton
 from .skills import (
     SkillCatalog,
     SkillCatalogValidationError,
@@ -20,4 +21,5 @@ __all__ = [
     "SkillCatalog",
     "SkillCatalogValidationError",
     "load_default_skill_catalog",
+    "Skeleton",
 ]
