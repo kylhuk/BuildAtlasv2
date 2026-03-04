@@ -451,9 +451,10 @@ class WorkerPool:
                 typed_results.append(result)
             else:
                 pending_result_idx = pending_indices.index(i)
-                if results[pending_result_idx] is None:
+                pending_result = results[pending_result_idx]
+                if pending_result is None:
                     raise WorkerProtocolError("worker pool returned incomplete batch results")
-                typed_results.append(results[pending_result_idx])
+                typed_results.append(pending_result)
         return typed_results
 
     def close(self) -> None:
@@ -464,18 +465,68 @@ class WorkerPool:
         for worker in self._workers:
             worker.close()
 
+    def _compute_cache_key(self, payload: Any) -> str:
+        payload_json = json.dumps(payload, sort_keys=True, default=str)
+        return hashlib.sha256(payload_json.encode()).hexdigest()
+
+    def _get_cached_result(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        with self._cache_lock:
+            return self._result_cache.get(cache_key)
+
+    def _cache_result(self, cache_key: str, result: Dict[str, Any]) -> None:
+        with self._cache_lock:
+            if len(self._result_cache) >= RESULT_CACHE_MAX_SIZE:
+                oldest_key = next(iter(self._result_cache))
+                del self._result_cache[oldest_key]
+            self._result_cache[cache_key] = result
+
+    def _is_fast_reject_candidate(self, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+
+        if "build" not in payload or "scenario" not in payload:
+            return False
+
+        build = payload.get("build")
+        if not isinstance(build, dict):
+            return True
+
+        if "items" not in build or not isinstance(build.get("items"), list):
+            return True
+
+        if "tree" not in build or not isinstance(build.get("tree"), dict):
+            return True
+
+        return False
+
     def _assign_worker(self) -> int:
         with self._round_robin_lock:
             idx = self._next_worker
             self._next_worker = (self._next_worker + 1) % len(self._workers)
             return idx
 
-    def _send_with_retries(self, worker_idx: int, payload: Any) -> Dict[str, Any]:
+    def _send_with_retries(
+        self, worker_idx: int, payload: Any, cache_key: Optional[str] = None
+    ) -> Dict[str, Any]:
+        if self._is_fast_reject_candidate(payload):
+            logger.debug("fast-reject: invalid build structure detected")
+            return {
+                "id": 0,
+                "ok": False,
+                "error": {
+                    "code": -32002,
+                    "message": "fast-reject: invalid build structure",
+                },
+            }
+
         worker = self._workers[worker_idx]
         last_exc: Optional[Exception] = None
         for attempt in range(WORKER_RETRY_COUNT + 1):
             try:
-                return worker.send_request("evaluate", payload)
+                result = worker.send_request("evaluate", payload)
+                if cache_key is not None:
+                    self._cache_result(cache_key, result)
+                return result
             except (WorkerTimeoutError, WorkerCrashedError, WorkerProtocolError) as exc:
                 last_exc = exc
                 if attempt >= WORKER_RETRY_COUNT:

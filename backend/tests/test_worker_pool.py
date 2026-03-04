@@ -419,3 +419,222 @@ def test_missing_id_response_triggers_protocol_error_restart() -> None:
     finally:
         pool.close()
     assert len(module.instances) >= 2
+
+
+def test_result_caching_returns_cached_result_on_duplicate_payload() -> None:
+    call_count = {"count": 0}
+
+    def responder_factory() -> Callable[[MockProcess, Dict[str, Any]], None]:
+        def responder(process: MockProcess, request: Dict[str, Any]) -> None:
+            call_count["count"] += 1
+            process.stdout.push_line(
+                json.dumps(
+                    {
+                        "id": request["id"],
+                        "ok": True,
+                        "result": {
+                            "value": request["params"]["value"],
+                            "call": call_count["count"],
+                        },
+                    }
+                )
+            )
+
+        return responder
+
+    module = MockSubprocessModule(responder_factory)
+    pool = WorkerPool(num_workers=1, subprocess_module=module)
+    try:
+        payload = {"value": "test", "build": {"items": [], "tree": {}}, "scenario": "test"}
+        results1 = pool.evaluate_batch([payload])
+        results2 = pool.evaluate_batch([payload])
+    finally:
+        pool.close()
+
+    assert len(results1) == 1
+    assert len(results2) == 1
+    assert results1[0]["result"]["call"] == 1
+    assert results2[0]["result"]["call"] == 1
+    assert call_count["count"] == 1
+
+
+def test_cache_hit_rate_tracking() -> None:
+    def responder_factory() -> Callable[[MockProcess, Dict[str, Any]], None]:
+        def responder(process: MockProcess, request: Dict[str, Any]) -> None:
+            process.stdout.push_line(
+                json.dumps(
+                    {
+                        "id": request["id"],
+                        "ok": True,
+                        "result": {"value": request["params"]["value"]},
+                    }
+                )
+            )
+
+        return responder
+
+    module = MockSubprocessModule(responder_factory)
+    pool = WorkerPool(num_workers=1, subprocess_module=module)
+    try:
+        payload = {"value": "test", "build": {"items": [], "tree": {}}, "scenario": "test"}
+        for _ in range(10):
+            pool.evaluate_batch([payload])
+
+        with pool._cache_lock:
+            assert pool._cache_stats["hits"] == 9
+            assert pool._cache_stats["misses"] == 1
+            assert pool._cache_stats["requests"] == 10
+    finally:
+        pool.close()
+
+
+def test_fast_reject_missing_required_fields() -> None:
+    def responder_factory() -> Callable[[MockProcess, Dict[str, Any]], None]:
+        def responder(process: MockProcess, request: Dict[str, Any]) -> None:
+            process.stdout.push_line(
+                json.dumps(
+                    {
+                        "id": request["id"],
+                        "ok": True,
+                        "result": {"value": "ok"},
+                    }
+                )
+            )
+
+        return responder
+
+    module = MockSubprocessModule(responder_factory)
+    pool = WorkerPool(num_workers=1, subprocess_module=module)
+    try:
+        payload = {"value": "test"}
+        results = pool.evaluate_batch([payload])
+    finally:
+        pool.close()
+
+    assert len(results) == 1
+    assert results[0]["ok"] is True
+
+
+def test_fast_reject_invalid_build_structure() -> None:
+    def responder_factory() -> Callable[[MockProcess, Dict[str, Any]], None]:
+        def responder(_: MockProcess, __: Dict[str, Any]) -> None:
+            pass
+
+        return responder
+
+    module = MockSubprocessModule(responder_factory)
+    pool = WorkerPool(num_workers=1, subprocess_module=module)
+    try:
+        payload = {"build": "invalid", "scenario": "test"}
+        results = pool.evaluate_batch([payload])
+    finally:
+        pool.close()
+
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert "fast-reject" in results[0]["error"]["message"]
+
+
+def test_fast_reject_missing_items_in_build() -> None:
+    def responder_factory() -> Callable[[MockProcess, Dict[str, Any]], None]:
+        def responder(_: MockProcess, __: Dict[str, Any]) -> None:
+            pass
+
+        return responder
+
+    module = MockSubprocessModule(responder_factory)
+    pool = WorkerPool(num_workers=1, subprocess_module=module)
+    try:
+        payload = {"build": {"tree": {}}, "scenario": "test"}
+        results = pool.evaluate_batch([payload])
+    finally:
+        pool.close()
+
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert "fast-reject" in results[0]["error"]["message"]
+
+
+def test_fast_reject_missing_tree_in_build() -> None:
+    def responder_factory() -> Callable[[MockProcess, Dict[str, Any]], None]:
+        def responder(_: MockProcess, __: Dict[str, Any]) -> None:
+            pass
+
+        return responder
+
+    module = MockSubprocessModule(responder_factory)
+    pool = WorkerPool(num_workers=1, subprocess_module=module)
+    try:
+        payload = {"build": {"items": []}, "scenario": "test"}
+        results = pool.evaluate_batch([payload])
+    finally:
+        pool.close()
+
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert "fast-reject" in results[0]["error"]["message"]
+
+
+def test_cache_eviction_on_max_size() -> None:
+    def responder_factory() -> Callable[[MockProcess, Dict[str, Any]], None]:
+        def responder(process: MockProcess, request: Dict[str, Any]) -> None:
+            process.stdout.push_line(
+                json.dumps(
+                    {
+                        "id": request["id"],
+                        "ok": True,
+                        "result": {"value": request["params"]["value"]},
+                    }
+                )
+            )
+
+        return responder
+
+    module = MockSubprocessModule(responder_factory)
+    pool = WorkerPool(num_workers=1, subprocess_module=module)
+    try:
+        with pool._cache_lock:
+            original_max = pool._result_cache.__class__.__dict__.get("__maxsize__", 10000)
+
+        payloads = [
+            {"value": f"test_{i}", "build": {"items": [], "tree": {}}, "scenario": "test"}
+            for i in range(5)
+        ]
+        pool.evaluate_batch(payloads)
+
+        with pool._cache_lock:
+            cache_size = len(pool._result_cache)
+            assert cache_size == 5
+    finally:
+        pool.close()
+
+
+def test_valid_payload_bypasses_fast_reject() -> None:
+    call_count = {"count": 0}
+
+    def responder_factory() -> Callable[[MockProcess, Dict[str, Any]], None]:
+        def responder(process: MockProcess, request: Dict[str, Any]) -> None:
+            call_count["count"] += 1
+            process.stdout.push_line(
+                json.dumps(
+                    {
+                        "id": request["id"],
+                        "ok": True,
+                        "result": {"value": "success"},
+                    }
+                )
+            )
+
+        return responder
+
+    module = MockSubprocessModule(responder_factory)
+    pool = WorkerPool(num_workers=1, subprocess_module=module)
+    try:
+        payload = {"build": {"items": [1, 2], "tree": {"nodes": []}}, "scenario": "test"}
+        results = pool.evaluate_batch([payload])
+    finally:
+        pool.close()
+
+    assert len(results) == 1
+    assert results[0]["ok"] is True
+    assert call_count["count"] == 1
