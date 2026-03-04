@@ -2502,3 +2502,176 @@ def test_online_learning_state_persistence(tmp_path: Path) -> None:
     assert final_state.get("online_learning_eval_count") == 75
     assert final_state.get("online_learning_last_retrain_iteration") == 2
     assert final_state.get("updated_at_utc") is not None
+
+
+@pytest.fixture
+def mock_run_generation(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    captured_thresholds: list[Any] = []
+
+    def mock_impl(**kwargs: object) -> dict[str, object]:
+        captured_thresholds.append(kwargs.get("gate_thresholds"))
+        gate_evaluations = [
+            {
+                "gate_pass": True,
+                "selected_for_evaluation": True,
+                "gate_fail_reasons": [],
+                "gate_slacks": {},
+            }
+            for _ in range(12)
+        ]
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "completed",
+            "candidates": [],
+            "evaluation": {
+                "attempted": 12,
+                "successes": 12,
+                "failures": 0,
+                "errors": 0,
+                "gate_evaluations": gate_evaluations,
+            },
+        }
+
+    monkeypatch.setattr(ml_loop, "run_generation", mock_impl)
+    return captured_thresholds
+
+
+def test_ml_loop_curriculum_integration(
+    tmp_path: Path,
+    mock_run_generation: list[Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test curriculum applies tightened thresholds and transitions phases."""
+
+    from backend.engine.scenarios.loader import ScenarioGateThresholds, ScenarioReservationThreshold
+
+    loop_id = "curriculum-test"
+    data_path = tmp_path / "data"
+
+    base_thresholds = ScenarioGateThresholds(
+        resists={"fire": 75.0, "cold": 75.0, "lightning": 75.0, "chaos": 0.0},
+        reservation=ScenarioReservationThreshold(max_percent=110.0),
+        attributes={"strength": 100.0, "dexterity": 100.0, "intelligence": 100.0},
+        min_max_hit=3000.0,
+        min_full_dps=5_000_000.0,
+    )
+
+    def fake_load_thresholds_for_profile(profile_id: str) -> ScenarioGateThresholds:
+        _ = profile_id
+        return base_thresholds
+
+    rows = [{"full_dps": 1.0, "max_hit": 2.0, "utility_score": 3.0, "build_id": "b1"}]
+
+    def fake_build_dataset_snapshot(
+        *,
+        data_path: Path | str,
+        output_root: Path | str,
+        snapshot_id: str,
+        exclude_stub_rows: bool,
+        profile_id: str | None = None,
+        scenario_id: str | None = None,
+    ) -> SnapshotResult:
+        _ = data_path
+        _ = profile_id
+        _ = scenario_id
+        assert exclude_stub_rows is True
+        snapshot_root = Path(output_root) / snapshot_id
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        dataset_path = snapshot_root / "dataset.jsonl"
+        dataset_path.write_text("[]", encoding="utf-8")
+        manifest_path = snapshot_root / "manifest.json"
+        manifest_path.write_text("{}", encoding="utf-8")
+        return SnapshotResult(
+            snapshot_id=snapshot_id,
+            dataset_path=dataset_path,
+            manifest_path=manifest_path,
+            row_count=len(rows),
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+            dataset_hash="hash",
+        )
+
+    def fake_train(
+        *,
+        dataset_path: Path | str,
+        output_root: Path | str,
+        model_id: str,
+        compute_backend: str,
+        **_: object,
+    ) -> TrainResult:
+        _ = dataset_path
+        _ = compute_backend
+        model_root = Path(output_root) / model_id
+        model_root.mkdir(parents=True, exist_ok=True)
+        model_path = model_root / "model.json"
+        model_path.write_text("{}", encoding="utf-8")
+        metrics_path = model_root / "metrics.json"
+        metrics_path.write_text("{}", encoding="utf-8")
+        meta_path = model_root / "meta.json"
+        meta_path.write_text("{}", encoding="utf-8")
+        return TrainResult(
+            model_id=model_id,
+            model_path=model_path,
+            metrics_path=metrics_path,
+            meta_path=meta_path,
+            dataset_snapshot_id="iter-0001",
+            dataset_hash="hash",
+            row_count=len(rows),
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+        )
+
+    def fake_load_dataset_rows(dataset_path: Path | str) -> list[dict[str, float]]:
+        _ = dataset_path
+        return [dict(row) for row in rows]
+
+    def fake_load_model(*args: object, **kwargs: object) -> _FakeModel:
+        _ = args
+        _ = kwargs
+        return _FakeModel()
+
+    def fake_evaluate_predictions(*args: object, **kwargs: object) -> EvaluationResult:
+        _ = args
+        _ = kwargs
+        return EvaluationResult(
+            row_count=len(rows),
+            metric_mae={"full_dps": 0.0, "max_hit": 0.0},
+            pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+        )
+
+    monkeypatch.setattr(ml_loop, "load_thresholds_for_profile", fake_load_thresholds_for_profile)
+    monkeypatch.setattr(ml_loop, "build_dataset_snapshot", fake_build_dataset_snapshot)
+    monkeypatch.setattr(ml_loop, "train", fake_train)
+    monkeypatch.setattr(ml_loop, "load_dataset_rows", fake_load_dataset_rows)
+    monkeypatch.setattr(ml_loop, "load_model", fake_load_model)
+    monkeypatch.setattr(ml_loop, "evaluate_predictions", fake_evaluate_predictions)
+
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        iterations=2,
+        count=3,
+        seed_start=1,
+        profile_id="pinnacle",
+        ruleset_id="ruleset-smoke",
+        scenario_version=None,
+        price_snapshot_id="price",
+        pob_commit=None,
+        constraints_file=None,
+        data_path=data_path,
+        surrogate_backend="cpu",
+        curriculum_enabled=True,
+        curriculum_initial_phase="MAPPING",
+    )
+
+    result = ml_loop.start_loop(args)
+    assert result == 0
+
+    assert len(mock_run_generation) == 2
+
+    first_thresholds = mock_run_generation[0]
+    assert first_thresholds is not None
+    assert first_thresholds.min_max_hit == pytest.approx(3000.0 * 0.70, rel=0.01)
+
+    state_path = data_path / "ml_loops" / loop_id / ml_loop.STATE_FILENAME
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    curriculum_state = state.get("curriculum", {})
+    assert isinstance(curriculum_state, dict)
+    assert curriculum_state.get("phase") in {"BOSSING", "PINNACLE", "UBER"}
