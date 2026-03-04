@@ -2744,6 +2744,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Enable gate checking: 'resistances' for resistance gates only, 'full' for all gates (default: None - no gates)",
     )
     start_parser.add_argument(
+        "--level-interval",
+        type=int,
+        default=10,
+        help="Character level increases every N iterations (default: 10)",
+    )
+    start_parser.add_argument(
         "--skeleton-id",
         default=None,
         help="Optional skeleton identifier for feasibility-first generation",

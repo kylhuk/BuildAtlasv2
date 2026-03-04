@@ -78,7 +78,7 @@ regen-baselines:
 
 # ML loop tool
 ml-loop-start:
-	$(BACKEND_RUN) python -m backend.tools.ml_loop start --loop-id $(ML_LOOP_ID) --iterations $(ML_LOOP_ITERATIONS) --count $(ML_LOOP_COUNT) --data-path $(ML_LOOP_DATA_PATH) $(if $(ML_LOOP_GATE),--gate-profile $(ML_LOOP_GATE),)
+	$(BACKEND_RUN) python -m backend.tools.ml_loop start --loop-id $(ML_LOOP_ID) --iterations $(ML_LOOP_ITERATIONS) --count $(ML_LOOP_COUNT) --data-path $(ML_LOOP_DATA_PATH) $(if $(ML_LOOP_GATE),--gate-profile $(ML_LOOP_GATE),) $(if $(ML_LOOP_LEVEL_INTERVAL),--level-interval $(ML_LOOP_LEVEL_INTERVAL),)
 
 ml-loop-stop:
 	$(BACKEND_RUN) python -m backend.tools.ml_loop stop --loop-id $(ML_LOOP_ID) --data-path $(ML_LOOP_DATA_PATH)
