@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     use_xxhash: bool = Field(default=True, alias="USE_XXHASH")
     use_async_io: bool = Field(default=False, alias="USE_ASYNC_IO")
 
+    # ClickHouse connection settings
+    clickhouse_pool_size: int = Field(default=5, alias="CLICKHOUSE_POOL_SIZE")
+
     model_config = SettingsConfigDict(env_file=ENV_PATH, env_file_encoding="utf-8")
 
 
