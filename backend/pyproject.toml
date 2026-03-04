@@ -26,6 +26,13 @@ ml = [
     "scikit-learn",
     "torch"
 ]
+
+performance = [
+    "orjson>=3.9.0",
+    "xxhash>=3.2.0",
+    "aiofiles>=23.0.0"
+]
+
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
