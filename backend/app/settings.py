@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     # Increase this when Phase 1 is the bottleneck.
     pob_worker_pool_size: int = Field(default_factory=_default_pob_worker_pool_size)
 
+    # Performance feature flags (default to False for backward compatibility)
+    use_orjson: bool = Field(default=False, alias="USE_ORJSON")
+    use_xxhash: bool = Field(default=False, alias="USE_XXHASH")
+    use_async_io: bool = Field(default=False, alias="USE_ASYNC_IO")
+
     model_config = SettingsConfigDict(env_file=ENV_PATH, env_file_encoding="utf-8")
 
 
