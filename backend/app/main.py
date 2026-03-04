@@ -1,17 +1,17 @@
 # ruff: noqa: B008
 
+import base64
 import json
 import logging
 import re
-import uuid
-import base64
-import zlib
 import subprocess
 import sys
+import uuid
+import zlib
 from collections import OrderedDict
-from threading import Lock
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, List, Literal, Mapping, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -42,12 +42,12 @@ from backend.app.api.models import (
     GenerationRunSummary,
     ImportBuildRequest,
     ImportBuildResponse,
-    ModelOpsArtifactState,
-    MLLoopStatusResponse,
     MLLoopStartRequest,
     MLLoopStartResponse,
+    MLLoopStatusResponse,
     MLLoopStopRequest,
     MLLoopStopResponse,
+    ModelOpsArtifactState,
     ModelOpsModelRecord,
     ModelOpsStatusResponse,
     PredictionDetail,
@@ -105,8 +105,8 @@ def _coerce_status_counts(payload: Any) -> dict[str, int]:
 
 
 def _fallback_build_inventory_stats(repo: Any) -> tuple[int, int, dict[str, int]]:
-    if hasattr(repo, "_builds") and isinstance(getattr(repo, "_builds"), dict):
-        rows = list(getattr(repo, "_builds").values())
+    if hasattr(repo, "_builds") and isinstance(repo._builds, dict):
+        rows = list(repo._builds.values())
     else:
         try:
             rows = repo.list_builds(
@@ -389,6 +389,18 @@ async def handle_validation_error(_: Request, exc: RequestValidationError) -> JS
 async def handle_http_exception(_: Request, exc: HTTPException) -> JSONResponse:
     payload = {"error": {"code": "http_error", "message": exc.detail}}
     return JSONResponse(status_code=exc.status_code, content=payload)
+
+
+@app.exception_handler(Exception)
+async def handle_unexpected_exception(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception(
+        "Unhandled API exception method=%s path=%s",
+        request.method,
+        request.url.path,
+        exc_info=exc,
+    )
+    payload = {"error": {"code": "internal_error", "message": "internal server error"}}
+    return JSONResponse(status_code=500, content=payload)
 
 
 def get_repository() -> ClickhouseRepository:
@@ -1017,10 +1029,14 @@ def _build_summary_from_row(row: Dict[str, Any]) -> BuildSummary:
 def _artifact_path_exists(path_value: Any, base_path: Path) -> bool:
     if not isinstance(path_value, str) or not path_value:
         return False
+    base_resolved = base_path.resolve()
     path = Path(path_value)
     if not path.is_absolute():
-        path = base_path / path
-    return path.exists()
+        path = base_resolved / path
+    resolved_path = path.resolve()
+    if not resolved_path.is_relative_to(base_resolved):
+        return False
+    return resolved_path.exists()
 
 
 def _scenario_metric_summary_from_row(row: Dict[str, Any]) -> ScenarioMetricSummary:

@@ -1,23 +1,22 @@
 import json
 import random
 from pathlib import Path
+from typing import Any, Sequence
 from xml.etree import ElementTree as ET
 
 import pytest
 
-from typing import Any, Sequence
-
 from backend.engine.generation.runner import (
     CANONICAL_ITEM_SLOTS,
-    Candidate,
     POB_TARGET_VERSION,
-    _predict_candidates,
-    _optimizer_objectives_from_payload,
-    _select_optimizer_elites,
-    _select_surrogate_optimizer_elites,
+    Candidate,
     _assert_no_stub_metrics,
     _build_worker_xml_payload,
     _load_surrogate_predictor,
+    _optimizer_objectives_from_payload,
+    _predict_candidates,
+    _select_optimizer_elites,
+    _select_surrogate_optimizer_elites,
 )
 from backend.engine.genome import GenomeV0
 

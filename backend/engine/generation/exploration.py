@@ -195,7 +195,7 @@ def select_pareto_frontier(
 
     # Find Pareto frontier
     pareto = []
-    for i, candidate_dict in enumerate(c_dicts):
+    for _i, candidate_dict in enumerate(c_dicts):
         dominated = False
         for existing_dict in pareto:
             if dominates(existing_dict, candidate_dict):

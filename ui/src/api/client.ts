@@ -577,10 +577,14 @@ export async function listBuilds(params: BuildListParams = {}): Promise<BuildSum
   if (params.limit !== undefined) searchParams.append('limit', params.limit.toString());
   if (params.offset !== undefined) searchParams.append('offset', params.offset.toString());
   if (params.constraintStatus) searchParams.append('constraint_status', params.constraintStatus);
-  if (params.constraintReasonCode) searchParams.append('constraint_reason_code', params.constraintReasonCode);
-  if (params.violatedConstraint) searchParams.append('violated_constraint', params.violatedConstraint);
-  if (params.constraintCheckedAfter) searchParams.append('constraint_checked_after', params.constraintCheckedAfter);
-  if (params.constraintCheckedBefore) searchParams.append('constraint_checked_before', params.constraintCheckedBefore);
+  if (params.constraintReasonCode)
+    searchParams.append('constraint_reason_code', params.constraintReasonCode);
+  if (params.violatedConstraint)
+    searchParams.append('violated_constraint', params.violatedConstraint);
+  if (params.constraintCheckedAfter)
+    searchParams.append('constraint_checked_after', params.constraintCheckedAfter);
+  if (params.constraintCheckedBefore)
+    searchParams.append('constraint_checked_before', params.constraintCheckedBefore);
   const query = searchParams.toString();
   const path = query ? `/builds?${query}` : '/builds';
   const response = await requestJson<BuildListResponse>(path);

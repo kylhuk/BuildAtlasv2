@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List
 
 from backend.app.api.errors import APIError
 from backend.app.api.models import BuildStatus
@@ -242,8 +242,7 @@ class BuildEvaluator:
                     life=normalized.life,
                     mana=normalized.mana,
                     utility_score=normalized.utility_score,
-                    metrics_source=normalize_metrics_source(payload.get("metrics_source"))
-                    or METRICS_SOURCE_POB,
+                    metrics_source=self._worker_payload_metrics_source(payload),
                 )
             )
             warnings_lower = {

@@ -2,23 +2,22 @@
 
 from __future__ import annotations
 
+import builtins
 import hashlib
 import json
 import math
-import builtins
 from pathlib import Path
 from typing import Any, Mapping, Sequence, cast
 
 import pytest
 
 import backend.engine.surrogate.model as surrogate_model
-
 from backend.engine.surrogate.dataset import (
+    FEATURE_IDENTITY_CROSS_TOKENS,
+    FEATURE_IDENTITY_TOKENS,
     FEATURE_ITEM_SLOT_COUNT,
     FEATURE_SCHEMA_VERSION,
     FEATURE_SIGNAL_KEYS,
-    FEATURE_IDENTITY_TOKENS,
-    FEATURE_IDENTITY_CROSS_TOKENS,
     build_dataset_snapshot,
 )
 from backend.engine.surrogate.model import (
@@ -27,7 +26,6 @@ from backend.engine.surrogate.model import (
     TrainResult,
     evaluate_predictions,
     load_model,
-    _apply_deterministic_balance,
     train,
 )
 
@@ -1052,3 +1050,46 @@ def test_train_classifier_disabled_when_include_failures_false(tmp_path: Path) -
     assert meta["classifier_cv_status"] == "skipped"
     assert "classifier" not in meta
     assert "classifier_metrics" not in meta
+
+
+def test_train_logistic_classifier_rejects_single_class_labels() -> None:
+    row: dict[str, Any] = {feature: 0.0 for feature in FEATURE_SIGNAL_KEYS}
+    row[FEATURE_IDENTITY_TOKENS] = []
+    row[FEATURE_IDENTITY_CROSS_TOKENS] = []
+    row["gate_pass"] = True
+
+    with pytest.raises(ValueError, match="requires both positive and negative"):
+        surrogate_model._train_logistic_classifier(
+            [row],
+            signal_feature_keys=list(FEATURE_SIGNAL_KEYS),
+            identity_hash_dim=surrogate_model.CLASSIFIER_HASH_DIM,
+            cross_hash_dim=surrogate_model.CLASSIFIER_HASH_DIM,
+            epochs=surrogate_model.CLASSIFIER_EPOCHS,
+            learning_rate=surrogate_model.CLASSIFIER_LEARNING_RATE,
+            l2=surrogate_model.CLASSIFIER_L2,
+            lr_decay=surrogate_model.CLASSIFIER_LR_DECAY,
+        )
+
+
+def test_write_model_artifacts_atomic_cleans_staging_on_replace_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_root = tmp_path / "models" / "atomic-failure"
+
+    def _raise_replace(src: str | Path, dst: str | Path) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(surrogate_model.os, "replace", _raise_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        surrogate_model._write_model_artifacts_atomic(
+            model_root,
+            model_payload={"model_id": "atomic-failure"},
+            metrics_payload={"row_count": 1},
+            meta_payload={"meta": True},
+        )
+
+    assert not model_root.exists()
+    staging_dirs = list(model_root.parent.glob(f".{model_root.name}-*"))
+    assert staging_dirs == []

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping as AbcMapping
 from collections.abc import Sequence as AbcSequence
 from dataclasses import dataclass
 from typing import Any, Mapping
+
+logger = logging.getLogger(__name__)
 
 
 def _coerce_float(value: Any, default: float = 0.0) -> float:
@@ -36,12 +39,16 @@ class ResistSnapshot:
 
     def get(self, name: str) -> float:
         normalized = name.lower()
-        return {
+        values = {
             "fire": self.fire,
             "cold": self.cold,
             "lightning": self.lightning,
             "chaos": self.chaos,
-        }.get(normalized, 0.0)
+        }
+        if normalized in values:
+            return values[normalized]
+        logger.warning("Unknown resist name requested: %s", name)
+        return 0.0
 
 
 @dataclass(frozen=True)

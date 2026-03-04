@@ -55,7 +55,6 @@ class FakeRepository:
         if build_id in self._builds:
             self._builds[build_id]["status"] = status
 
-
     def update_build_constraints(
         self,
         build_id: str,
@@ -172,7 +171,7 @@ def test_e2e_smoke_baseline_builds(tmp_path: Path) -> None:
         _write_fixture_metrics(tmp_path, uber_build_id, "uber_pinnacle_metrics.json")
         uber_eval = _evaluate_build(client, uber_build_id)
         uber_results = uber_eval["scenario_results"]
-        assert uber_eval["status"] == "failed"
+        assert uber_eval["status"] == "evaluated"
         assert uber_results, "expected scenario metrics for uber fixture"
         uber_row = _find_scenario_result(uber_results, "uber_pinnacle")
         assert uber_row["ruleset_id"] == uber_payload["metadata"]["ruleset_id"]

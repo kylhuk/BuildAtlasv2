@@ -4,7 +4,12 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from backend.app.main import app, get_artifact_base_path
-from backend.engine.archive import ArchiveStore, DescriptorAxisSpec, load_archive_artifact, persist_archive
+from backend.engine.archive import (
+    ArchiveStore,
+    DescriptorAxisSpec,
+    load_archive_artifact,
+    persist_archive,
+)
 from backend.engine.archive.store import ARCHIVE_ARTIFACT_SCHEMA_VERSION
 
 
@@ -19,9 +24,7 @@ def test_archive_endpoints(tmp_path: Path) -> None:
         store.insert("entry", score=5.0, descriptor=(0.1,), metadata={"seed": 42})
         persist_archive("test-run", store, base_path=tmp_path, created_at="2025-01-01T00:00:00Z")
 
-        artifact = load_archive_artifact(
-            "test-run", base_path=tmp_path
-        )
+        artifact = load_archive_artifact("test-run", base_path=tmp_path)
         axis_entry = artifact["axes"][0]
         assert axis_entry["name"] == "alpha"
         assert axis_entry["transform"] == "identity"
@@ -48,7 +51,6 @@ def test_archive_endpoints(tmp_path: Path) -> None:
         app.dependency_overrides.clear()
 
 
-
 def test_default_axes_persist_transform_metadata(tmp_path: Path) -> None:
     store = ArchiveStore()
     store.insert(
@@ -62,13 +64,10 @@ def test_default_axes_persist_transform_metadata(tmp_path: Path) -> None:
         base_path=tmp_path,
         created_at="2025-01-03T00:00:00Z",
     )
-    artifact = load_archive_artifact(
-        "default-axes", base_path=tmp_path
-    )
+    artifact = load_archive_artifact("default-axes", base_path=tmp_path)
     axes = {axis["name"]: axis for axis in artifact["axes"]}
     assert axes["damage"]["transform"] == "log10"
     assert axes["max_hit"]["transform"] == "log10"
-
 
 
 def test_load_archive_artifact_normalizes_missing_axis_transform(tmp_path: Path) -> None:
@@ -106,7 +105,6 @@ def test_load_archive_artifact_normalizes_missing_axis_transform(tmp_path: Path)
     assert axis_entry["transform"] == "identity"
 
 
-
 def test_archive_frontier_endpoint(tmp_path: Path) -> None:
     app.dependency_overrides.clear()
     app.dependency_overrides[get_artifact_base_path] = lambda: tmp_path
@@ -131,10 +129,10 @@ def test_archive_frontier_endpoint(tmp_path: Path) -> None:
         response = client.get("/archives/frontier-run/frontier")
         assert response.status_code == 200
         payload = response.json()
-        assert {
-            bin_entry["build_id"]
-            for bin_entry in payload["bins"]
-        } == {"alpha_focus", "beta_focus"}
+        assert {bin_entry["build_id"] for bin_entry in payload["bins"]} == {
+            "alpha_focus",
+            "beta_focus",
+        }
         for bin_entry in payload["bins"]:
             assert bin_entry["tradeoff_reasons"]
             links = bin_entry["artifact_links"]
@@ -148,4 +146,3 @@ def test_archive_frontier_endpoint(tmp_path: Path) -> None:
     finally:
         client.close()
         app.dependency_overrides.clear()
-

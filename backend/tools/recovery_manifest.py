@@ -32,9 +32,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             help="Base directory containing run subdirectories (default: data/runs)",
         )
 
-    verify_parser = subparsers.add_parser(
-        "verify", help="Report manifest/artifact availability"
-    )
+    verify_parser = subparsers.add_parser("verify", help="Report manifest/artifact availability")
     _add_common_arguments(verify_parser)
 
     replay_parser = subparsers.add_parser(
@@ -96,9 +94,7 @@ def _inspect_summary(
         summary_info["parsed"] = True
         return summary_info, payload, errors, warnings
     except json.JSONDecodeError as exc:
-        message = (
-            f"summary manifest {summary_path} could not be parsed: {exc}"
-        )
+        message = f"summary manifest {summary_path} could not be parsed: {exc}"
         summary_info["error"] = message
         errors.append(message)
     except (OSError, ValueError) as exc:
@@ -126,9 +122,7 @@ def _inspect_artifacts(
                 if value_str:
                     candidate_path = Path(value_str)
                     resolved_path = (
-                        candidate_path
-                        if candidate_path.is_absolute()
-                        else run_dir / candidate_path
+                        candidate_path if candidate_path.is_absolute() else run_dir / candidate_path
                     )
                     exists = resolved_path.exists()
                 if exists:
@@ -195,9 +189,7 @@ def _write_replay_marker(
         "dry_run": dry_run,
         "reason": reason or "",
     }
-    marker_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    marker_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return marker_path
 
 
@@ -205,9 +197,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     base_path = Path(args.base_path)
     run_dir = base_path / args.run_id
-    summary_info, summary_data, summary_errors, summary_warnings = _inspect_summary(
-        run_dir
-    )
+    summary_info, summary_data, summary_errors, summary_warnings = _inspect_summary(run_dir)
     artifact_report, artifact_warnings = _inspect_artifacts(summary_data, run_dir)
     errors = [*summary_errors]
     warnings = [*summary_warnings, *artifact_warnings]

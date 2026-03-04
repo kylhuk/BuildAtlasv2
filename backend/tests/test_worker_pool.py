@@ -195,6 +195,34 @@ def test_timeout_restarts_worker_module() -> None:
     assert len(module.instances) >= 2
 
 
+def test_timeout_retries_use_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    def responder_factory() -> Callable[[MockProcess, Dict[str, Any]], None]:
+        def responder(_: MockProcess, __: Dict[str, Any]) -> None:
+            pass
+
+        return responder
+
+    sleep_calls: list[float] = []
+
+    monkeypatch.setattr("backend.engine.worker_pool.random.uniform", lambda _a, _b: 0.0)
+    monkeypatch.setattr(
+        "backend.engine.worker_pool.time.sleep",
+        lambda seconds: sleep_calls.append(float(seconds)),
+    )
+
+    module = MockSubprocessModule(responder_factory)
+    pool = WorkerPool(num_workers=1, subprocess_module=module, request_timeout=0.01)
+    try:
+        with pytest.raises(WorkerTimeoutError):
+            pool.evaluate_batch([{"value": "timeout"}])
+    finally:
+        pool.close()
+
+    assert len(sleep_calls) == 2
+    assert sleep_calls[0] == pytest.approx(0.05)
+    assert sleep_calls[1] == pytest.approx(0.1)
+
+
 def test_protocol_parsing_returns_response_payload() -> None:
     def responder_factory() -> Callable[[MockProcess, Dict[str, Any]], None]:
         def responder(process: MockProcess, request: Dict[str, Any]) -> None:

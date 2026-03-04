@@ -14,6 +14,8 @@ import hashlib
 import json
 import logging
 import os
+import shutil
+import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -478,10 +480,16 @@ def _apply_deterministic_balance(
         retention_ratio = output_count / total_rows if total_rows else 0.0
         if output_count < DETERMINISTIC_BALANCE_MIN_OUTPUT_ROWS:
             fallback = True
-            reason = f"balanced rows {output_count} below minimum {DETERMINISTIC_BALANCE_MIN_OUTPUT_ROWS}; reverting to original dataset"
+            reason = (
+                f"balanced rows {output_count} below minimum "
+                f"{DETERMINISTIC_BALANCE_MIN_OUTPUT_ROWS}; reverting to original dataset"
+            )
         elif retention_ratio < DETERMINISTIC_BALANCE_MIN_RETENTION_RATIO:
             fallback = True
-            reason = f"retention ratio {retention_ratio:.3f} below threshold {DETERMINISTIC_BALANCE_MIN_RETENTION_RATIO}; reverting to original dataset"
+            reason = (
+                f"retention ratio {retention_ratio:.3f} below threshold "
+                f"{DETERMINISTIC_BALANCE_MIN_RETENTION_RATIO}; reverting to original dataset"
+            )
         else:
             reason = f"dominant share {dominant_share:.3f} > {DETERMINISTIC_BALANCE_DOMINANT_SHARE}"
         final_rows = original_rows if fallback else truncated_rows
@@ -551,10 +559,10 @@ def train(
     backend_preference = _normalize_backend_preference(compute_backend)
     resolved_backend, fallback_reason = _resolve_compute_backend(backend_preference)
     model_root = Path(output_root) / model_id
-    model_root.mkdir(parents=True, exist_ok=True)
     _train_phase_log(
         "surrogate train %s phase=start "
-        "(snapshot=%s rows=%d raw_rows=%d train_rows=%d val_rows=%d backend_preference=%s backend_resolved=%s)",
+        "(snapshot=%s rows=%d raw_rows=%d train_rows=%d val_rows=%d "
+        "backend_preference=%s backend_resolved=%s)",
         model_id,
         manifest.get("snapshot_id", ""),
         len(regression_rows),
@@ -725,26 +733,30 @@ def train(
                     + ", ".join(f"{label}={count}" for label, count in sorted(label_counts.items()))
                 )
             else:
-                classifier_payload, classifier_metrics = _train_logistic_classifier(
-                    classification_rows,
-                    signal_feature_keys=list(FEATURE_SIGNAL_KEYS),
-                    identity_hash_dim=CLASSIFIER_HASH_DIM,
-                    cross_hash_dim=CLASSIFIER_HASH_DIM,
-                    epochs=CLASSIFIER_EPOCHS,
-                    learning_rate=CLASSIFIER_LEARNING_RATE,
-                    l2=CLASSIFIER_L2,
-                    lr_decay=CLASSIFIER_LR_DECAY,
-                )
-                classifier_model = CLASSIFIER_BACKEND
-                classifier_meta["classifier_status"] = "trained"
-                classifier_meta["classifier_skip_reason"] = None
-                model = SurrogateModel(
-                    **model_kwargs,
-                    identity_token_effects=identity_effects,
-                    identity_cross_token_effects=cross_effects,
-                    token_learner_backend=token_learner_backend,
-                    classifier=classifier_payload,
-                )
+                try:
+                    classifier_payload, classifier_metrics = _train_logistic_classifier(
+                        classification_rows,
+                        signal_feature_keys=list(FEATURE_SIGNAL_KEYS),
+                        identity_hash_dim=CLASSIFIER_HASH_DIM,
+                        cross_hash_dim=CLASSIFIER_HASH_DIM,
+                        epochs=CLASSIFIER_EPOCHS,
+                        learning_rate=CLASSIFIER_LEARNING_RATE,
+                        l2=CLASSIFIER_L2,
+                        lr_decay=CLASSIFIER_LR_DECAY,
+                    )
+                except ValueError as exc:
+                    classifier_meta["classifier_skip_reason"] = str(exc)
+                else:
+                    classifier_model = CLASSIFIER_BACKEND
+                    classifier_meta["classifier_status"] = "trained"
+                    classifier_meta["classifier_skip_reason"] = None
+                    model = SurrogateModel(
+                        **model_kwargs,
+                        identity_token_effects=identity_effects,
+                        identity_cross_token_effects=cross_effects,
+                        token_learner_backend=token_learner_backend,
+                        classifier=classifier_payload,
+                    )
 
     classifier_elapsed = (
         max(0.0, monotonic() - classifier_stage_started_at)
@@ -761,9 +773,6 @@ def train(
         classifier_elapsed,
         classifier_meta.get("classifier_skip_reason") or "none",
     )
-
-    model_path = model_root / _MODEL_FILENAME
-    model_path.write_text(json.dumps(model.to_dict(), indent=2), encoding="utf-8")
 
     evaluation_stage_started_at = monotonic()
     _train_phase_log("surrogate train %s phase=evaluation_start", model_id)
@@ -789,8 +798,6 @@ def train(
             "split_remainder": split_remainder,
         },
     }
-    metrics_path = model_root / _METRICS_FILENAME
-    metrics_path.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
     _train_phase_log(
         "surrogate train %s phase=evaluation_complete (rows=%d elapsed=%.1fs)",
         model_id,
@@ -827,8 +834,12 @@ def train(
         meta_payload["classifier"] = classifier_model
         meta_payload["classifier_metrics"] = classifier_metrics
 
-    meta_path = model_root / _META_FILENAME
-    meta_path.write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
+    model_path, metrics_path, meta_path = _write_model_artifacts_atomic(
+        model_root,
+        model_payload=model.to_dict(),
+        metrics_payload=metrics_payload,
+        meta_payload=meta_payload,
+    )
 
     _train_phase_log(
         "surrogate train %s phase=completed (backend=%s token_backend=%s elapsed=%.1fs)",
@@ -1141,6 +1152,8 @@ def _train_logistic_classifier(
 
     positive_count = sum(labels)
     negative_count = len(labels) - positive_count
+    if positive_count <= 0 or negative_count <= 0:
+        raise ValueError("classifier requires both positive and negative gate_pass labels")
     positive_weight = len(labels) / (2.0 * positive_count)
     negative_weight = len(labels) / (2.0 * negative_count)
 
@@ -1294,6 +1307,35 @@ def _load_dataset_rows(snapshot_root: Path) -> Iterable[Mapping[str, Any]]:
         if not line.strip():
             continue
         yield json.loads(line)
+
+
+def _write_model_artifacts_atomic(
+    model_root: Path,
+    *,
+    model_payload: Mapping[str, Any],
+    metrics_payload: Mapping[str, Any],
+    meta_payload: Mapping[str, Any],
+) -> tuple[Path, Path, Path]:
+    model_root.parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(tempfile.mkdtemp(prefix=f".{model_root.name}-", dir=str(model_root.parent)))
+    try:
+        model_path = staging_root / _MODEL_FILENAME
+        metrics_path = staging_root / _METRICS_FILENAME
+        meta_path = staging_root / _META_FILENAME
+        model_path.write_text(json.dumps(model_payload, indent=2), encoding="utf-8")
+        metrics_path.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
+        meta_path.write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
+        if model_root.exists():
+            shutil.rmtree(model_root)
+        os.replace(staging_root, model_root)
+    except Exception:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise
+    return (
+        model_root / _MODEL_FILENAME,
+        model_root / _METRICS_FILENAME,
+        model_root / _META_FILENAME,
+    )
 
 
 def _is_snapshot(path: Path) -> bool:

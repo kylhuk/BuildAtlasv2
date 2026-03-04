@@ -4,11 +4,11 @@ from datetime import datetime
 from typing import Any, Dict, List, Sequence
 
 import clickhouse_connect
-from backend.engine.metrics_source import METRICS_SOURCE_POB
 from clickhouse_connect.driver.client import Client
 from pydantic import BaseModel, ConfigDict, Field
 
 from backend.app.settings import settings
+from backend.engine.metrics_source import METRICS_SOURCE_POB
 
 ClickhouseClient = Client
 
@@ -201,6 +201,24 @@ class ClickhouseRepository:
 
     def __init__(self, client: ClickhouseClient | None = None) -> None:
         self._client = client or get_clickhouse_client()
+        self._query_timeout_seconds = max(1, int(settings.clickhouse_query_timeout_seconds))
+        self._query_settings: Dict[str, Any] = {
+            "max_execution_time": self._query_timeout_seconds,
+        }
+
+    def _query(self, query: str, parameters: Dict[str, Any] | None = None):
+        return self._client.query(
+            query,
+            parameters=parameters,
+            settings=self._query_settings,
+        )
+
+    def _command(self, query: str, parameters: Dict[str, Any] | None = None) -> Any:
+        return self._client.command(
+            query,
+            parameters=parameters,
+            settings=self._query_settings,
+        )
 
     def close(self) -> None:
         client = self._client
@@ -322,7 +340,7 @@ class ClickhouseRepository:
             "FROM scenario_metrics "
             "WHERE ruleset_id = {ruleset_id:String}"
         )
-        result = self._client.query(query, parameters={"ruleset_id": ruleset_id})
+        result = self._query(query, parameters={"ruleset_id": ruleset_id})
         try:
             rows = list(result.named_results())
         finally:
@@ -331,7 +349,7 @@ class ClickhouseRepository:
 
     def get_build(self, build_id: str) -> Dict[str, Any] | None:
         query = "SELECT * FROM builds WHERE build_id = {build_id:String} LIMIT 1"
-        result = self._client.query(query, parameters={"build_id": build_id})
+        result = self._query(query, parameters={"build_id": build_id})
         rows = list(result.named_results())
         result.close()
         return rows[0] if rows else None
@@ -494,7 +512,7 @@ class ClickhouseRepository:
             f"ORDER BY {sort_column} {order_dir.upper()} "
             "LIMIT {limit:UInt32} OFFSET {offset:UInt32}"
         )
-        result = self._client.query(query, parameters=parameters)
+        result = self._query(query, parameters=parameters)
         try:
             rows = list(result.named_results())
         finally:
@@ -505,14 +523,14 @@ class ClickhouseRepository:
         total_query = (
             "SELECT count() AS total_builds, countIf(is_stale = 1) AS stale_builds FROM builds"
         )
-        total_result = self._client.query(total_query)
+        total_result = self._query(total_query)
         try:
             total_rows = list(total_result.named_results())
         finally:
             total_result.close()
 
         status_query = "SELECT status, count() AS count FROM builds GROUP BY status"
-        status_result = self._client.query(status_query)
+        status_result = self._query(status_query)
         try:
             status_rows = list(status_result.named_results())
         finally:
@@ -535,7 +553,7 @@ class ClickhouseRepository:
         query = (
             "ALTER TABLE builds UPDATE status = {status:String} WHERE build_id = {build_id:String}"
         )
-        self._client.command(query, parameters={"build_id": build_id, "status": status})
+        self._command(query, parameters={"build_id": build_id, "status": status})
 
     def update_build_constraints(
         self,
@@ -566,7 +584,7 @@ class ClickhouseRepository:
             + ", ".join(updates)
             + " WHERE build_id = {build_id:String}"
         )
-        self._client.command(query, parameters=parameters)
+        self._command(query, parameters=parameters)
 
     def update_build_ruleset(
         self,
@@ -589,7 +607,7 @@ class ClickhouseRepository:
             + ", ".join(updates)
             + " WHERE build_id = {build_id:String}"
         )
-        self._client.command(query, parameters=parameters)
+        self._command(query, parameters=parameters)
 
     def mark_builds_stale_except(self, ruleset_id: str, profile_id: str | None = None) -> None:
         query = "ALTER TABLE builds UPDATE is_stale = 1 WHERE ruleset_id != {ruleset_id:String}"
@@ -597,21 +615,25 @@ class ClickhouseRepository:
         if profile_id:
             query += " AND profile_id = {profile_id:String}"
             parameters["profile_id"] = profile_id
-        self._client.command(query, parameters=parameters)
+        self._command(query, parameters=parameters)
 
     def purge_build(self, build_id: str) -> None:
         parameters: Dict[str, Any] = {"build_id": build_id}
         settings: Dict[str, Any] = {"mutations_sync": 1}
         for table in ("scenario_metrics", "build_costs", "builds"):
             query = f"ALTER TABLE {table} DELETE WHERE build_id = {{build_id:String}}"
-            self._client.command(query, parameters=parameters, settings=settings)
+            self._client.command(
+                query,
+                parameters=parameters,
+                settings={**self._query_settings, **settings},
+            )
 
     def list_scenario_metrics(self, build_id: str) -> List[Dict[str, Any]]:
         query = (
             "SELECT * FROM scenario_metrics WHERE build_id = {build_id:String} "
             "ORDER BY scenario_id ASC, evaluated_at DESC"
         )
-        result = self._client.query(query, parameters={"build_id": build_id})
+        result = self._query(query, parameters={"build_id": build_id})
         try:
             rows = list(result.named_results())
         finally:
@@ -623,7 +645,7 @@ class ClickhouseRepository:
             "SELECT * FROM build_costs WHERE build_id = {build_id:String} "
             "ORDER BY calculated_at DESC LIMIT 1"
         )
-        result = self._client.query(query, parameters={"build_id": build_id})
+        result = self._query(query, parameters={"build_id": build_id})
         try:
             rows = list(result.named_results())
         finally:

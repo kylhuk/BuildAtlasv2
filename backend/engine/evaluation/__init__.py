@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from .gates import (
     GATE_REASON_ATTRIBUTES,
-    GATE_REASON_MAX_HIT,
     GATE_REASON_FULL_DPS,
+    GATE_REASON_MAX_HIT,
     GATE_REASON_RESERVATION,
     GATE_REASON_RESIST_CHAOS,
     GATE_REASON_RESIST_COLD,

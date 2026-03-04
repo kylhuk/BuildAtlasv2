@@ -201,8 +201,6 @@ def test_start_loop_executes_two_iterations(
         surrogate_top_k=surrogate_top_k,
     )
 
-    evaluation_budget = args.count
-
     rows = [{"full_dps": 1.0, "max_hit": 2.0, "utility_score": 3.0}]
     last_snapshot_id: str | None = None
     seed_calls: list[int] = []
@@ -1313,8 +1311,8 @@ def test_status_loop_reports_tripwire_counts(
 
     output = capsys.readouterr().out
     assert (
-        "Tripwire counts: worker_metrics=5 fallback_stub=2 worker_errors=1 last_worker_error=worker metadata missing for unknown"
-        in output
+        "Tripwire counts: worker_metrics=5 fallback_stub=2 worker_errors=1 "
+        "last_worker_error=worker metadata missing for unknown" in output
     )
 
 
@@ -2305,3 +2303,100 @@ def test_report_loop_csv_output_includes_header_and_warnings(tmp_path: Path) -> 
     warnings_value = row.get("warnings")
     assert isinstance(warnings_value, str)
     assert "surrogate_predictions_missing" in warnings_value
+
+
+def test_start_loop_tolerates_malformed_constraints_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop_id = "malformed-constraints"
+    data_path = tmp_path / "data"
+    constraints_path = tmp_path / "constraints.json"
+    constraints_path.write_text("{not-json", encoding="utf-8")
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        iterations=1,
+        count=2,
+        seed_start=1,
+        profile_id="pinnacle",
+        ruleset_id="ruleset-smoke",
+        scenario_version=None,
+        price_snapshot_id="price",
+        pob_commit=None,
+        constraints_file=constraints_path,
+        data_path=data_path,
+        surrogate_backend="cpu",
+    )
+
+    def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "failed",
+            "evaluation": {"attempted": 2, "successes": 0, "failures": 2, "errors": 0},
+            "status_reason": {
+                "code": "no_verified_evaluations",
+                "message": "no verified builds",
+            },
+        }
+
+    monkeypatch.setattr(ml_loop, "run_generation", fake_run_generation)
+
+    result = ml_loop.start_loop(args)
+    assert result == 0
+
+    state_path = data_path / "ml_loops" / loop_id / ml_loop.STATE_FILENAME
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "completed"
+    assert state["iteration"] == 1
+
+
+def test_start_loop_rebuilds_corrupt_state_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop_id = "corrupt-state"
+    data_path = tmp_path / "data"
+    loop_root = data_path / "ml_loops" / loop_id
+    loop_root.mkdir(parents=True, exist_ok=True)
+    state_path = loop_root / ml_loop.STATE_FILENAME
+    state_path.write_text("{not-json", encoding="utf-8")
+    (loop_root / ml_loop.ITERATIONS_FILENAME).write_text("", encoding="utf-8")
+
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        iterations=1,
+        count=2,
+        seed_start=7,
+        profile_id="pinnacle",
+        ruleset_id="ruleset-smoke",
+        scenario_version=None,
+        price_snapshot_id="price",
+        pob_commit=None,
+        constraints_file=None,
+        data_path=data_path,
+        surrogate_backend="cpu",
+    )
+
+    def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "failed",
+            "evaluation": {"attempted": 2, "successes": 0, "failures": 2, "errors": 0},
+            "status_reason": {
+                "code": "no_verified_evaluations",
+                "message": "no verified builds",
+            },
+        }
+
+    monkeypatch.setattr(ml_loop, "run_generation", fake_run_generation)
+
+    result = ml_loop.start_loop(args)
+    assert result == 0
+
+    backup_path = loop_root / "state.corrupt.json"
+    assert backup_path.exists()
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "completed"
+    assert state["iteration"] == 1
+    assert state["seed_start_base"] == 7

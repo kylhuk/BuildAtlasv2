@@ -268,7 +268,6 @@ class GenerationRequest(BaseModel):
     optimizer_iterations: int = 1
     optimizer_elite_count: int = 2
     constraints: Dict[str, Any] | None = None
-    constraints: Dict[str, Any] | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -540,10 +539,10 @@ class MLLoopStartRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     @model_validator(mode="after")
-    def validate_iterations(cls, values: "MLLoopStartRequest") -> "MLLoopStartRequest":
-        if not values.endless and (values.iterations is None or values.iterations <= 0):
+    def validate_iterations(self) -> "MLLoopStartRequest":
+        if not self.endless and (self.iterations is None or self.iterations <= 0):
             raise ValueError("iterations must be provided and positive when endless is false")
-        return values
+        return self
 
 
 class MLLoopStartResponse(BaseModel):

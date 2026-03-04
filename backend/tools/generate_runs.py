@@ -126,7 +126,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-
 def _load_constraints(path: Path | None) -> dict[str, Any] | None:
     if path is None:
         return None

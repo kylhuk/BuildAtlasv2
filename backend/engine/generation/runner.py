@@ -46,20 +46,18 @@ from backend.engine.items.templates import (
     RepairReport,
     build_item_templates,
 )
-from backend.engine.passives.builder import PassiveTreePlan, build_passive_tree_plan
-from backend.engine.scenarios.loader import ScenarioTemplate, list_templates
-from backend.engine.skills.catalog import GemPlan, SkillCatalog, load_default_skill_catalog
-from backend.engine.sockets.planner import SocketPlan, plan_sockets
 from backend.engine.metrics_source import (
-    METRICS_SOURCE_FALLBACK,
     METRICS_SOURCE_POB,
     METRICS_SOURCE_STUB,
     METRICS_SOURCE_VALUES,
     normalize_metrics_source,
 )
+from backend.engine.passives.builder import PassiveTreePlan, build_passive_tree_plan
+from backend.engine.scenarios.loader import ScenarioTemplate, list_templates
+from backend.engine.skills.catalog import GemPlan, SkillCatalog, load_default_skill_catalog
+from backend.engine.sockets.planner import SocketPlan, plan_sockets
 from backend.engine.surrogate import load_model
 from backend.engine.surrogate.dataset import extract_feature_signals
-
 
 logger = logging.getLogger(__name__)
 
@@ -146,8 +144,6 @@ def _collect_verified_metric_entries(
 ) -> list[tuple[int, float | None, float | None]]:
     entries: list[tuple[int, float | None, float | None]] = []
     for candidate in candidates:
-        if candidate.evaluation_status != BuildStatus.evaluated.value:
-            continue
         metrics_payload = candidate.verified_metrics_payload
         if not isinstance(metrics_payload, Mapping):
             continue
@@ -568,7 +564,10 @@ def _log_degenerate_surrogate_predictions(run_id: str, candidates: Sequence[Cand
         return
     metric_list = ", ".join(sorted(set(constant_metrics)))
     logger.warning(
-        "generation run %s surrogate predictions constant for metrics [%s] across %d evaluable candidates",
+        (
+            "generation run %s surrogate predictions constant for metrics [%s] "
+            "across %d evaluable candidates"
+        ),
         run_id,
         metric_list,
         total,
@@ -1566,7 +1565,14 @@ def run_generation(
     created_repo = repo is None
     repo = repo or ClickhouseRepository()
     created_evaluator = evaluator is None
-    evaluator = evaluator or BuildEvaluator(repo=repo, base_path=base_path)
+    evaluator = evaluator or BuildEvaluator(
+        repo=repo,
+        base_path=base_path,
+        worker_cmd=settings.pob_worker_cmd,
+        worker_args=settings.pob_worker_args,
+        worker_cwd=settings.pob_worker_cwd,
+        worker_pool_size=settings.pob_worker_pool_size,
+    )
     if run_mode == "optimizer":
         evaluator.require_worker_metrics_for_profile(profile_id)
         if profile_id.strip().lower() == "uber_pinnacle":
@@ -2003,6 +2009,8 @@ def run_generation(
     evaluation_attempted = 0
     metrics_ok_count = 0
     gate_pass_count = 0
+    gate_fail_count = 0
+    gate_fail_reason_counts: dict[str, int] = {}
     evaluation_failures = 0
     evaluation_errors = 0
     evaluation_started_at = monotonic()
@@ -2017,6 +2025,7 @@ def run_generation(
         "worker_error_count": 0,
         "last_worker_error": None,
     }
+    metrics_source_counts: dict[str, int] = {source: 0 for source in METRICS_SOURCE_VALUES}
 
     if selected_count == 0:
         logger.warning("generation run %s has no candidates selected for evaluation", session_id)
@@ -2042,6 +2051,20 @@ def run_generation(
                 candidate.gate_pass = all(getattr(row, "gate_pass", True) for row in rows)
                 if candidate.gate_pass:
                     gate_pass_count += 1
+                else:
+                    gate_fail_count += 1
+                for row in rows:
+                    if not getattr(row, "gate_pass", True):
+                        for reason in getattr(row, "gate_fail_reasons", []) or []:
+                            reason_key = str(reason)
+                            gate_fail_reason_counts[reason_key] = (
+                                gate_fail_reason_counts.get(reason_key, 0) + 1
+                            )
+                    source_value = normalize_metrics_source(
+                        getattr(row, "metrics_source", None), METRICS_SOURCE_STUB
+                    )
+                    source_key = source_value or METRICS_SOURCE_STUB
+                    metrics_source_counts[source_key] = metrics_source_counts.get(source_key, 0) + 1
             candidate.verified_metrics_payload = _metrics_payload_from_scenario_rows(rows)
             evaluation_rows.extend(rows)
             metrics_sources = _row_metrics_sources(rows)
@@ -2054,14 +2077,20 @@ def run_generation(
                     scenarios_text = _describe_scenarios(
                         provenance.worker_metadata_missing_scenarios
                     )
-                    tripwire_message = f"PoB evaluation inactive; worker metadata missing for scenarios {scenarios_text}"
+                    tripwire_message = (
+                        "PoB evaluation inactive; worker metadata missing "
+                        f"for scenarios {scenarios_text}"
+                    )
                     tripwire_details["worker_metadata_missing_scenarios"] = (
                         provenance.worker_metadata_missing_scenarios
                     )
                 elif provenance.stub_warning_count > 0:
                     tripwire_reason = "stub_metrics_detected"
                     scenarios_text = _describe_scenarios(provenance.stub_warning_scenarios)
-                    tripwire_message = f"PoB evaluation inactive; stub metrics detected for scenarios {scenarios_text}"
+                    tripwire_message = (
+                        "PoB evaluation inactive; stub metrics detected "
+                        f"for scenarios {scenarios_text}"
+                    )
                     tripwire_details["stub_warning_scenarios"] = provenance.stub_warning_scenarios
             detection_triggered = tripwire_reason is not None
             if detection_triggered:
@@ -2212,12 +2241,14 @@ def run_generation(
         if should_log_progress:
             _phase_log(
                 "generation run %s phase=evaluation_progress "
-                "(completed=%d/%d metrics_ok=%d gate_pass=%d failures=%d errors=%d elapsed=%.1fs)",
+                "(completed=%d/%d metrics_ok=%d gate_pass=%d gate_fail=%d "
+                "failures=%d errors=%d elapsed=%.1fs)",
                 session_id,
                 evaluation_attempted,
                 selected_count,
                 metrics_ok_count,
                 gate_pass_count,
+                gate_fail_count,
                 evaluation_failures,
                 evaluation_errors,
                 max(0.0, now - evaluation_started_at),
@@ -2228,17 +2259,29 @@ def run_generation(
 
     _phase_log(
         "generation run %s phase=evaluation_complete "
-        "(attempted=%d metrics_ok=%d gate_pass=%d failures=%d errors=%d elapsed=%.1fs)",
+        "(attempted=%d metrics_ok=%d gate_pass=%d gate_fail=%d "
+        "failures=%d errors=%d elapsed=%.1fs)",
         session_id,
         evaluation_attempted,
         metrics_ok_count,
         gate_pass_count,
+        gate_fail_count,
         evaluation_failures,
         evaluation_errors,
         max(0.0, monotonic() - evaluation_started_at),
     )
 
-    _assert_no_stub_metrics(_collect_verified_metric_entries(candidates))
+    try:
+        _assert_no_stub_metrics(_collect_verified_metric_entries(candidates))
+    except ValueError as exc:
+        if infrastructure_failure_reason is None:
+            infrastructure_failure_reason = {
+                "code": "stub_metrics_detected",
+                "message": str(exc),
+                "details": {
+                    "hint": "placeholder metrics detected; verify PoB worker configuration",
+                },
+            }
 
     valid_generation_records: list[dict[str, Any]] = []
     generation_attempt_records: list[dict[str, Any]] = []
@@ -2382,6 +2425,7 @@ def run_generation(
         "attempted": evaluation_attempted,
         "metrics_ok_count": metrics_ok_count,
         "gate_pass_count": gate_pass_count,
+        "gate_fail_count": gate_fail_count,
         "successes": metrics_ok_count,
         "failures": evaluation_failures,
         "errors": evaluation_errors,
@@ -2454,6 +2498,9 @@ def run_generation(
             "attempted": evaluation_attempted,
             "metrics_ok_count": metrics_ok_count,
             "gate_pass_count": gate_pass_count,
+            "gate_fail_count": gate_fail_count,
+            "gate_fail_reason_counts": gate_fail_reason_counts,
+            "metrics_source_counts": metrics_source_counts,
             "successes": metrics_ok_count,
             "failures": evaluation_failures,
             "errors": evaluation_errors,
@@ -2582,7 +2629,7 @@ def run_generation(
     if created_evaluator:
         evaluator.close()
     if created_repo and hasattr(repo, "close"):
-        close_repo = getattr(repo, "close")
+        close_repo = repo.close
         if callable(close_repo):
             close_repo()
     return summary

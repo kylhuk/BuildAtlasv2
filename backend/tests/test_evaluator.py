@@ -6,6 +6,7 @@ from typing import Any
 
 from backend.app.api.evaluator import BuildEvaluator
 from backend.app.api.models import BuildStatus
+from backend.engine.metrics_source import METRICS_SOURCE_POB, METRICS_SOURCE_STUB
 
 
 class FakeRepository:
@@ -61,3 +62,28 @@ def test_worker_configuration_defaults_to_settings(monkeypatch, tmp_path: Path) 
     assert evaluator._worker_args[1:] == ["--log-level", "debug"]
     assert evaluator._worker_cwd == str(project_root / "backend")
     assert evaluator._worker_pool_size == 3
+
+
+def test_metrics_source_detects_stub_from_warnings(tmp_path: Path) -> None:
+    evaluator = BuildEvaluator(repo=FakeRepository(), base_path=tmp_path)
+
+    metrics_source = evaluator._worker_payload_metrics_source(
+        {
+            "warnings": ["generation_stub_metrics"],
+        }
+    )
+
+    assert metrics_source == METRICS_SOURCE_STUB
+
+
+def test_metrics_source_preserves_pob_when_explicit(tmp_path: Path) -> None:
+    evaluator = BuildEvaluator(repo=FakeRepository(), base_path=tmp_path)
+
+    metrics_source = evaluator._worker_payload_metrics_source(
+        {
+            "metrics_source": METRICS_SOURCE_POB,
+            "warnings": [],
+        }
+    )
+
+    assert metrics_source == METRICS_SOURCE_POB

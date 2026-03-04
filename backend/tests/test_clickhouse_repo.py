@@ -2,7 +2,6 @@ from datetime import datetime
 from unittest.mock import MagicMock
 
 import pytest
-
 from clickhouse_connect.driver.exceptions import ClickHouseError
 
 from backend.app.db.ch import (

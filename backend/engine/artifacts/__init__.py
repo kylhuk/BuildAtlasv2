@@ -7,8 +7,8 @@ from .store import (
     canonical_xml_hash,
     format_ruleset_id,
     parse_ruleset_id,
-    read_build_artifacts,
     purge_build_artifacts,
+    read_build_artifacts,
     write_build_artifacts,
 )
 

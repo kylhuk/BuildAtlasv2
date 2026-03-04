@@ -87,7 +87,6 @@ DEFAULT_DESCRIPTOR_AXES: Tuple[DescriptorAxisSpec, ...] = (
 )
 
 
-
 @dataclass(frozen=True)
 class ArchiveMetrics:
     bins_filled: int

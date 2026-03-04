@@ -71,6 +71,7 @@ def _extract_max_hit_failure(
     if metrics.max_hit < thresholds.min_max_hit:
         yield GATE_REASON_MAX_HIT
 
+
 def _extract_full_dps_failure(
     metrics: NormalizedMetrics,
     thresholds: ScenarioGateThresholds,

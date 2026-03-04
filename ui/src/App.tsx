@@ -299,14 +299,16 @@ const App = () => {
   const [maxCostChaosFilter, setMaxCostChaosFilter] = useState<number | null>(null);
   const [excludeUnknownCostFilter, setExcludeUnknownCostFilter] = useState(false);
   const [priceSnapshotFilter, setPriceSnapshotFilter] = useState('');
-  const [costCalculatedRange, setCostCalculatedRange] = useState<[
-    Dayjs | null,
-    Dayjs | null,
-  ]>([null, null]);
+  const [costCalculatedRange, setCostCalculatedRange] = useState<[Dayjs | null, Dayjs | null]>([
+    null,
+    null,
+  ]);
   const [constraintStatusFilter, setConstraintStatusFilter] = useState<ConstraintStatus | ''>('');
   const [constraintReasonCodeFilter, setConstraintReasonCodeFilter] = useState('');
   const [violatedConstraintFilter, setViolatedConstraintFilter] = useState('');
-  const [constraintCheckedRange, setConstraintCheckedRange] = useState<[Dayjs | null, Dayjs | null]>([null, null]);
+  const [constraintCheckedRange, setConstraintCheckedRange] = useState<
+    [Dayjs | null, Dayjs | null]
+  >([null, null]);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
   const [sortField, setSortField] = useState<string | null>(null);
@@ -361,9 +363,9 @@ const App = () => {
   const ratioSortDisabled = !scenarioFilter.trim();
   const hasMediumSortNarrowingFilter = Boolean(
     rulesetFilter.trim() ||
-      normalizeProfileId(profileFilter) ||
-      scenarioFilter.trim() ||
-      priceSnapshotFilter.trim(),
+    normalizeProfileId(profileFilter) ||
+    scenarioFilter.trim() ||
+    priceSnapshotFilter.trim(),
   );
   const mediumPrioritySortDisabled = !hasMediumSortNarrowingFilter || pageSize > 100;
 
@@ -808,9 +810,7 @@ const App = () => {
             ) : (
               <Typography.Text type="secondary">Status unknown</Typography.Text>
             )}
-            {reason && (
-              <Typography.Text type="secondary">{reason}</Typography.Text>
-            )}
+            {reason && <Typography.Text type="secondary">{reason}</Typography.Text>}
             {violations.length ? (
               <Typography.Text type="secondary">
                 {violations.length} violation
@@ -1035,9 +1035,8 @@ const App = () => {
         : undefined;
 
   const detailConstraintEvaluation = detail?.constraints?.evaluation ?? null;
-  const detailConstraintStatus = (
-    detailConstraintEvaluation?.status ?? detail?.build.constraint_status
-  ) as ConstraintStatus | undefined;
+  const detailConstraintStatus = (detailConstraintEvaluation?.status ??
+    detail?.build.constraint_status) as ConstraintStatus | undefined;
   const detailConstraintReason =
     detailConstraintEvaluation?.reason_code ?? detail?.build.constraint_reason_code ?? null;
   const detailConstraintCheckedAt =
@@ -1046,9 +1045,9 @@ const App = () => {
     detailConstraintEvaluation?.violated_constraints ?? detail?.build.violated_constraints ?? [];
   const hasConstraintMetadata = Boolean(
     detailConstraintStatus ||
-      detailConstraintReason ||
-      detailConstraintCheckedAt ||
-      detailViolatedConstraints.length,
+    detailConstraintReason ||
+    detailConstraintCheckedAt ||
+    detailViolatedConstraints.length,
   );
 
   useEffect(() => {
@@ -1148,7 +1147,6 @@ const App = () => {
     }
   };
 
-
   useEffect(() => {
     refreshModelOpsStatus();
     refreshInventoryStats();
@@ -1242,7 +1240,8 @@ const App = () => {
       ? gateTrend[gateTrend.length - 1].mean
       : null;
   const latestDiversityTrend =
-    diversityTrend.length > 0 && typeof diversityTrend[diversityTrend.length - 1]?.unique_main_skills === 'number'
+    diversityTrend.length > 0 &&
+    typeof diversityTrend[diversityTrend.length - 1]?.unique_main_skills === 'number'
       ? diversityTrend[diversityTrend.length - 1].unique_main_skills
       : null;
 
@@ -1399,14 +1398,18 @@ const App = () => {
             />
             <DatePicker.RangePicker
               value={costCalculatedRange}
-              onChange={(value) => setCostCalculatedRange((value as [Dayjs | null, Dayjs | null]) ?? [null, null])}
+              onChange={(value) =>
+                setCostCalculatedRange((value as [Dayjs | null, Dayjs | null]) ?? [null, null])
+              }
               showTime
             />
             <Select
               allowClear
               placeholder="Constraint status"
               value={constraintStatusFilter || undefined}
-              onChange={(value) => setConstraintStatusFilter((value ?? '') as ConstraintStatus | '')}
+              onChange={(value) =>
+                setConstraintStatusFilter((value ?? '') as ConstraintStatus | '')
+              }
               options={constraintStatusOptions}
               style={{ minWidth: 160 }}
             />
@@ -1464,8 +1467,8 @@ const App = () => {
           )}
           {mediumPrioritySortDisabled && (
             <Typography.Text type="secondary">
-              Cost-oriented sorts require a narrowing filter (ruleset/profile/scenario/snapshot)
-              and page size of 100 or less.
+              Cost-oriented sorts require a narrowing filter (ruleset/profile/scenario/snapshot) and
+              page size of 100 or less.
             </Typography.Text>
           )}
           {buildError && (
@@ -1681,12 +1684,7 @@ const App = () => {
           </Form>
           {generationResult && (
             <div className="generation-card__result">
-              <Descriptions
-                column={2}
-                size="small"
-                bordered
-                className="generation-card__summary"
-              >
+              <Descriptions column={2} size="small" bordered className="generation-card__summary">
                 <Descriptions.Item label="Run ID">{generationResult.run_id}</Descriptions.Item>
                 <Descriptions.Item label="Status">{generationResult.status}</Descriptions.Item>
                 <Descriptions.Item label="Requested">
@@ -1765,18 +1763,10 @@ const App = () => {
                 />
                 <Typography.Text type="secondary">Endless loop</Typography.Text>
               </Space>
-              <Button
-                type="primary"
-                loading={mlLoopActionLoading}
-                onClick={handleMLLoopStart}
-              >
+              <Button type="primary" loading={mlLoopActionLoading} onClick={handleMLLoopStart}>
                 Start loop
               </Button>
-              <Button
-                type="default"
-                loading={mlLoopActionLoading}
-                onClick={handleMLLoopStop}
-              >
+              <Button type="default" loading={mlLoopActionLoading} onClick={handleMLLoopStop}>
                 Stop loop
               </Button>
             </Space>
@@ -1841,7 +1831,8 @@ const App = () => {
                   <Space wrap>
                     <Tag color="processing">Loop: {mlLoopStatus.loop_id}</Tag>
                     <Tag>
-                      Iteration: {mlLoopStatus.iteration ?? 0} / {mlLoopStatus.total_iterations ?? '?'}
+                      Iteration: {mlLoopStatus.iteration ?? 0} /{' '}
+                      {mlLoopStatus.total_iterations ?? '?'}
                     </Tag>
                     {mlImproved !== null && (
                       <Tag color={mlImproved ? 'green' : 'volcano'}>
@@ -1869,7 +1860,9 @@ const App = () => {
                       </Tag>
                     )}
                     {latestDiversityTrend !== null && (
-                      <Tag color="purple">Unique main skills: {Math.round(latestDiversityTrend)}</Tag>
+                      <Tag color="purple">
+                        Unique main skills: {Math.round(latestDiversityTrend)}
+                      </Tag>
                     )}
                   </Space>
                   {Object.keys(mlMaeDeltas).length ? (
@@ -1913,7 +1906,9 @@ const App = () => {
               )}
             </>
           ) : (
-            <Typography.Text type="secondary">Model operations data is not available.</Typography.Text>
+            <Typography.Text type="secondary">
+              Model operations data is not available.
+            </Typography.Text>
           )}
         </Card>
         <Card variant="borderless" className="archive-card">
@@ -2039,7 +2034,9 @@ const App = () => {
                           ))}
                         </Space>
                       ) : (
-                        <Typography.Text type="secondary">Tradeoff metadata unavailable.</Typography.Text>
+                        <Typography.Text type="secondary">
+                          Tradeoff metadata unavailable.
+                        </Typography.Text>
                       )}
                     </Descriptions.Item>
                     <Descriptions.Item label="Artifact links">
@@ -2057,7 +2054,9 @@ const App = () => {
                           ))}
                         </Space>
                       ) : (
-                        <Typography.Text type="secondary">No artifact links recorded.</Typography.Text>
+                        <Typography.Text type="secondary">
+                          No artifact links recorded.
+                        </Typography.Text>
                       )}
                     </Descriptions.Item>
                   </Descriptions>
@@ -2138,12 +2137,16 @@ const App = () => {
                     {(compositionIdentity?.class as string | undefined) ?? detail.build.class_}
                   </Descriptions.Item>
                   <Descriptions.Item label="Ascendancy">
-                    {(compositionIdentity?.ascendancy as string | undefined) ?? detail.build.ascendancy}
+                    {(compositionIdentity?.ascendancy as string | undefined) ??
+                      detail.build.ascendancy}
                   </Descriptions.Item>
                   <Descriptions.Item label="Main skill">
-                    {(compositionIdentity?.main_skill as string | undefined) ?? detail.build.main_skill}
+                    {(compositionIdentity?.main_skill as string | undefined) ??
+                      detail.build.main_skill}
                   </Descriptions.Item>
-                  <Descriptions.Item label="Items captured">{compositionItems.length}</Descriptions.Item>
+                  <Descriptions.Item label="Items captured">
+                    {compositionItems.length}
+                  </Descriptions.Item>
                   <Descriptions.Item label="Gem groups captured">
                     {compositionGemGroups.length}
                   </Descriptions.Item>
@@ -2552,7 +2555,11 @@ const App = () => {
         onCancel={handleCloseXmlViewer}
         width={800}
         footer={[
-          <Button key="download" icon={<DownloadOutlined />} onClick={() => detail && handleDownloadXml(detail.build.build_id)}>
+          <Button
+            key="download"
+            icon={<DownloadOutlined />}
+            onClick={() => detail && handleDownloadXml(detail.build.build_id)}
+          >
             Download
           </Button>,
           <Button key="close" type="primary" onClick={handleCloseXmlViewer}>
@@ -2566,14 +2573,16 @@ const App = () => {
             <Spin />
           </div>
         ) : xmlViewerContent ? (
-          <pre style={{ 
-            maxHeight: 500, 
-            overflow: 'auto', 
-            backgroundColor: '#f5f5f5', 
-            padding: 12, 
-            fontSize: 11,
-            fontFamily: 'monospace'
-          }}>
+          <pre
+            style={{
+              maxHeight: 500,
+              overflow: 'auto',
+              backgroundColor: '#f5f5f5',
+              padding: 12,
+              fontSize: 11,
+              fontFamily: 'monospace',
+            }}
+          >
             {xmlViewerContent}
           </pre>
         ) : (

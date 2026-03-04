@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     clickhouse_user: str = "default"
     clickhouse_password: str = ""
     clickhouse_db: str = "default"
+    clickhouse_query_timeout_seconds: int = 30
     data_path: Path = Path("data")
     pob_path: Path = Path("PathOfBuilding")
     backend_port: int = 8000

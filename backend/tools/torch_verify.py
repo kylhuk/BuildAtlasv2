@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import sys
-
-
 if __name__ == "__main__":
     try:
         import torch
     except ModuleNotFoundError:
         print("Torch is not installed in the backend environment.")
         print("Run 'make torch-install-cpu' or 'make torch-install-cuda' first.")
-        raise SystemExit(1)
+        raise SystemExit(1) from None
 
     print(f"torch.__version__: {torch.__version__}")
     cuda_available = torch.cuda.is_available()

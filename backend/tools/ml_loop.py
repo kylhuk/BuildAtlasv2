@@ -6,10 +6,10 @@ import hashlib
 import json
 import logging
 import math
+import re
 import statistics
 import tarfile
 import tempfile
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
@@ -19,9 +19,9 @@ from backend.app.api.evaluator import BuildEvaluator
 from backend.app.db.ch import ClickhouseRepository
 from backend.app.settings import settings
 from backend.engine.generation.runner import (
-    run_generation,
-    load_run_summary,
     _run_summary_path,
+    load_run_summary,
+    run_generation,
 )
 from backend.engine.ruleset import (
     DEFAULT_PRICE_SNAPSHOT_ID,
@@ -621,7 +621,11 @@ def start_loop(args: argparse.Namespace) -> int:
         iterations_path.write_text("", encoding="utf-8")
     state_path = loop_root / STATE_FILENAME
 
-    constraints = _load_constraints(args.constraints_file)
+    try:
+        constraints = _load_constraints(args.constraints_file)
+    except Exception as exc:
+        logger.error("ml loop %s constraints load failed: %s", loop_id, exc)
+        constraints = None
     ruleset_id = _resolve_ruleset_id(args)
 
     profile_id = str(getattr(args, "profile_id", "pinnacle"))
@@ -660,13 +664,34 @@ def start_loop(args: argparse.Namespace) -> int:
     start_iteration = completed_iterations + 1
     state_exists = state_path.exists()
     if state_exists:
-        state = _load_state(state_path)
+        try:
+            state = _load_state(state_path)
+        except Exception as exc:
+            logger.error("ml loop %s state load failed, rebuilding state: %s", loop_id, exc)
+            backup_path = state_path.with_suffix(".corrupt.json")
+            try:
+                state_path.replace(backup_path)
+            except OSError as backup_exc:
+                logger.warning(
+                    "ml loop %s unable to preserve corrupt state file %s: %s",
+                    loop_id,
+                    state_path,
+                    backup_exc,
+                )
+            state = _build_initial_state(loop_id, total_iterations, args.seed_start, generate_count)
+            _write_state(state_path, state)
+            state_exists = False
     else:
         state = _build_initial_state(loop_id, total_iterations, args.seed_start, generate_count)
         _write_state(state_path, state)
 
     _ensure_seed_metadata(state_path, state, args)
-    state = _load_state(state_path)
+    try:
+        state = _load_state(state_path)
+    except Exception as exc:
+        logger.error(
+            "ml loop %s state reload failed, continuing with in-memory state: %s", loop_id, exc
+        )
     target_text = "endless" if total_iterations is None else str(total_iterations)
     _log_loop_phase(
         loop_id,
@@ -765,7 +790,8 @@ def start_loop(args: argparse.Namespace) -> int:
                     surrogate_model = load_model(active_surrogate_model_path)
                 except Exception as exc:
                     logger.warning(
-                        "ml loop %s iteration %d surrogate model load failed for %s; falling back to path-based loading: %s",
+                        "ml loop %s iteration %d surrogate model load failed for %s; "
+                        "falling back to path-based loading: %s",
                         loop_id,
                         iteration,
                         active_surrogate_model_path,
@@ -2343,7 +2369,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--surrogate-top-k",
         type=int,
         default=None,
-        help="Number of surrogate-ranked candidates to keep when a surrogate is available (default=resolved evaluation budget; <=0 disables pruning)",
+        help=(
+            "Number of surrogate-ranked candidates to keep when a surrogate is "
+            "available (default=resolved evaluation budget; <=0 disables pruning)"
+        ),
     )
     start_parser.add_argument(
         "--surrogate-exploration-pct",

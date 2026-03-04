@@ -3,6 +3,7 @@ import itertools
 import json
 import logging
 import queue
+import random
 import subprocess
 import threading
 import time
@@ -14,6 +15,10 @@ DEFAULT_WORKER_CMD: Sequence[str] = ("luajit", "backend/pob_worker/pob_worker.lu
 
 WORKER_TERMINATED_ERROR_CODE = -32000
 WORKER_PROTOCOL_ERROR_CODE = -32001
+WORKER_RETRY_COUNT = 2
+WORKER_RETRY_BASE_DELAY_SECONDS = 0.05
+WORKER_RETRY_MAX_DELAY_SECONDS = 0.5
+WORKER_RETRY_JITTER_SECONDS = 0.02
 
 logger = logging.getLogger(__name__)
 
@@ -415,14 +420,36 @@ class WorkerPool:
     def _send_with_retries(self, worker_idx: int, payload: Any) -> Dict[str, Any]:
         worker = self._workers[worker_idx]
         last_exc: Optional[Exception] = None
-        for _ in range(2):
+        for attempt in range(WORKER_RETRY_COUNT + 1):
             try:
                 return worker.send_request("evaluate", payload)
             except (WorkerTimeoutError, WorkerCrashedError, WorkerProtocolError) as exc:
                 last_exc = exc
+                if attempt >= WORKER_RETRY_COUNT:
+                    break
+                backoff = self._retry_backoff_delay(attempt)
+                logger.warning(
+                    (
+                        "worker pool request failed worker_idx=%d attempt=%d/%d "
+                        "retry_in=%.3fs error=%s"
+                    ),
+                    worker_idx,
+                    attempt + 1,
+                    WORKER_RETRY_COUNT + 1,
+                    backoff,
+                    exc,
+                )
                 worker = self._restart_worker(worker_idx)
+                time.sleep(backoff)
         assert last_exc is not None
         raise last_exc
+
+    @staticmethod
+    def _retry_backoff_delay(attempt: int) -> float:
+        base_delay = WORKER_RETRY_BASE_DELAY_SECONDS * (2 ** max(0, attempt))
+        capped_delay = min(WORKER_RETRY_MAX_DELAY_SECONDS, base_delay)
+        jitter = random.uniform(0.0, WORKER_RETRY_JITTER_SECONDS)
+        return capped_delay + jitter
 
     def _restart_worker(self, idx: int) -> WorkerProcess:
         with self._workers_lock:

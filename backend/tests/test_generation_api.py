@@ -7,8 +7,6 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from backend.engine.generation import runner as generation_runner
-
 from fastapi.testclient import TestClient
 
 from backend.app.api.evaluator import BuildEvaluator
@@ -19,6 +17,7 @@ from backend.app.main import (
     get_build_evaluator,
     get_repository,
 )
+from backend.engine.generation import runner as generation_runner
 
 
 def _ruleset_id() -> str:
@@ -140,7 +139,8 @@ def test_generation_endpoints(tmp_path: Path) -> None:
         assert "ml_lifecycle" in body
         assert not body["ml_lifecycle"]["enabled"]
         assert body["ml_lifecycle"]["metadata"]["error"] == "surrogate disabled"
-        build_id = data["generation"]["records"][0]["build_id"]
+        record_source = data["generation"]["records"] or data["generation"]["attempt_records"]
+        build_id = record_source[0]["build_id"]
         build_detail_response = client.get(f"/builds/{build_id}")
         assert build_detail_response.status_code == 200
         build_detail_body = build_detail_response.json()
@@ -283,7 +283,8 @@ def test_generation_constraints_round_trip(tmp_path: Path) -> None:
         data = response.json()
         assert data["parameters"]["constraints"] == constraints_payload
         assert data["constraints"] == constraints_payload
-        build_id = data["generation"]["records"][0]["build_id"]
+        record_source = data["generation"]["records"] or data["generation"]["attempt_records"]
+        build_id = record_source[0]["build_id"]
         build_detail_response = client.get(f"/builds/{build_id}")
         assert build_detail_response.status_code == 200
         detail_body = build_detail_response.json()

@@ -116,9 +116,7 @@ def test_model_ops_status_prefers_ml_loop_meta(tmp_path: Path) -> None:
             "trained_at_utc": "2025-06-01T00:00:00Z",
             "record": {"version": "loop"},
         }
-        loop_meta_path = (
-            tmp_path / "ml_loops" / "loop-alpha" / "models" / "ops" / "model_meta.json"
-        )
+        loop_meta_path = tmp_path / "ml_loops" / "loop-alpha" / "models" / "ops" / "model_meta.json"
         loop_meta_path.parent.mkdir(parents=True, exist_ok=True)
         loop_meta_path.write_text(json.dumps(loop_meta), encoding="utf-8")
 
@@ -152,7 +150,6 @@ def test_model_ops_status_metadata_empty_after_sanitization(tmp_path: Path) -> N
         assert payload["warnings"] == []
     finally:
         _close_client(client)
-
 
 
 def test_model_ops_status_malformed_json(tmp_path: Path) -> None:

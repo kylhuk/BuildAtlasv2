@@ -30,7 +30,7 @@ _COMPARATORS: Mapping[ConstraintOperator, Callable[[float, float], bool]] = {
 
 def _normalize_metric_path(value: Any) -> tuple[str, ...]:
     if isinstance(value, str):
-        parts = [segment.strip() for segment in value.split('.') if segment.strip()]
+        parts = [segment.strip() for segment in value.split(".") if segment.strip()]
         if not parts:
             raise ValueError("metric_path must include at least one segment")
         return tuple(parts)

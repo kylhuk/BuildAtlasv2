@@ -56,7 +56,6 @@ def test_emitters_and_allocator():
     assert emitters[2].select(entries, allocation["uncertainty"]) == []
 
 
-
 def test_default_descriptor_axes_use_log_damage_and_max_hit():
     store = ArchiveStore()
     assert store.axes[0].metric_key == "full_dps"
@@ -79,4 +78,3 @@ def test_high_dps_values_fill_multiple_damage_bins():
     assert len(entries) == len(dps_values)
     damage_bins = {entry.bin_key.split("-")[0] for entry in entries}
     assert len(damage_bins) == len(dps_values)
-

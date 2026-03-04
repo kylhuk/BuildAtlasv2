@@ -13,6 +13,7 @@ METRICS_SOURCE_VALUES = {
     METRICS_SOURCE_FALLBACK,
 }
 
+
 def normalize_metrics_source(value: Any | None, default: str | None = None) -> str | None:
     """Normalize arbitrary input to a known metrics source string."""
 
@@ -20,6 +21,7 @@ def normalize_metrics_source(value: Any | None, default: str | None = None) -> s
         return default
     candidate = value.strip().lower()
     return candidate if candidate in METRICS_SOURCE_VALUES else default
+
 
 def default_pob_source(value: Any | None) -> str:
     """Normalize metrics source with a default of PoB."""

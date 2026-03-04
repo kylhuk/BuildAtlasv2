@@ -148,7 +148,6 @@ def test_gate_evaluation_passes_and_reports_failure_reasons():
     assert GATE_REASON_RESERVATION in failure_reasons
 
 
-
 def test_uber_pinnacle_full_dps_gate():
     template = load_template("uber_pinnacle", "v0")
     assert template.gate_thresholds.min_full_dps == 2000000.0
@@ -174,7 +173,9 @@ def test_uber_pinnacle_full_dps_gate():
 
     passing_payload = copy.deepcopy(base_payload)
     passing_payload["metrics"]["full_dps"] = template.gate_thresholds.min_full_dps + 1000
-    passing_evaluation = evaluate_gates(map_worker_output(passing_payload), template.gate_thresholds)
+    passing_evaluation = evaluate_gates(
+        map_worker_output(passing_payload), template.gate_thresholds
+    )
     assert passing_evaluation.gate_pass
 
 

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import gzip
 import json
-import shutil
 import re
+import shutil
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from hashlib import sha256
@@ -81,6 +81,7 @@ def purge_build_artifacts(build_id: str, base_path: Optional[Union[str, Path]] =
     if not build_dir.exists():
         return
     shutil.rmtree(build_dir, ignore_errors=True)
+
 
 def artifact_paths(build_id: str, base_path: Optional[Union[str, Path]] = None) -> ArtifactPaths:
     base_dir = _safe_build_dir(build_id, base_path)
@@ -212,7 +213,6 @@ def write_build_constraints(
     content = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
     _atomic_write_bytes(paths.constraints, content)
     return paths.constraints
-
 
 
 def _read_optional_json(path: Path) -> Optional[Any]:

@@ -9,8 +9,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from backend.app.api.evaluator import BuildEvaluator, EvaluationProvenance
 from backend.app.api.errors import APIError
+from backend.app.api.evaluator import BuildEvaluator, EvaluationProvenance
 from backend.app.db.ch import BuildInsertPayload, ScenarioMetricRow
 from backend.engine.archive import load_archive_artifact
 from backend.engine.artifacts.store import read_build_artifacts
@@ -283,6 +283,7 @@ def test_generation_completes_when_metrics_ok_but_no_gate_pass(tmp_path: Path) -
     assert summary["evaluation"]["successes"] == summary["evaluation"]["attempted"]
     assert summary["evaluation"]["metrics_ok_count"] == summary["evaluation"]["attempted"]
     assert summary["evaluation"]["gate_pass_count"] == 0
+    assert summary["evaluation"]["gate_fail_count"] == summary["evaluation"]["attempted"]
     assert summary["evaluation"]["failures"] == 0
     assert summary["evaluation"]["errors"] == 0
     scenarios = summary["benchmark"]["scenarios"]
@@ -295,6 +296,118 @@ def test_generation_completes_when_metrics_ok_but_no_gate_pass(tmp_path: Path) -
     assert all(record.get("persisted") is True for record in attempt_records)
     assert all(record.get("evaluation_status") == "evaluated" for record in attempt_records)
     assert all(record.get("gate_pass") is False for record in attempt_records)
+
+
+def test_generation_uses_settings_worker_config_when_evaluator_not_provided(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = FakeRepository()
+    monkeypatch.setattr(generation_runner.settings, "pob_worker_cmd", "luajit-custom")
+    monkeypatch.setattr(
+        generation_runner.settings,
+        "pob_worker_args",
+        "backend/pob_worker/pob_worker.lua --trace",
+    )
+    monkeypatch.setattr(generation_runner.settings, "pob_worker_cwd", "PathOfBuilding/src")
+    monkeypatch.setattr(generation_runner.settings, "pob_worker_pool_size", 7)
+
+    evaluator_instance = Mock()
+
+    def _evaluate_build(
+        build_id: str,
+    ) -> tuple[generation_runner.BuildStatus, list[ScenarioMetricRow]]:
+        row = ScenarioMetricRow(
+            build_id=build_id,
+            ruleset_id=_ruleset_id(),
+            scenario_id="pinnacle_boss",
+            gate_pass=True,
+            gate_fail_reasons=[],
+            pob_warnings=[],
+            evaluated_at=datetime.now(UTC),
+            full_dps=2200.0,
+            max_hit=3200.0,
+            armour=1000.0,
+            evasion=500.0,
+            life=4000.0,
+            mana=700.0,
+            utility_score=44.0,
+            metrics_source="pob",
+        )
+        return generation_runner.BuildStatus.evaluated, [row]
+
+    evaluator_instance.evaluate_build.side_effect = _evaluate_build
+    evaluator_instance.pop_last_evaluation_provenance.return_value = None
+
+    with patch.object(generation_runner, "BuildEvaluator", return_value=evaluator_instance) as ctor:
+        summary = generation_runner.run_generation(
+            count=1,
+            seed_start=44,
+            ruleset_id=_ruleset_id(),
+            profile_id="pinnacle",
+            base_path=tmp_path,
+            repo=repo,
+            evaluator=None,
+            run_id="settings-evaluator-run",
+            metrics_generator=_verified_metrics_generator,
+        )
+
+    assert summary["status"] == "completed"
+    kwargs = ctor.call_args.kwargs
+    assert kwargs["worker_cmd"] == "luajit-custom"
+    assert kwargs["worker_args"] == "backend/pob_worker/pob_worker.lua --trace"
+    assert kwargs["worker_cwd"] == "PathOfBuilding/src"
+    assert kwargs["worker_pool_size"] == 7
+    evaluator_instance.close.assert_called_once()
+
+
+def test_stub_tripwire_detects_placeholder_metrics_when_gate_fails(tmp_path: Path) -> None:
+    repo = FakeRepository()
+    evaluator = _fake_evaluator(tmp_path, repo)
+    call_count = 0
+    seed_start = 90
+
+    def _evaluate_build(
+        build_id: str,
+    ) -> tuple[generation_runner.BuildStatus, list[ScenarioMetricRow]]:
+        nonlocal call_count
+        call_count += 1
+        seed = seed_start + call_count - 1
+        row = ScenarioMetricRow(
+            build_id=build_id,
+            ruleset_id=_ruleset_id(),
+            scenario_id="pinnacle_boss",
+            gate_pass=False,
+            gate_fail_reasons=["min_max_hit"],
+            pob_warnings=[],
+            evaluated_at=datetime.now(UTC),
+            full_dps=float(120 * seed),
+            max_hit=float(4500 + 2 * seed),
+            armour=1000.0,
+            evasion=500.0,
+            life=4000.0,
+            mana=700.0,
+            utility_score=0.0,
+            metrics_source="pob",
+        )
+        return generation_runner.BuildStatus.evaluated, [row]
+
+    with patch.object(evaluator, "evaluate_build", side_effect=_evaluate_build):
+        summary = generation_runner.run_generation(
+            count=4,
+            seed_start=seed_start,
+            ruleset_id=_ruleset_id(),
+            profile_id="pinnacle",
+            base_path=tmp_path,
+            repo=repo,
+            evaluator=evaluator,
+            run_id="stub-tripwire-gate-fail",
+            metrics_generator=_verified_metrics_generator,
+        )
+
+    assert summary["status"] == "failed"
+    reason = summary.get("status_reason")
+    assert reason is not None
+    assert reason["code"] == "stub_metrics_detected"
 
 
 def test_generation_aborts_on_evaluation_infrastructure_error(tmp_path: Path) -> None:
