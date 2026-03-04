@@ -707,15 +707,15 @@ def _retrain_surrogate_if_needed(
 ) -> tuple[bool, str | None]:
     """
     Check if surrogate should be retrained based on evaluation count.
-    
+
     Returns: (was_retrained, new_model_path)
     """
     eval_count = _coerce_int(state.get("online_learning_eval_count")) or 0
     last_retrain_iteration = _coerce_int(state.get("online_learning_last_retrain_iteration")) or 0
-    
+
     if eval_count < ONLINE_LEARNING_EVAL_THRESHOLD:
         return False, None
-    
+
     # Time to retrain
     _log_loop_phase(
         loop_id,
@@ -723,7 +723,7 @@ def _retrain_surrogate_if_needed(
         iteration=iteration,
         detail=f"eval_count={eval_count} threshold={ONLINE_LEARNING_EVAL_THRESHOLD}",
     )
-    
+
     try:
         # Use all historical data for retraining
         snapshot_id = f"online-learning-iter-{iteration:04d}"
@@ -736,7 +736,7 @@ def _retrain_surrogate_if_needed(
             profile_id=None,
             scenario_id=None,
         )
-        
+
         if snapshot.row_count <= 0:
             _log_loop_phase(
                 loop_id,
@@ -745,7 +745,7 @@ def _retrain_surrogate_if_needed(
                 detail="no data available for retraining",
             )
             return False, None
-        
+
         # Train new model with all historical data
         model_id = f"{loop_id}-online-learning-{iteration:04d}"
         train_result = train(
@@ -756,18 +756,17 @@ def _retrain_surrogate_if_needed(
             split_mod=VAL_SPLIT_MOD,
             split_remainder=VAL_SPLIT_REMAINDER,
         )
-        
+
         elapsed = max(0.0, monotonic() - retrain_started_at)
         _log_loop_phase(
             loop_id,
             "online_learning_complete",
             iteration=iteration,
             detail=(
-                f"model_id={train_result.model_id} rows={snapshot.row_count} "
-                f"elapsed={elapsed:.1f}s"
+                f"model_id={train_result.model_id} rows={snapshot.row_count} elapsed={elapsed:.1f}s"
             ),
         )
-        
+
         # Reset eval counter and update state
         _persist_state(
             state_path,
@@ -775,9 +774,9 @@ def _retrain_surrogate_if_needed(
             online_learning_eval_count=0,
             online_learning_last_retrain_iteration=iteration,
         )
-        
+
         return True, str(train_result.model_path)
-    
+
     except Exception as exc:
         logger.warning(
             "ml loop %s iteration %d online learning retrain failed: %s",
@@ -936,17 +935,17 @@ def start_loop(args: argparse.Namespace) -> int:
     current_run_id: str | None = None
     iteration_seed_start: int | None = None
     try:
-         repo = ClickhouseRepository()
-         evaluator = BuildEvaluator(repo=repo, base_path=data_root)
-         evaluator.require_worker_metrics_for_profile(profile_id)
-         evaluator.require_non_stub_metrics_for_profile(profile_id)
-         # Initialize ME-MAP-Elites archive for QD
-         archive = ArchiveStore()
-         _log_loop_phase(
-             loop_id,
-             "archive_initialized",
-             detail=f"axes={len(archive.axes)} total_bins={archive.total_bins}",
-         )
+        repo = ClickhouseRepository()
+        evaluator = BuildEvaluator(repo=repo, base_path=data_root)
+        evaluator.require_worker_metrics_for_profile(profile_id)
+        evaluator.require_non_stub_metrics_for_profile(profile_id)
+        # Initialize ME-MAP-Elites archive for QD
+        archive = ArchiveStore()
+        _log_loop_phase(
+            loop_id,
+            "archive_initialized",
+            detail=f"axes={len(archive.axes)} total_bins={archive.total_bins}",
+        )
         while True:
             if total_iterations is not None and iteration > total_iterations:
                 break
@@ -1043,83 +1042,85 @@ def start_loop(args: argparse.Namespace) -> int:
                 }
                 for e in gate_evals_raw
             ]
-             run_summary.update(generate_run_summary(gate_evaluations))
+            run_summary.update(generate_run_summary(gate_evaluations))
 
-             _log_loop_phase(
-                 loop_id,
-                 "generation_complete",
-                 iteration=iteration,
-                 detail=(
-                     f"run_id={run_summary.get('run_id')} status={run_summary.get('status')} "
-                     f"verified={run_summary.get('evaluation', {}).get('successes')} "
-                     f"elapsed={max(0.0, monotonic() - generation_started_at):.1f}s"
-                 ),
-             )
-             status_reason = _as_dict(run_summary.get("status_reason"))
-             evaluation_summary = _as_dict(run_summary.get("evaluation"))
-             attempted_count = _coerce_int(evaluation_summary.get("attempted")) or 0
-             verified_count = _coerce_int(evaluation_summary.get("successes")) or 0
-             
-             # TASK 3.4: Update archive with verified builds
-             if archive is not None and verified_count > 0:
-                 candidates_data = run_summary.get("candidates", [])
-                 archive_updated_count = 0
-                 for candidate_data in candidates_data:
-                     if not isinstance(candidate_data, Mapping):
-                         continue
-                     # Only add verified builds to archive
-                     if not candidate_data.get("selected_for_evaluation"):
-                         continue
-                     if candidate_data.get("evaluation_status") != "verified":
-                         continue
-                     
-                     build_id = candidate_data.get("build_id")
-                     metrics_payload = candidate_data.get("verified_metrics_payload")
-                     if not build_id or not isinstance(metrics_payload, Mapping):
-                         continue
-                     
-                     # Extract behavior characteristics (BCs) from metrics
-                     score = score_from_metrics(metrics_payload)
-                     descriptor = descriptor_values_from_metrics(metrics_payload, archive.axes)
-                     
-                     # Add metadata for tracking
-                     metadata = {
-                         "iteration": iteration,
-                         "run_id": current_run_id,
-                         "main_skill": candidate_data.get("main_skill_package"),
-                         "class_name": candidate_data.get("class_name"),
-                         "ascendancy": candidate_data.get("ascendancy"),
-                     }
-                     
-                     # Insert into archive (returns True if inserted/replaced)
-                     if archive.insert(build_id, score=score, descriptor=descriptor, metadata=metadata):
-                         archive_updated_count += 1
-                 
-                 if archive_updated_count > 0:
-                     _log_loop_phase(
-                         loop_id,
-                         "archive_updated",
-                         iteration=iteration,
-                         detail=(
-                             f"added={archive_updated_count} "
-                             f"coverage={archive.metrics().coverage:.2%} "
-                             f"qd_score={archive.metrics().qd_score:.1f}"
-                         ),
-                     )
-                     # Persist archive to disk
-                     try:
-                         persist_archive(
-                             run_id=current_run_id or f"{loop_id}-iter-{iteration:04d}",
-                             store=archive,
-                             base_path=data_root,
-                         )
-                     except Exception as exc:
-                         logger.warning(
-                             "ml loop %s iteration %d failed to persist archive: %s",
-                             loop_id,
-                             iteration,
-                             exc,
-                         )
+            _log_loop_phase(
+                loop_id,
+                "generation_complete",
+                iteration=iteration,
+                detail=(
+                    f"run_id={run_summary.get('run_id')} status={run_summary.get('status')} "
+                    f"verified={run_summary.get('evaluation', {}).get('successes')} "
+                    f"elapsed={max(0.0, monotonic() - generation_started_at):.1f}s"
+                ),
+            )
+            status_reason = _as_dict(run_summary.get("status_reason"))
+            evaluation_summary = _as_dict(run_summary.get("evaluation"))
+            attempted_count = _coerce_int(evaluation_summary.get("attempted")) or 0
+            verified_count = _coerce_int(evaluation_summary.get("successes")) or 0
+
+            # TASK 3.4: Update archive with verified builds
+            if archive is not None and verified_count > 0:
+                candidates_data = run_summary.get("candidates", [])
+                archive_updated_count = 0
+                for candidate_data in candidates_data:
+                    if not isinstance(candidate_data, Mapping):
+                        continue
+                    # Only add verified builds to archive
+                    if not candidate_data.get("selected_for_evaluation"):
+                        continue
+                    if candidate_data.get("evaluation_status") != "verified":
+                        continue
+
+                    build_id = candidate_data.get("build_id")
+                    metrics_payload = candidate_data.get("verified_metrics_payload")
+                    if not build_id or not isinstance(metrics_payload, Mapping):
+                        continue
+
+                    # Extract behavior characteristics (BCs) from metrics
+                    score = score_from_metrics(metrics_payload)
+                    descriptor = descriptor_values_from_metrics(metrics_payload, archive.axes)
+
+                    # Add metadata for tracking
+                    metadata = {
+                        "iteration": iteration,
+                        "run_id": current_run_id,
+                        "main_skill": candidate_data.get("main_skill_package"),
+                        "class_name": candidate_data.get("class_name"),
+                        "ascendancy": candidate_data.get("ascendancy"),
+                    }
+
+                    # Insert into archive (returns True if inserted/replaced)
+                    if archive.insert(
+                        build_id, score=score, descriptor=descriptor, metadata=metadata
+                    ):
+                        archive_updated_count += 1
+
+                if archive_updated_count > 0:
+                    _log_loop_phase(
+                        loop_id,
+                        "archive_updated",
+                        iteration=iteration,
+                        detail=(
+                            f"added={archive_updated_count} "
+                            f"coverage={archive.metrics().coverage:.2%} "
+                            f"qd_score={archive.metrics().qd_score:.1f}"
+                        ),
+                    )
+                    # Persist archive to disk
+                    try:
+                        persist_archive(
+                            run_id=current_run_id or f"{loop_id}-iter-{iteration:04d}",
+                            store=archive,
+                            base_path=data_root,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "ml loop %s iteration %d failed to persist archive: %s",
+                            loop_id,
+                            iteration,
+                            exc,
+                        )
             failures_count = _coerce_int(evaluation_summary.get("failures")) or 0
             errors_count = _coerce_int(evaluation_summary.get("errors")) or 0
             worker_metrics_used_count = (
@@ -1390,49 +1391,49 @@ def start_loop(args: argparse.Namespace) -> int:
             checkpoint_path = _iteration_checkpoint_path(loop_root, iteration)
             checkpoint_path.write_text(json.dumps(record), encoding="utf-8")
             print(json.dumps(record))
-             # Update online learning eval counter
-             current_eval_count = _coerce_int(state.get("online_learning_eval_count")) or 0
-             new_eval_count = current_eval_count + verified_count
-             
-             _persist_state(
-                 state_path,
-                 state,
-                 phase="idle",
-                 iteration=iteration,
-                 last_model_id=promoted_model_id,
-                 last_model_path=promoted_model_path,
-                 last_improvement=improvement,
-                 last_error=None,
-                 last_iteration_outcome="completed",
-                 last_skip_reason_code=None,
-                 last_skip_reason_message=None,
-                 failed_iteration=None,
-                 failed_phase=None,
-                 failed_at_utc=None,
-                 last_failure_checkpoint_path=None,
-                 online_learning_eval_count=new_eval_count,
-             )
-             
-             # Check if online learning retrain is needed
-             state = _load_state(state_path)
-             was_retrained, new_model_path = _retrain_surrogate_if_needed(
-                 state=state,
-                 state_path=state_path,
-                 loop_id=loop_id,
-                 iteration=iteration,
-                 snapshots_root=snapshots_root,
-                 models_root=models_root,
-                 args=args,
-             )
-             if was_retrained and new_model_path:
-                 _persist_state(
-                     state_path,
-                     state,
-                     last_model_path=new_model_path,
-                 )
-             
-             _log_loop_phase(loop_id, "idle", iteration=iteration, detail="iteration complete")
-             iteration += 1
+            # Update online learning eval counter
+            current_eval_count = _coerce_int(state.get("online_learning_eval_count")) or 0
+            new_eval_count = current_eval_count + verified_count
+
+            _persist_state(
+                state_path,
+                state,
+                phase="idle",
+                iteration=iteration,
+                last_model_id=promoted_model_id,
+                last_model_path=promoted_model_path,
+                last_improvement=improvement,
+                last_error=None,
+                last_iteration_outcome="completed",
+                last_skip_reason_code=None,
+                last_skip_reason_message=None,
+                failed_iteration=None,
+                failed_phase=None,
+                failed_at_utc=None,
+                last_failure_checkpoint_path=None,
+                online_learning_eval_count=new_eval_count,
+            )
+
+            # Check if online learning retrain is needed
+            state = _load_state(state_path)
+            was_retrained, new_model_path = _retrain_surrogate_if_needed(
+                state=state,
+                state_path=state_path,
+                loop_id=loop_id,
+                iteration=iteration,
+                snapshots_root=snapshots_root,
+                models_root=models_root,
+                args=args,
+            )
+            if was_retrained and new_model_path:
+                _persist_state(
+                    state_path,
+                    state,
+                    last_model_path=new_model_path,
+                )
+
+            _log_loop_phase(loop_id, "idle", iteration=iteration, detail="iteration complete")
+            iteration += 1
         if not stop_triggered and total_iterations is not None:
             final_state = _load_state(state_path)
             _persist_state(
