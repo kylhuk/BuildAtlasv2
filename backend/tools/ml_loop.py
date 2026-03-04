@@ -941,9 +941,11 @@ def start_loop(args: argparse.Namespace) -> int:
     _persist_state(state_path, state)
 
     base_thresholds = None
-    if curriculum.enabled:
+    # Only load gate thresholds if --gate-profile is explicitly set
+    if curriculum.enabled and getattr(args, "gate_profile", None):
         try:
             base_thresholds = load_thresholds_for_profile(profile_id)
+            logger.info("ml loop %s loaded gate thresholds for profile %s", loop_id, profile_id)
         except Exception as exc:
             logger.warning(
                 "ml loop %s unable to load base gate thresholds for curriculum: %s",
