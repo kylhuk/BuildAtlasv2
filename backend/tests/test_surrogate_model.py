@@ -1093,3 +1093,296 @@ def test_write_model_artifacts_atomic_cleans_staging_on_replace_failure(
     assert not model_root.exists()
     staging_dirs = list(model_root.parent.glob(f".{model_root.name}-*"))
     assert staging_dirs == []
+
+
+def test_ensemble_surrogate_requires_exactly_five_models() -> None:
+    """EnsembleSurrogate must have exactly 5 models."""
+    from backend.engine.surrogate.model import EnsembleSurrogate
+
+    # Create a minimal model
+    model = surrogate_model.SurrogateModel(
+        model_id="test",
+        dataset_snapshot_id="test",
+        feature_schema_version="v4",
+        global_metrics={},
+        main_skill_metrics={},
+        feature_stats={},
+        feature_weights={},
+        pass_metric="full_dps",
+        backend="ep-v4-baseline",
+        backend_version="0.2.0",
+        compute_backend="cpu",
+        token_learner_backend="residual_mean",
+        trained_at_utc="2024-01-01T00:00:00",
+    )
+
+    # Test with wrong number of models
+    with pytest.raises(ValueError, match="requires exactly 5 models"):
+        EnsembleSurrogate(models=[model, model, model])
+
+    # Test with correct number
+    ensemble = EnsembleSurrogate(models=[model] * 5)
+    assert len(ensemble.models) == 5
+
+
+def test_ensemble_surrogate_predict_many_computes_uncertainty() -> None:
+    """EnsembleSurrogate.predict_many computes mean and std across models."""
+    from backend.engine.surrogate.model import EnsembleSurrogate
+
+    # Create 5 models with different predictions
+    models = []
+    for i in range(5):
+        model = surrogate_model.SurrogateModel(
+            model_id=f"test-{i}",
+            dataset_snapshot_id="test",
+            feature_schema_version="v4",
+            global_metrics={
+                "full_dps": surrogate_model.MetricSummary(
+                    mean=1000.0 + i * 100,  # 1000, 1100, 1200, 1300, 1400
+                    std=100.0,
+                    minimum=500.0,
+                    maximum=2000.0,
+                    count=100,
+                ),
+                "max_hit": surrogate_model.MetricSummary(
+                    mean=500.0 + i * 50,  # 500, 550, 600, 650, 700
+                    std=50.0,
+                    minimum=100.0,
+                    maximum=1000.0,
+                    count=100,
+                ),
+            },
+            main_skill_metrics={},
+            feature_stats={},
+            feature_weights={},
+            pass_metric="full_dps",
+            backend="ep-v4-baseline",
+            backend_version="0.2.0",
+            compute_backend="cpu",
+            token_learner_backend="residual_mean",
+            trained_at_utc="2024-01-01T00:00:00",
+        )
+        models.append(model)
+
+    ensemble = EnsembleSurrogate(models=models)
+
+    # Create a test row
+    row: dict[str, Any] = {feature: 0.0 for feature in FEATURE_SIGNAL_KEYS}
+    row[FEATURE_IDENTITY_TOKENS] = []
+    row[FEATURE_IDENTITY_CROSS_TOKENS] = []
+
+    predictions = ensemble.predict_many([row])
+    assert len(predictions) == 1
+
+    pred = predictions[0]
+    assert "metrics" in pred
+    assert "metrics_std" in pred
+    assert "pass_probability" in pred
+    assert "pass_probability_std" in pred
+    assert "ucb_full_dps" in pred
+
+    # Check that metrics are computed correctly
+    metrics = pred["metrics"]
+    metrics_std = pred["metrics_std"]
+
+    # Mean of [1000, 1100, 1200, 1300, 1400] = 1200
+    assert abs(metrics["full_dps"] - 1200.0) < 1.0
+
+    # Std should be non-zero (models have different predictions)
+    assert metrics_std["full_dps"] > 0.0
+
+    # UCB should be mean + 2*std
+    expected_ucb = metrics["full_dps"] + 2.0 * metrics_std["full_dps"]
+    assert abs(pred["ucb_full_dps"] - expected_ucb) < 0.1
+
+
+def test_ensemble_surrogate_ucb_acquisition() -> None:
+    """EnsembleSurrogate computes UCB correctly for exploration."""
+    from backend.engine.surrogate.model import EnsembleSurrogate
+
+    # Create 5 identical models for predictable uncertainty
+    model = surrogate_model.SurrogateModel(
+        model_id="test",
+        dataset_snapshot_id="test",
+        feature_schema_version="v4",
+        global_metrics={
+            "full_dps": surrogate_model.MetricSummary(
+                mean=1000.0,
+                std=100.0,
+                minimum=500.0,
+                maximum=2000.0,
+                count=100,
+            ),
+            "max_hit": surrogate_model.MetricSummary(
+                mean=500.0,
+                std=50.0,
+                minimum=100.0,
+                maximum=1000.0,
+                count=100,
+            ),
+        },
+        main_skill_metrics={},
+        feature_stats={},
+        feature_weights={},
+        pass_metric="full_dps",
+        backend="ep-v4-baseline",
+        backend_version="0.2.0",
+        compute_backend="cpu",
+        token_learner_backend="residual_mean",
+        trained_at_utc="2024-01-01T00:00:00",
+    )
+
+    ensemble = EnsembleSurrogate(models=[model] * 5)
+
+    row: dict[str, Any] = {feature: 0.0 for feature in FEATURE_SIGNAL_KEYS}
+    row[FEATURE_IDENTITY_TOKENS] = []
+    row[FEATURE_IDENTITY_CROSS_TOKENS] = []
+
+    predictions = ensemble.predict_many([row])
+    pred = predictions[0]
+
+    # With identical models, std should be 0
+    assert pred["metrics_std"]["full_dps"] == 0.0
+
+    # UCB = mean + 2*0 = mean
+    assert abs(pred["ucb_full_dps"] - pred["metrics"]["full_dps"]) < 0.01
+
+
+def test_ensemble_surrogate_serialization() -> None:
+    """EnsembleSurrogate can be serialized and deserialized."""
+    from backend.engine.surrogate.model import EnsembleSurrogate
+
+    model = surrogate_model.SurrogateModel(
+        model_id="test",
+        dataset_snapshot_id="test",
+        feature_schema_version="v4",
+        global_metrics={},
+        main_skill_metrics={},
+        feature_stats={},
+        feature_weights={},
+        pass_metric="full_dps",
+        backend="ep-v4-baseline",
+        backend_version="0.2.0",
+        compute_backend="cpu",
+        token_learner_backend="residual_mean",
+        trained_at_utc="2024-01-01T00:00:00",
+    )
+
+    ensemble = EnsembleSurrogate(models=[model] * 5, ensemble_id="test-ensemble")
+
+    # Serialize
+    payload = ensemble.to_dict()
+    assert payload["ensemble_id"] == "test-ensemble"
+    assert payload["model_count"] == 5
+    assert len(payload["models"]) == 5
+
+    # Deserialize
+    restored = EnsembleSurrogate.from_dict(payload)
+    assert restored.ensemble_id == "test-ensemble"
+    assert len(restored.models) == 5
+
+
+def test_ensemble_surrogate_handles_missing_predictions() -> None:
+    """EnsembleSurrogate gracefully handles models with missing predictions."""
+    from backend.engine.surrogate.model import EnsembleSurrogate
+
+    # Create models with different metric availability
+    models = []
+    for i in range(5):
+        model = surrogate_model.SurrogateModel(
+            model_id=f"test-{i}",
+            dataset_snapshot_id="test",
+            feature_schema_version="v4",
+            global_metrics={
+                "full_dps": surrogate_model.MetricSummary(
+                    mean=1000.0 + i * 100,
+                    std=100.0,
+                    minimum=500.0,
+                    maximum=2000.0,
+                    count=100,
+                ),
+                "max_hit": surrogate_model.MetricSummary(
+                    mean=500.0 + i * 50,
+                    std=50.0,
+                    minimum=100.0,
+                    maximum=1000.0,
+                    count=100,
+                ),
+            },
+            main_skill_metrics={},
+            feature_stats={},
+            feature_weights={},
+            pass_metric="full_dps",
+            backend="ep-v4-baseline",
+            backend_version="0.2.0",
+            compute_backend="cpu",
+            token_learner_backend="residual_mean",
+            trained_at_utc="2024-01-01T00:00:00",
+        )
+        models.append(model)
+
+    ensemble = EnsembleSurrogate(models=models)
+
+    row: dict[str, Any] = {feature: 0.0 for feature in FEATURE_SIGNAL_KEYS}
+    row[FEATURE_IDENTITY_TOKENS] = []
+    row[FEATURE_IDENTITY_CROSS_TOKENS] = []
+
+    # Should not raise even if some models return None
+    predictions = ensemble.predict_many([row])
+    assert len(predictions) == 1
+    assert "metrics" in predictions[0]
+    assert "metrics_std" in predictions[0]
+
+
+def test_ensemble_surrogate_multiple_rows() -> None:
+    """EnsembleSurrogate can predict multiple rows at once."""
+    from backend.engine.surrogate.model import EnsembleSurrogate
+
+    model = surrogate_model.SurrogateModel(
+        model_id="test",
+        dataset_snapshot_id="test",
+        feature_schema_version="v4",
+        global_metrics={
+            "full_dps": surrogate_model.MetricSummary(
+                mean=1000.0,
+                std=100.0,
+                minimum=500.0,
+                maximum=2000.0,
+                count=100,
+            ),
+            "max_hit": surrogate_model.MetricSummary(
+                mean=500.0,
+                std=50.0,
+                minimum=100.0,
+                maximum=1000.0,
+                count=100,
+            ),
+        },
+        main_skill_metrics={},
+        feature_stats={},
+        feature_weights={},
+        pass_metric="full_dps",
+        backend="ep-v4-baseline",
+        backend_version="0.2.0",
+        compute_backend="cpu",
+        token_learner_backend="residual_mean",
+        trained_at_utc="2024-01-01T00:00:00",
+    )
+
+    ensemble = EnsembleSurrogate(models=[model] * 5)
+
+    # Create multiple test rows
+    rows = []
+    for j in range(3):
+        row: dict[str, Any] = {feature: float(j) for feature in FEATURE_SIGNAL_KEYS}
+        row[FEATURE_IDENTITY_TOKENS] = []
+        row[FEATURE_IDENTITY_CROSS_TOKENS] = []
+        rows.append(row)
+
+    predictions = ensemble.predict_many(rows)
+    assert len(predictions) == 3
+
+    for pred in predictions:
+        assert "metrics" in pred
+        assert "metrics_std" in pred
+        assert "ucb_full_dps" in pred
