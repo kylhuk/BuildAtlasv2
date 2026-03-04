@@ -12,6 +12,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+import xxhash
+
+from app.settings import settings
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WORKER_CMD: Sequence[str] = ("luajit", "backend/pob_worker/pob_worker.lua")
 
@@ -467,6 +471,8 @@ class WorkerPool:
 
     def _compute_cache_key(self, payload: Any) -> str:
         payload_json = json.dumps(payload, sort_keys=True, default=str)
+        if settings.use_xxhash:
+            return xxhash.xxh128_hexdigest(payload_json.encode())
         return hashlib.sha256(payload_json.encode()).hexdigest()
 
     def _get_cached_result(self, cache_key: str) -> Optional[Dict[str, Any]]:
