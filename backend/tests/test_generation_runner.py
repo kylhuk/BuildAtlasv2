@@ -399,6 +399,31 @@ def test_select_surrogate_elites_tie_breaker_depends_on_rng() -> None:
     assert order != ["tie-a", "tie-b"]
 
 
+def test_select_surrogate_elites_prefers_higher_max_hit_when_full_dps_ties() -> None:
+    high_max_hit = _make_optimizer_candidate(
+        build_id="high-max-hit",
+        seed=5,
+        actual_full_dps=100.0,
+        predicted_full_dps=200.0,
+        predicted_max_hit=180.0,
+        predicted_pass_probability=0.5,
+    )
+    low_max_hit = _make_optimizer_candidate(
+        build_id="low-max-hit",
+        seed=6,
+        actual_full_dps=110.0,
+        predicted_full_dps=200.0,
+        predicted_max_hit=120.0,
+        predicted_pass_probability=0.5,
+    )
+
+    elites = _select_surrogate_optimizer_elites(
+        [low_max_hit, high_max_hit],
+        2,
+        rng=random.Random(0),
+    )
+    assert elites[0][0] is high_max_hit
+
 
 def test_stub_tripwire_detects_exact_stub_metrics() -> None:
     entries = [
@@ -408,7 +433,6 @@ def test_stub_tripwire_detects_exact_stub_metrics() -> None:
     ]
     with pytest.raises(ValueError, match="PoB evaluation inactive; stub metrics detected"):
         _assert_no_stub_metrics(entries)
-
 
 
 def test_stub_tripwire_detects_linear_stub_metrics() -> None:

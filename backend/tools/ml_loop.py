@@ -1244,6 +1244,9 @@ REPORT_FIELD_ORDER = [
     "evaluation.verified",
     "evaluation.failures",
     "evaluation.errors",
+    "evaluation.gate_pass_rate",
+    "evaluation.gate_fail_reason_counts",
+    "evaluation.metrics_source_counts",
     "evaluation.full_dps.min",
     "evaluation.full_dps.median",
     "evaluation.full_dps.p95",
@@ -1659,6 +1662,7 @@ def _build_report_rows(
             row[f"surrogate.{metric}.uniq"] = metric_stats.get("uniq")
             row[f"surrogate.{metric}.degenerate"] = metric_stats.get("degenerate")
         evaluation_summary = _as_dict(run_summary.get("evaluation"))
+        benchmark_summary = _as_dict(run_summary.get("benchmark"))
         row["evaluation.attempted"] = _coerce_int(evaluation_summary.get("attempted"))
         row["evaluation.verified"] = _coerce_int(evaluation_summary.get("successes"))
         row["evaluation.failures"] = _coerce_int(evaluation_summary.get("failures"))
@@ -1666,6 +1670,38 @@ def _build_report_rows(
         gate_zero, gate_one = _collect_gate_pass_counts(gate_source)
         row["evaluation.gate_pass_0"] = gate_zero
         row["evaluation.gate_pass_1"] = gate_one
+        gate_pass_rate = _numeric(benchmark_summary.get("gate_pass_rate"))
+        gate_zero_count = _coerce_int(gate_zero) or 0
+        gate_one_count = _coerce_int(gate_one) or 0
+        if gate_pass_rate is None:
+            denominator = gate_zero_count + gate_one_count
+            if denominator > 0:
+                gate_pass_rate = gate_one_count / denominator
+            else:
+                scenarios_payload = benchmark_summary.get("scenarios")
+                if isinstance(scenarios_payload, Mapping):
+                    weighted_total = 0.0
+                    sample_total = 0
+                    for scenario_payload in scenarios_payload.values():
+                        if not isinstance(scenario_payload, Mapping):
+                            continue
+                        samples = _coerce_int(scenario_payload.get("samples"))
+                        scenario_rate = _numeric(scenario_payload.get("gate_pass_rate"))
+                        if samples is None or samples <= 0 or scenario_rate is None:
+                            continue
+                        sample_total += samples
+                        weighted_total += scenario_rate * samples
+                    if sample_total > 0:
+                        gate_pass_rate = weighted_total / sample_total
+        row["evaluation.gate_pass_rate"] = gate_pass_rate
+        gate_fail_reason_counts = benchmark_summary.get("gate_fail_reason_counts")
+        if isinstance(gate_fail_reason_counts, Mapping):
+            row["evaluation.gate_fail_reason_counts"] = dict(gate_fail_reason_counts)
+        metrics_source_counts = evaluation_summary.get("metrics_source_counts")
+        if not isinstance(metrics_source_counts, Mapping):
+            metrics_source_counts = benchmark_summary.get("metrics_source_counts")
+        if isinstance(metrics_source_counts, Mapping):
+            row["evaluation.metrics_source_counts"] = dict(metrics_source_counts)
         evaluation_stats = _collect_evaluation_metric_stats(run_summary, row_warnings)
         for metric in REPORT_METRICS:
             metric_stats = evaluation_stats.get(metric, {})

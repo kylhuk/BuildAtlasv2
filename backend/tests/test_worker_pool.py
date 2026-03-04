@@ -293,13 +293,10 @@ def test_worker_pool_resolves_luajit_script_path_and_defaults_cwd() -> None:
         pool.close()
 
     project_root = Path(__file__).resolve().parents[2]
-    expected_worker_script = str(project_root / "PathOfBuilding/worker/worker.lua")
+    expected_worker_script = str(project_root / "backend/pob_worker/pob_worker.lua")
     assert module.popen_args[0][0][0] == "luajit"
     assert module.popen_args[0][0][1] == expected_worker_script
     assert module.popen_kwargs[0].get("cwd") == str(project_root / "PathOfBuilding/src")
-
-
-
 
 
 def test_worker_pool_legacy_pob_script_defaults_to_pathofbuilding_src() -> None:

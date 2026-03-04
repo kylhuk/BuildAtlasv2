@@ -2,6 +2,9 @@
 -- Uses PoB's own module system correctly
 
 local json = require("cjson")
+
+-- Ensure JSON-RPC responses flush immediately when running under pipes.
+io.stdout:setvbuf("line")
 local io = require("io")
 
 -- ============================================================================

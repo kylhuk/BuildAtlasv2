@@ -28,9 +28,7 @@ from backend.engine.worker_pool import WorkerPool, WorkerPoolError
 
 logger = logging.getLogger(__name__)
 
-HARDCODED_WORKER_CMD = "luajit"
-HARDCODED_WORKER_ARGS = "PathOfBuilding/worker/worker.lua"
-HARDCODED_WORKER_CWD = "PathOfBuilding/src"
+HARDCODED_WORKER_REQUEST_TIMEOUT_SECONDS = 120.0
 
 _ALLOWED_STATUS_TRANSITIONS: Dict[BuildStatus, set[BuildStatus]] = {
     BuildStatus.imported: {BuildStatus.queued},
@@ -48,6 +46,7 @@ class EvaluationProvenance:
     worker_metadata_missing_count: int
     worker_metadata_missing_scenarios: list[str]
 
+
 class BuildEvaluator:
     def __init__(
         self,
@@ -64,20 +63,23 @@ class BuildEvaluator:
         self._repo = repo
         self._base_path = base_path
 
-        # Worker configuration (hardcoded defaults for this single-machine repo)
-        self._worker_cmd = worker_cmd or HARDCODED_WORKER_CMD
-        raw_args = (worker_args or HARDCODED_WORKER_ARGS).split()
+        # Worker configuration defaults from application settings.
+        self._worker_cmd = worker_cmd or settings.pob_worker_cmd
+        raw_args = (worker_args if worker_args is not None else settings.pob_worker_args).split()
         project_root = Path(__file__).resolve().parents[3]
         if self._worker_cmd in {"luajit", "luajit.exe"} and raw_args:
-            script_path = project_root / raw_args[0]
+            script_arg = Path(raw_args[0])
+            script_path = script_arg if script_arg.is_absolute() else project_root / script_arg
             if script_path.exists() and script_path.is_file():
                 raw_args[0] = str(script_path)
         self._worker_args = raw_args
         self._worker_pool_size = worker_pool_size or settings.pob_worker_pool_size
         # Make worker_cwd absolute to ensure it works regardless of parent process working directory
-        worker_cwd_value = worker_cwd if worker_cwd is not None else HARDCODED_WORKER_CWD
+        worker_cwd_value = worker_cwd if worker_cwd is not None else settings.pob_worker_cwd
         if worker_cwd_value:
-            worker_cwd_value = str(project_root / worker_cwd_value)
+            cwd_path = Path(worker_cwd_value)
+            resolved_cwd = cwd_path if cwd_path.is_absolute() else project_root / cwd_path
+            worker_cwd_value = str(resolved_cwd)
         self._worker_cwd = worker_cwd_value.strip() if worker_cwd_value is not None else None
 
         self._profiles_requiring_non_stub_metrics: set[str] = set()
@@ -97,7 +99,7 @@ class BuildEvaluator:
                     num_workers=self._worker_pool_size,
                     worker_cmd=(self._worker_cmd, *self._worker_args),
                     worker_cwd=(self._worker_cwd or None),
-                    request_timeout=25.0,
+                    request_timeout=HARDCODED_WORKER_REQUEST_TIMEOUT_SECONDS,
                 )
             return self._pool
 
@@ -126,12 +128,8 @@ class BuildEvaluator:
         self._repo.update_build_status(build_id, BuildStatus.queued.value)
         try:
             scenario_rows = self._collect_scenario_rows(build)
-            final_status = (
-                BuildStatus.evaluated
-                if all(row.gate_pass for row in scenario_rows)
-                else BuildStatus.failed
-            )
             self._repo.insert_scenario_metrics(scenario_rows)
+            final_status = BuildStatus.evaluated
             self._repo.update_build_status(build_id, final_status.value)
             return final_status, scenario_rows
         except APIError:
@@ -249,9 +247,7 @@ class BuildEvaluator:
                 )
             )
             warnings_lower = {
-                str(item).strip().lower()
-                for item in normalized.warnings
-                if str(item).strip()
+                str(item).strip().lower() for item in normalized.warnings if str(item).strip()
             }
             if "generation_stub_metrics" in warnings_lower:
                 stub_warning_count += 1

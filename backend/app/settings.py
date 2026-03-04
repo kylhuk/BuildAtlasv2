@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     # Use the authoritative Path of Building worker by default.
     # Can be overridden via environment as POB_WORKER_CMD/POB_WORKER_ARGS/POB_WORKER_CWD.
     pob_worker_cmd: str = "luajit"
-    pob_worker_args: str = "PathOfBuilding/worker/worker.lua"
+    pob_worker_args: str = "backend/pob_worker/pob_worker.lua"
 
     # Optional working directory for spawned worker process (used by luajit worker mode).
     # Pointing into PathOfBuilding/src keeps HeadlessWrapper happy.

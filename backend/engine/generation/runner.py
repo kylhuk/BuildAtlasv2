@@ -115,6 +115,32 @@ def _record_provenance_counts(
         counters["last_worker_error"] = f"stub metrics detected for scenarios {scenarios_text}"
 
 
+def _record_stub_disallowed_error_counts(
+    error: Mapping[str, Any] | None,
+    counters: dict[str, int | str | None],
+) -> None:
+    if not isinstance(error, Mapping):
+        return
+    details = error.get("details")
+    if not isinstance(details, Mapping):
+        return
+    reason_raw = details.get("reason")
+    reason = str(reason_raw).strip().lower() if reason_raw is not None else ""
+    if reason in {"worker_stub_metrics_only", "stub_metrics_only"}:
+        fallback_count = counters.get("fallback_stub_count")
+        counters["fallback_stub_count"] = (
+            fallback_count if isinstance(fallback_count, int) else 0
+        ) + 1
+        counters["last_worker_error"] = "stub metrics detected for worker-required profile"
+        return
+    if reason in {"worker_metrics_missing", "worker_metadata_missing"}:
+        worker_error_count = counters.get("worker_error_count")
+        counters["worker_error_count"] = (
+            worker_error_count if isinstance(worker_error_count, int) else 0
+        ) + 1
+        counters["last_worker_error"] = "worker metrics missing for worker-required profile"
+
+
 def _collect_verified_metric_entries(
     candidates: Sequence[Candidate],
 ) -> list[tuple[int, float | None, float | None]]:
@@ -300,6 +326,7 @@ class Candidate:
     selected_for_evaluation: bool = False
     evaluation_status: str | None = None
     gate_pass: bool | None = None
+    metrics_ok: bool = False
     evaluation_error: dict[str, Any] | None = None
     verified_metrics_payload: Mapping[str, Any] | None = None
     stage_label: str = "random_seed"
@@ -578,7 +605,7 @@ def _surrogate_rank_key(
     candidate: Candidate, *, tie_breaker: float
 ) -> tuple[float, float, float, float]:
     full_dps, max_hit, pass_probability = _surrogate_prediction_components(candidate)
-    max_hit_sort = max_hit if max_hit is not None else float("inf")
+    max_hit_sort = -(max_hit if max_hit is not None else float("-inf"))
     probability_sort = pass_probability if pass_probability is not None else float("-inf")
     return (-full_dps, max_hit_sort, -probability_sort, tie_breaker)
 
@@ -1974,7 +2001,8 @@ def run_generation(
     evaluation_rows: list[ScenarioMetricRow] = []
     evaluation_records: list[dict[str, Any]] = []
     evaluation_attempted = 0
-    evaluation_successes = 0
+    metrics_ok_count = 0
+    gate_pass_count = 0
     evaluation_failures = 0
     evaluation_errors = 0
     evaluation_started_at = monotonic()
@@ -2012,6 +2040,8 @@ def run_generation(
             candidate.evaluation_status = status.value
             if rows:
                 candidate.gate_pass = all(getattr(row, "gate_pass", True) for row in rows)
+                if candidate.gate_pass:
+                    gate_pass_count += 1
             candidate.verified_metrics_payload = _metrics_payload_from_scenario_rows(rows)
             evaluation_rows.extend(rows)
             metrics_sources = _row_metrics_sources(rows)
@@ -2057,13 +2087,14 @@ def run_generation(
                             "message": message_text,
                             "details": error_details,
                         }
-            evaluation_success = (
+            metrics_ok = (
                 status is BuildStatus.evaluated
                 and metrics_sources == {METRICS_SOURCE_POB}
                 and not (enforce_worker_tripwire and detection_triggered)
             )
-            if evaluation_success:
-                evaluation_successes += 1
+            candidate.metrics_ok = metrics_ok
+            if metrics_ok:
+                metrics_ok_count += 1
                 if candidate.surrogate_prediction_payload:
                     _persist_surrogate_prediction(
                         candidate.build_id,
@@ -2092,7 +2123,6 @@ def run_generation(
                                 "error": candidate.evaluation_error,
                             },
                         }
-                candidate.evaluation_status = BuildStatus.failed.value
             evaluation_records.append(
                 {
                     "build_id": candidate.build_id,
@@ -2121,6 +2151,7 @@ def run_generation(
             evaluation_errors += 1
             evaluation_failures += 1
             candidate.evaluation_status = BuildStatus.failed.value
+            candidate.metrics_ok = False
             logger.warning(
                 "generation run %s candidate %s evaluation error code=%s message=%s details=%s",
                 session_id,
@@ -2130,6 +2161,20 @@ def run_generation(
                 candidate.evaluation_error.get("details"),
             )
             normalized_code = str(error_code) if error_code is not None else ""
+            if enforce_worker_tripwire and normalized_code == "stub_metrics_disallowed":
+                _record_stub_disallowed_error_counts(
+                    candidate.evaluation_error, evaluation_counters
+                )
+                if infrastructure_failure_reason is None:
+                    infrastructure_failure_reason = {
+                        "code": "evaluation_non_pob_metrics",
+                        "message": error_message or "PoB evaluation aborted after non-PoB metrics",
+                        "details": {
+                            "build_id": candidate.build_id,
+                            "error": candidate.evaluation_error,
+                        },
+                    }
+                break
             is_infrastructure_error = (
                 normalized_code in INFRASTRUCTURE_EVALUATION_ERROR_CODES
                 or any(
@@ -2167,11 +2212,12 @@ def run_generation(
         if should_log_progress:
             _phase_log(
                 "generation run %s phase=evaluation_progress "
-                "(completed=%d/%d successes=%d failures=%d errors=%d elapsed=%.1fs)",
+                "(completed=%d/%d metrics_ok=%d gate_pass=%d failures=%d errors=%d elapsed=%.1fs)",
                 session_id,
                 evaluation_attempted,
                 selected_count,
-                evaluation_successes,
+                metrics_ok_count,
+                gate_pass_count,
                 evaluation_failures,
                 evaluation_errors,
                 max(0.0, now - evaluation_started_at),
@@ -2182,10 +2228,11 @@ def run_generation(
 
     _phase_log(
         "generation run %s phase=evaluation_complete "
-        "(attempted=%d successes=%d failures=%d errors=%d elapsed=%.1fs)",
+        "(attempted=%d metrics_ok=%d gate_pass=%d failures=%d errors=%d elapsed=%.1fs)",
         session_id,
         evaluation_attempted,
-        evaluation_successes,
+        metrics_ok_count,
+        gate_pass_count,
         evaluation_failures,
         evaluation_errors,
         max(0.0, monotonic() - evaluation_started_at),
@@ -2253,12 +2300,21 @@ def run_generation(
             record["constraint_checked_at"] = candidate.constraint_checked_at
         record["persisted"] = candidate.persisted
         generation_attempt_records.append(record)
-        if candidate.persisted and candidate.evaluation_status == BuildStatus.evaluated.value:
+        if (
+            candidate.persisted
+            and candidate.evaluation_status == BuildStatus.evaluated.value
+            and candidate.metrics_ok
+            and candidate.gate_pass
+        ):
             valid_generation_records.append(record)
 
     archive_store = ArchiveStore()
     for candidate in candidates:
-        if candidate.evaluation_status != BuildStatus.evaluated.value:
+        if (
+            candidate.evaluation_status != BuildStatus.evaluated.value
+            or not candidate.metrics_ok
+            or not candidate.gate_pass
+        ):
             continue
         metrics_payload = candidate.verified_metrics_payload or candidate.metrics_payload
         descriptor = descriptor_values_from_metrics(metrics_payload, archive_store.axes)
@@ -2324,7 +2380,9 @@ def run_generation(
 
     evaluation_stats: dict[str, int] = {
         "attempted": evaluation_attempted,
-        "successes": evaluation_successes,
+        "metrics_ok_count": metrics_ok_count,
+        "gate_pass_count": gate_pass_count,
+        "successes": metrics_ok_count,
         "failures": evaluation_failures,
         "errors": evaluation_errors,
     }
@@ -2343,11 +2401,17 @@ def run_generation(
             "message": "no evaluations were attempted",
             "evaluation": evaluation_stats,
         }
-    elif evaluation_successes == 0:
+    elif metrics_ok_count == 0:
         run_status = "failed"
         status_reason = {
             "code": "no_verified_evaluations",
             "message": "no PoB-verified evaluations succeeded",
+            "evaluation": evaluation_stats,
+        }
+    elif gate_pass_count == 0:
+        status_reason = {
+            "code": "no_gate_pass_builds",
+            "message": "evaluations produced metrics but no builds passed gates",
             "evaluation": evaluation_stats,
         }
     elif evaluation_failures > 0:
@@ -2388,7 +2452,9 @@ def run_generation(
         },
         "evaluation": {
             "attempted": evaluation_attempted,
-            "successes": evaluation_successes,
+            "metrics_ok_count": metrics_ok_count,
+            "gate_pass_count": gate_pass_count,
+            "successes": metrics_ok_count,
             "failures": evaluation_failures,
             "errors": evaluation_errors,
             "worker_metrics_used_count": evaluation_counters["worker_metrics_used_count"],
@@ -2433,7 +2499,7 @@ def run_generation(
         summary["paths"]["archive"] = str(archive_path)
 
     invalid_evaluations = evaluation_failures + evaluation_errors
-    if evaluation_successes == 0:
+    if metrics_ok_count == 0:
         logger.warning(
             "generation run %s emitted no PoB-verified builds (attempted=%d invalid=%d)",
             session_id,
@@ -2444,7 +2510,7 @@ def run_generation(
         logger.info(
             "generation run %s emitted %d verified build(s) (attempted=%d invalid=%d, status=%s)",
             session_id,
-            evaluation_successes,
+            metrics_ok_count,
             evaluation_attempted,
             invalid_evaluations,
             run_status,
@@ -2551,15 +2617,25 @@ def _benchmark_summary_from_rows(
         "scenarios": {},
     }
     global_source_counts: dict[str, int] = {source: 0 for source in METRICS_SOURCE_VALUES}
+    global_gate_fail_reason_counts: dict[str, int] = {}
     for scenario_id, entries in grouped.items():
         sample_count = len(entries)
         source_counts: dict[str, int] = {source: 0 for source in METRICS_SOURCE_VALUES}
+        scenario_gate_fail_reason_counts: dict[str, int] = {}
         for entry in entries:
             source_value = getattr(entry, "metrics_source", METRICS_SOURCE_STUB)
             normalized_source = normalize_metrics_source(source_value, METRICS_SOURCE_STUB)
             key = normalized_source or METRICS_SOURCE_STUB
             source_counts[key] = source_counts.get(key, 0) + 1
             global_source_counts[key] = global_source_counts.get(key, 0) + 1
+            for reason in getattr(entry, "gate_fail_reasons", []) or []:
+                reason_key = str(reason)
+                scenario_gate_fail_reason_counts[reason_key] = (
+                    scenario_gate_fail_reason_counts.get(reason_key, 0) + 1
+                )
+                global_gate_fail_reason_counts[reason_key] = (
+                    global_gate_fail_reason_counts.get(reason_key, 0) + 1
+                )
         summary_payload["scenarios"][scenario_id] = {
             "samples": sample_count,
             "median_full_dps": _median_or_zero([entry.full_dps for entry in entries]),
@@ -2571,8 +2647,10 @@ def _benchmark_summary_from_rows(
                 else 0.0
             ),
             "metrics_source_counts": source_counts,
+            "gate_fail_reason_counts": scenario_gate_fail_reason_counts,
         }
     summary_payload["metrics_source_counts"] = global_source_counts
+    summary_payload["gate_fail_reason_counts"] = global_gate_fail_reason_counts
     return summary_payload
 
 

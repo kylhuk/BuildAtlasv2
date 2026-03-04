@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_WORKER_CMD: Sequence[str] = ("luajit", "PathOfBuilding/worker/worker.lua")
+DEFAULT_WORKER_CMD: Sequence[str] = ("luajit", "backend/pob_worker/pob_worker.lua")
 
 WORKER_TERMINATED_ERROR_CODE = -32000
 WORKER_PROTOCOL_ERROR_CODE = -32001
@@ -63,7 +63,12 @@ def _normalize_worker_invocation(
         and script_parent.name == "worker"
         and script_root_name in {"PathOfBuilding", "pob"}
     )
-    if resolved_cwd is None and is_pathofbuilding_worker:
+    is_backend_pob_worker = (
+        resolved_script.name == "pob_worker.lua"
+        and script_parent.name == "pob_worker"
+        and script_root_name == "backend"
+    )
+    if resolved_cwd is None and (is_pathofbuilding_worker or is_backend_pob_worker):
         resolved_cwd = str(PROJECT_ROOT / "PathOfBuilding" / "src")
 
     return tuple(normalized_cmd), resolved_cwd

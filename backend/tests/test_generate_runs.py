@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
 
+import pytest
+
 from backend.app.api.evaluator import BuildEvaluator, EvaluationProvenance
 from backend.app.api.errors import APIError
 from backend.app.db.ch import BuildInsertPayload, ScenarioMetricRow
@@ -235,42 +237,33 @@ def test_generation_logs_run_phases(tmp_path: Path, caplog) -> None:
     assert any("phase=artifact_write_start" in message for message in messages)
 
 
-def test_generation_fails_without_verified_metrics(tmp_path: Path) -> None:
+def test_generation_completes_when_metrics_ok_but_no_gate_pass(tmp_path: Path) -> None:
     repo = FakeRepository()
     evaluator = _fake_evaluator(tmp_path, repo)
 
-    def failing_metrics_generator(seed: int, templates):
-        payload = generation_runner._default_metrics_generator(seed, templates)
-        for scenario in payload.values():
-            if not isinstance(scenario, dict):
-                continue
-            metrics = scenario.setdefault("metrics", {})
-            if isinstance(metrics, dict):
-                metrics["max_hit"] = 100.0
-            defense = scenario.setdefault("defense", {})
-            if isinstance(defense, dict):
-                resists = defense.setdefault("resists", {})
-                if isinstance(resists, dict):
-                    resists.update(
-                        {
-                            "fire": 10.0,
-                            "cold": 10.0,
-                            "lightning": 10.0,
-                            "chaos": 0.0,
-                        }
-                    )
-            attributes = scenario.setdefault("attributes", {})
-            if isinstance(attributes, dict):
-                attributes.update(
-                    {
-                        "strength": 10.0,
-                        "dexterity": 10.0,
-                        "intelligence": 10.0,
-                    }
-                )
-        return payload
+    def _evaluate_build(
+        build_id: str,
+    ) -> tuple[generation_runner.BuildStatus, list[ScenarioMetricRow]]:
+        row = ScenarioMetricRow(
+            build_id=build_id,
+            ruleset_id=_ruleset_id(),
+            scenario_id="pinnacle_boss",
+            gate_pass=False,
+            gate_fail_reasons=["min_max_hit"],
+            pob_warnings=[],
+            evaluated_at=datetime.now(UTC),
+            full_dps=1200.0,
+            max_hit=1800.0,
+            armour=1000.0,
+            evasion=500.0,
+            life=4000.0,
+            mana=700.0,
+            utility_score=44.0,
+            metrics_source="pob",
+        )
+        return generation_runner.BuildStatus.evaluated, [row]
 
-    with patch.object(evaluator, "_collect_worker_metrics", return_value={}):
+    with patch.object(evaluator, "evaluate_build", side_effect=_evaluate_build):
         summary = generation_runner.run_generation(
             count=1,
             seed_start=13,
@@ -279,31 +272,29 @@ def test_generation_fails_without_verified_metrics(tmp_path: Path) -> None:
             base_path=tmp_path,
             repo=repo,
             evaluator=evaluator,
-            run_id="stub-run",
-            metrics_generator=failing_metrics_generator,
+            run_id="no-gate-pass-run",
+            metrics_generator=_verified_metrics_generator,
         )
 
-    assert summary["status"] == "failed"
+    assert summary["status"] == "completed"
     reason = summary.get("status_reason")
-    assert reason and reason.get("code") == "evaluation_non_pob_metrics"
+    assert reason and reason.get("code") == "no_gate_pass_builds"
 
-    assert summary["evaluation"]["successes"] == 0
-    assert summary["evaluation"]["failures"] == summary["evaluation"]["attempted"]
+    assert summary["evaluation"]["successes"] == summary["evaluation"]["attempted"]
+    assert summary["evaluation"]["metrics_ok_count"] == summary["evaluation"]["attempted"]
+    assert summary["evaluation"]["gate_pass_count"] == 0
+    assert summary["evaluation"]["failures"] == 0
     assert summary["evaluation"]["errors"] == 0
     scenarios = summary["benchmark"]["scenarios"]
     assert scenarios
     assert all(payload["gate_pass_rate"] == 0.0 for payload in scenarios.values())
+    assert summary["benchmark"]["gate_fail_reason_counts"]
     assert summary["generation"]["records"] == []
     attempt_records = summary["generation"]["attempt_records"]
     assert attempt_records
-    # FL-01: Failed builds ARE now persisted (for ML training)
-    # Previously this was:
-    # assert all(record.get("persisted") is False for record in attempt_records)
-    # Now we keep failed builds for ML to learn from
     assert all(record.get("persisted") is True for record in attempt_records)
-    # But they should have failed status
+    assert all(record.get("evaluation_status") == "evaluated" for record in attempt_records)
     assert all(record.get("gate_pass") is False for record in attempt_records)
-    # Note: repo._builds will NOT be empty anymore since we persist failures
 
 
 def test_generation_aborts_on_evaluation_infrastructure_error(tmp_path: Path) -> None:
@@ -338,6 +329,45 @@ def test_generation_aborts_on_evaluation_infrastructure_error(tmp_path: Path) ->
     assert reason["evaluation"]["attempted"] == 1
     assert reason["details"]["error"]["code"] == "evaluation_error"
     assert reason["details"]["error"]["details"] == {"reason": "worker_hiccup"}
+
+
+def test_generation_tripwire_stub_metrics_abort(tmp_path: Path) -> None:
+    repo = FakeRepository()
+    evaluator = _fake_evaluator(tmp_path, repo)
+
+    error = APIError(
+        400,
+        "stub_metrics_disallowed",
+        "stub metrics disallowed for profile",
+        details={"reason": "worker_stub_metrics_only"},
+    )
+    mock_evaluate = Mock(side_effect=error)
+    with patch.object(evaluator, "evaluate_build", mock_evaluate):
+        summary = generation_runner.run_generation(
+            count=3,
+            seed_start=701,
+            ruleset_id=_ruleset_id(),
+            profile_id="pinnacle",
+            base_path=tmp_path,
+            repo=repo,
+            evaluator=evaluator,
+            run_id="tripwire-stub-metrics",
+            metrics_generator=_verified_metrics_generator,
+            enforce_worker_tripwire=True,
+        )
+
+    assert mock_evaluate.call_count == 1
+    evaluation = summary["evaluation"]
+    assert evaluation["attempted"] == 1
+    assert evaluation["errors"] == 1
+    assert evaluation["failures"] == 1
+    assert evaluation["fallback_stub_count"] == 1
+    assert evaluation["worker_error_count"] == 0
+    assert evaluation["last_worker_error"] == "stub metrics detected for worker-required profile"
+    reason = summary.get("status_reason")
+    assert reason is not None
+    assert reason["code"] == "evaluation_non_pob_metrics"
+    assert reason["details"]["error"]["code"] == "stub_metrics_disallowed"
 
 
 def test_generation_aborts_on_non_pob_metrics(tmp_path: Path) -> None:
@@ -1199,51 +1229,45 @@ def test_archive_contains_only_verified_candidates(tmp_path: Path) -> None:
     repo = FakeRepository()
     evaluator = _fake_evaluator(tmp_path, repo)
 
-    def metrics_with_one_failed_seed(seed: int, templates: list[Any]) -> dict[str, Any]:
-        payload = _verified_metrics_generator(seed, templates)  # type: ignore[attr-defined]
-        for scenario_id in payload:
-            payload[scenario_id].setdefault("metrics", {})
-            payload[scenario_id]["metrics"].update(
-                {
-                    "full_dps": 500_000,
-                    "max_hit": 25_000,
-                    "utility_score": 8,
-                }
-            )
-            payload[scenario_id].setdefault("defense", {})
-            payload[scenario_id]["defense"]["resists"] = {
-                "fire": 80,
-                "cold": 80,
-                "lightning": 80,
-                "chaos": 80,
-            }
-            payload[scenario_id].setdefault("attributes", {})
-            payload[scenario_id]["attributes"] = {
-                "strength": 250,
-                "dexterity": 220,
-                "intelligence": 220,
-            }
-            payload[scenario_id].setdefault("reservation", {})
-            payload[scenario_id]["reservation"].update(
-                {"reserved_percent": 20, "available_percent": 80}
-            )
-        if seed == 10:
-            for scenario_id in payload:
-                payload[scenario_id]["reservation"]["reserved_percent"] = 999
-                payload[scenario_id]["reservation"]["available_percent"] = 1000
-        return payload
+    evaluation_call_index = 0
 
-    summary = generation_runner.run_generation(
-        count=2,
-        seed_start=10,
-        ruleset_id=_ruleset_id(),
-        profile_id="pinnacle",
-        base_path=tmp_path,
-        repo=repo,
-        evaluator=evaluator,
-        metrics_generator=metrics_with_one_failed_seed,
-        run_id="archive-verified-only",
-    )
+    def _evaluate_build(
+        build_id: str,
+    ) -> tuple[generation_runner.BuildStatus, list[ScenarioMetricRow]]:
+        nonlocal evaluation_call_index
+        gate_pass = evaluation_call_index > 0
+        evaluation_call_index += 1
+        row = ScenarioMetricRow(
+            build_id=build_id,
+            ruleset_id=_ruleset_id(),
+            scenario_id="pinnacle_boss",
+            gate_pass=gate_pass,
+            gate_fail_reasons=[] if gate_pass else ["min_max_hit"],
+            pob_warnings=[],
+            evaluated_at=datetime.now(UTC),
+            full_dps=2000.0,
+            max_hit=3200.0,
+            armour=1000.0,
+            evasion=500.0,
+            life=4000.0,
+            mana=700.0,
+            utility_score=44.0,
+            metrics_source="pob",
+        )
+        return generation_runner.BuildStatus.evaluated, [row]
+
+    with patch.object(evaluator, "evaluate_build", side_effect=_evaluate_build):
+        summary = generation_runner.run_generation(
+            count=2,
+            seed_start=10,
+            ruleset_id=_ruleset_id(),
+            profile_id="pinnacle",
+            base_path=tmp_path,
+            repo=repo,
+            evaluator=evaluator,
+            metrics_generator=_verified_metrics_generator,
+            run_id="archive-verified-only",
+        )
 
     archive_payload = load_archive_artifact(
         "archive-verified-only",
@@ -1258,23 +1282,20 @@ def test_archive_contains_only_verified_candidates(tmp_path: Path) -> None:
 
     attempt_records = summary["generation"]["attempt_records"]
     assert attempt_records
-    non_evaluated_attempts = [
-        record for record in attempt_records if record.get("evaluation_status") != "evaluated"
+    gate_failed_attempts = [
+        record for record in attempt_records if record.get("gate_pass") is False
     ]
-    assert non_evaluated_attempts
-    assert all(record.get("persisted") is False for record in non_evaluated_attempts)
-    for record in non_evaluated_attempts:
-        build_id = record["build_id"]
-        assert repo.get_build(build_id) is None
-        artifact_dir = tmp_path / "data" / "builds" / build_id
-        assert not artifact_dir.exists()
+    assert gate_failed_attempts
+    assert all(record.get("evaluation_status") == "evaluated" for record in gate_failed_attempts)
+    assert all(record.get("persisted") is True for record in gate_failed_attempts)
 
     records = summary["generation"]["records"]
     assert all(record.get("evaluation_status") == "evaluated" for record in records)
+    assert all(record.get("gate_pass") is True for record in records)
     assert all(record.get("persisted") is True for record in records)
 
-    non_verified_ids = {record["build_id"] for record in non_evaluated_attempts}
-    assert archived_build_ids.isdisjoint(non_verified_ids)
+    gate_failed_ids = {record["build_id"] for record in gate_failed_attempts}
+    assert archived_build_ids.isdisjoint(gate_failed_ids)
 
 
 def test_generated_build_persists_build_details(tmp_path: Path) -> None:

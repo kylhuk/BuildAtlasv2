@@ -19,6 +19,7 @@ engine/__init__.py
 engine/build_details.py
 engine/constraints.py
 engine/genome.py
+engine/metrics_source.py
 engine/ruleset.py
 engine/worker_pool.py
 engine/archive/__init__.py

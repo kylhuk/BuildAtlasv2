@@ -127,7 +127,21 @@ def _setup_ml_loop_report_artifacts(tmp_path: Path, loop_id: str, run_id: str) -
             "successes": 3,
             "failures": 1,
             "errors": 0,
+            "metrics_source_counts": {"pob": 3, "fallback": 1, "stub": 0},
             "records": evaluation_records,
+        },
+        "benchmark": {
+            "metrics_source_counts": {"pob": 3, "fallback": 1, "stub": 0},
+            "gate_fail_reason_counts": {
+                "min_max_hit": 2,
+                "min_fire_resist": 1,
+            },
+            "scenarios": {
+                "mapping_t16": {
+                    "samples": 4,
+                    "gate_pass_rate": 0.5,
+                }
+            },
         },
     }
     summary_path.write_text(json.dumps(summary_payload), encoding="utf-8")
@@ -1494,7 +1508,16 @@ def test_start_loop_fails_fast_on_terminal_generation_failure(
         return {
             "run_id": kwargs.get("run_id"),
             "status": "failed",
-            "evaluation": {"attempted": 1, "successes": 0, "failures": 1, "errors": 0},
+            "evaluation": {
+                "attempted": 1,
+                "successes": 0,
+                "failures": 1,
+                "errors": 0,
+                "worker_metrics_used_count": 0,
+                "fallback_stub_count": 1,
+                "worker_error_count": 0,
+                "last_worker_error": "stub metrics detected for worker-required profile",
+            },
             "status_reason": {
                 "code": "evaluation_non_pob_metrics",
                 "message": "PoB evaluation inactive; non-PoB metrics returned",
@@ -1521,6 +1544,10 @@ def test_start_loop_fails_fast_on_terminal_generation_failure(
     assert state["failed_phase"] == "generation"
     assert "evaluation_non_pob_metrics" in state["last_error"]
     assert "PoB evaluation inactive" in state["last_error"]
+    assert state["last_worker_metrics_used_count"] == 0
+    assert state["last_fallback_stub_count"] == 1
+    assert state["last_worker_error_count"] == 0
+    assert state["last_worker_error"] == "stub metrics detected for worker-required profile"
     failure_path = Path(state["last_failure_checkpoint_path"])
     assert failure_path.exists()
     failure = json.loads(failure_path.read_text(encoding="utf-8"))
@@ -2133,6 +2160,12 @@ def test_report_loop_rows_include_expected_columns_and_stats(tmp_path: Path) -> 
     assert row["evaluation.full_dps.std"] > 0
     assert row["evaluation.gate_pass_0"] == 2
     assert row["evaluation.gate_pass_1"] == 2
+    assert row["evaluation.gate_pass_rate"] == pytest.approx(0.5)
+    assert row["evaluation.gate_fail_reason_counts"] == {
+        "min_max_hit": 2,
+        "min_fire_resist": 1,
+    }
+    assert row["evaluation.metrics_source_counts"] == {"pob": 3, "fallback": 1, "stub": 0}
 
 
 def test_bundle_loop_contains_expected_artifacts_and_optional_predictions(tmp_path: Path) -> None:
