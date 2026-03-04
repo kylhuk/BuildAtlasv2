@@ -54,10 +54,12 @@ from backend.engine.metrics_source import (
 )
 from backend.engine.passives.builder import PassiveTreePlan, build_passive_tree_plan
 from backend.engine.scenarios.loader import ScenarioTemplate, list_templates
+from backend.engine.skeletons.expansion import expand_skeleton
 from backend.engine.skills.catalog import GemPlan, SkillCatalog, load_default_skill_catalog
 from backend.engine.sockets.planner import SocketPlan, plan_sockets
 from backend.engine.surrogate import load_model
 from backend.engine.surrogate.dataset import extract_feature_signals
+from backend.engine.validation.csp import BuildCSP
 
 logger = logging.getLogger(__name__)
 
@@ -1486,12 +1488,159 @@ def _default_socket_planner(catalog: SkillCatalog, genome: GenomeV0) -> SocketPl
     return plan_sockets(catalog, genome)
 
 
+def _convert_to_csp_data(
+    build_details: dict[str, Any], metrics: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Convert build details and metrics to the format expected by BuildCSP."""
+    gems = build_details.get("gems", {})
+    socket_plan = gems.get("socket_plan", {})
+    main_links = socket_plan.get("main_link_requirement", 0)
+
+    # Extract items
+    items_data = build_details.get("items", {})
+    slot_templates = items_data.get("slot_templates", [])
+    csp_items = []
+    for template in slot_templates:
+        # Synthesize requirements and sockets for CSP
+        # In a real scenario, these would come from the item templates
+        csp_items.append(
+            {
+                "requirements": {
+                    "str": template.get("contributions", {}).get("strength", 0),
+                    "dex": template.get("contributions", {}).get("dexterity", 0),
+                    "int": template.get("contributions", {}).get("intelligence", 0),
+                },
+                "sockets": [],  # Placeholder
+            }
+        )
+
+    # Extract attributes from metrics
+    attributes = {"str": 0, "dex": 0, "int": 0}
+    reservation = 0.0
+    total_mana = 100.0  # Percent based
+    if metrics:
+        first_scenario = next(iter(metrics.values()))
+        if isinstance(first_scenario, Mapping):
+            attr_data = first_scenario.get("attributes", {})
+            attributes = {
+                "str": attr_data.get("strength", 0),
+                "dex": attr_data.get("dexterity", 0),
+                "int": attr_data.get("intelligence", 0),
+            }
+            res_data = first_scenario.get("reservation", {})
+            reservation = res_data.get("reserved_percent", 0.0)
+
+    # Extract passive tree
+    passives = build_details.get("passives", {})
+    allocated = []
+    for node_id in passives.get("node_ids", []):
+        try:
+            allocated.append(int(node_id))
+        except (ValueError, TypeError):
+            # Skip non-integer node IDs for CSP for now
+            continue
+
+    return {
+        "main_skill": {"links": main_links},
+        "items": csp_items,
+        "attributes": attributes,
+        "reservation": reservation,
+        "total_mana": total_mana,
+        "passive_tree": {
+            "allocated": allocated,
+            "adjacencies": {},  # Placeholder
+            "start_nodes": [],  # Placeholder
+        },
+    }
+
+
+def generate_from_skeleton(
+    skeleton_id: str,
+    seed: int,
+    profile_id: str,
+    templates: Sequence[ScenarioTemplate],
+    evaluator: BuildEvaluator,
+    *,
+    socket_planner: SocketPlanner | None = None,
+    passive_planner: PassivePlanner | None = None,
+    template_builder: TemplateBuilder | None = None,
+    metrics_generator: MetricsGenerator | None = None,
+) -> Candidate:
+    """
+    Generate a build from a skeleton, following the feasibility-first pipeline.
+    a. Load skeleton
+    b. Expand to full build
+    c. CSP validate (fast reject)
+    d. Repair if needed
+    e. PoB evaluate (handled by caller)
+    """
+    # a. Load skeleton & b. Expand to full build
+    dna = expand_skeleton(skeleton_id)
+
+    # Create GenomeV0 from skeleton/dna
+    genome = GenomeV0(
+        seed=seed,
+        class_name=dna.class_name,
+        ascendancy=dna.ascendancy,
+        main_skill_package=dna.main_skill,
+        defense_archetype=dna.defense_layer,
+        budget_tier=dna.budget_tier,
+        profile_id=profile_id,
+    )
+
+    catalog = load_default_skill_catalog()
+    socket_planner = socket_planner or _default_socket_planner
+    passive_planner = passive_planner or (lambda g, b: build_passive_tree_plan(g, b))
+    template_builder = template_builder or build_item_templates
+    metrics_generator = metrics_generator or _default_metrics_generator
+
+    gem_plan = catalog.build_plan(genome)
+    passive_plan = passive_planner(genome, _point_budget_for(genome))
+    socket_plan = socket_planner(catalog, genome)
+    template_plan = template_builder(genome, gem_plan, passive_plan, socket_plan)
+
+    build_details_payload = build_details_from_generation(
+        genome=genome,
+        gem_plan=gem_plan,
+        passive_plan=passive_plan,
+        socket_plan=socket_plan,
+        template_plan=template_plan,
+    )
+    metrics_payload = metrics_generator(seed, templates)
+
+    # c. CSP validate (fast reject)
+    csp = BuildCSP()
+    csp_data = _convert_to_csp_data(build_details_payload, metrics_payload)
+    is_valid, csp_errors = csp.validate(csp_data)
+
+    # d. Repair if needed
+    # The template_builder already calls repair_templates.
+    # If CSP validation fails, we add the errors to failures.
+    failures = list(csp_errors)
+
+    candidate = Candidate(
+        seed=seed,
+        build_id=uuid.uuid4().hex,
+        main_skill_package=genome.main_skill_package,
+        class_name=genome.class_name,
+        ascendancy=genome.ascendancy,
+        budget_tier=genome.budget_tier,
+        failures=failures,
+        metrics_payload=metrics_payload,
+        genome=genome,
+        code_payload=_render_build_code(genome, socket_plan, template_plan, metrics_payload),
+        build_details_payload=build_details_payload,
+    )
+    return candidate
+
+
 def run_generation(
     *,
     count: int,
     seed_start: int,
     ruleset_id: str,
     profile_id: str,
+    skeleton_id: str | None = None,
     run_id: str | None = None,
     base_path: Path | None = None,
     repo: ClickhouseRepository | None = None,
@@ -1611,50 +1760,63 @@ def run_generation(
         parent_build_id: str | None = None,
         parent_seed: int | None = None,
     ) -> Candidate:
-        genome = deterministic_genome_from_seed(seed)
-        gem_plan = catalog.build_plan(genome)
-        passive_plan = passive_planner(genome, _point_budget_for(genome))
-        socket_plan = socket_planner(catalog, genome)
-        template_plan = template_builder(genome, gem_plan, passive_plan, socket_plan)
-        build_details_payload = build_details_from_generation(
-            genome=genome,
-            gem_plan=gem_plan,
-            passive_plan=passive_plan,
-            socket_plan=socket_plan,
-            template_plan=template_plan,
-        )
-        metrics_payload = metrics_generator(seed, templates)
+        if skeleton_id:
+            candidate = generate_from_skeleton(
+                skeleton_id=skeleton_id,
+                seed=seed,
+                profile_id=profile_id,
+                templates=templates,
+                evaluator=evaluator,
+                socket_planner=socket_planner,
+                passive_planner=passive_planner,
+                template_builder=template_builder,
+                metrics_generator=metrics_generator,
+            )
+        else:
+            genome = deterministic_genome_from_seed(seed)
+            gem_plan = catalog.build_plan(genome)
+            passive_plan = passive_planner(genome, _point_budget_for(genome))
+            socket_plan = socket_planner(catalog, genome)
+            template_plan = template_builder(genome, gem_plan, passive_plan, socket_plan)
+            build_details_payload = build_details_from_generation(
+                genome=genome,
+                gem_plan=gem_plan,
+                passive_plan=passive_plan,
+                socket_plan=socket_plan,
+                template_plan=template_plan,
+            )
+            metrics_payload = metrics_generator(seed, templates)
 
-        failures: list[str] = []
-        if _socket_precheck_failed(socket_plan):
-            failures.append("socket_precheck_failed")
-        if _attribute_precheck_failed(template_plan.repair_report):
-            failures.append("attribute_precheck_failed")
-        if _reservation_precheck_failed(metrics_payload, templates):
-            failures.append("reservation_precheck_failed")
-        if _gem_completeness_precheck_failed(build_details_payload):
-            failures.append("gem_completeness_precheck_failed")
-        if _item_completeness_precheck_failed(build_details_payload):
-            failures.append("item_completeness_precheck_failed")
-        for category in failures:
-            if category in precheck_counts:
-                precheck_counts[category] += 1
+            failures: list[str] = []
+            if _socket_precheck_failed(socket_plan):
+                failures.append("socket_precheck_failed")
+            if _attribute_precheck_failed(template_plan.repair_report):
+                failures.append("attribute_precheck_failed")
+            if _reservation_precheck_failed(metrics_payload, templates):
+                failures.append("reservation_precheck_failed")
+            if _gem_completeness_precheck_failed(build_details_payload):
+                failures.append("gem_completeness_precheck_failed")
+            if _item_completeness_precheck_failed(build_details_payload):
+                failures.append("item_completeness_precheck_failed")
+            for category in failures:
+                if category in precheck_counts:
+                    precheck_counts[category] += 1
 
-        build_id = uuid.uuid4().hex
-        code_payload = _render_build_code(genome, socket_plan, template_plan, metrics_payload)
-        candidate = Candidate(
-            seed=seed,
-            build_id=build_id,
-            main_skill_package=genome.main_skill_package,
-            class_name=genome.class_name,
-            ascendancy=genome.ascendancy,
-            budget_tier=genome.budget_tier,
-            failures=list(failures),
-            metrics_payload=metrics_payload,
-            genome=genome,
-            code_payload=code_payload,
-            build_details_payload=build_details_payload,
-        )
+            build_id = uuid.uuid4().hex
+            code_payload = _render_build_code(genome, socket_plan, template_plan, metrics_payload)
+            candidate = Candidate(
+                seed=seed,
+                build_id=build_id,
+                main_skill_package=genome.main_skill_package,
+                class_name=genome.class_name,
+                ascendancy=genome.ascendancy,
+                budget_tier=genome.budget_tier,
+                failures=list(failures),
+                metrics_payload=metrics_payload,
+                genome=genome,
+                code_payload=code_payload,
+                build_details_payload=build_details_payload,
+            )
         if stage_label:
             candidate.stage_label = stage_label
         if source:

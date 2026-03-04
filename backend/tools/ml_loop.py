@@ -907,6 +907,7 @@ def start_loop(args: argparse.Namespace) -> int:
                 seed_start=iteration_seed_start,
                 ruleset_id=ruleset_id,
                 profile_id=profile_id,
+                skeleton_id=getattr(args, "skeleton_id", None),
                 run_id=current_run_id,
                 base_path=data_root,
                 constraints=constraints,
@@ -2443,6 +2444,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Deterministic seed offset for generation",
     )
     start_parser.add_argument("--profile-id", default="pinnacle", help="Scenario profile")
+    start_parser.add_argument(
+        "--skeleton-id",
+        default=None,
+        help="Optional skeleton identifier for feasibility-first generation",
+    )
     start_parser.add_argument("--ruleset-id", default=None, help="Explicit ruleset id")
     start_parser.add_argument(
         "--scenario-version",
