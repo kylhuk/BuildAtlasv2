@@ -1714,6 +1714,7 @@ def run_generation(
     optimizer_elite_count: int = 2,
     constraints: Mapping[str, Any] | None = None,
     enforce_worker_tripwire: bool = False,
+    archive: ArchiveStore | None = None,
 ) -> dict[str, Any]:
     if count <= 0:
         raise ValueError("count must be positive")
@@ -2042,6 +2043,42 @@ def run_generation(
             )
     evaluable_candidates = [candidate for candidate in candidates if candidate.evaluable]
 
+    # Pre-filtering: if we have many candidates and surrogate is enabled,
+    # use surrogate to pre-filter to top 10% (e.g., 1000 -> 100)
+    prefiltered_candidates = evaluable_candidates
+    prefilter_ratio = 0.1  # Keep top 10% by gate slack
+    prefilter_threshold = max(100, int(len(evaluable_candidates) * prefilter_ratio))
+
+    if surrogate_enabled and len(evaluable_candidates) > prefilter_threshold * 2:
+        try:
+            # Calculate gate slack for all candidates
+            candidate_slacks: list[tuple[Candidate, float]] = []
+            for candidate in evaluable_candidates:
+                slack = _calculate_min_gate_slack(candidate, templates)
+                candidate_slacks.append((candidate, slack))
+
+            # Sort by slack (descending) and select top candidates
+            candidate_slacks.sort(key=lambda x: -x[1])
+            prefiltered_candidates = [c for c, _ in candidate_slacks[:prefilter_threshold]]
+            pruned_in_prefilter = len(evaluable_candidates) - len(prefiltered_candidates)
+
+            _phase_log(
+                "generation run %s phase=prefilter_complete "
+                "(total=%d prefiltered=%d pruned=%d ratio=%.2fx)",
+                session_id,
+                len(evaluable_candidates),
+                len(prefiltered_candidates),
+                pruned_in_prefilter,
+                len(evaluable_candidates) / max(1, len(prefiltered_candidates)),
+            )
+        except Exception as exc:  # pragma: no cover - best effort prefilter fallback
+            logger.warning(
+                "generation run %s surrogate pre-filtering failed, using all candidates: %s",
+                session_id,
+                exc,
+            )
+            prefiltered_candidates = evaluable_candidates
+
     surrogate_summary: dict[str, Any] = {
         "enabled": surrogate_enabled,
         "status": "disabled",
@@ -2052,7 +2089,7 @@ def run_generation(
             "exploration_pct": exploration_pct,
         },
         "counts": {
-            "candidates": len(evaluable_candidates),
+            "candidates": len(prefiltered_candidates),
             "selected": 0,
             "pruned": 0,
         },
@@ -2063,7 +2100,7 @@ def run_generation(
     prediction_timestamp: str | None = None
     selected_candidates: list[Candidate] = []
 
-    if surrogate_enabled and evaluable_candidates:
+    if surrogate_enabled and prefiltered_candidates:
         prediction_timestamp = datetime.now(timezone.utc).isoformat()
         try:
             if surrogate_predictor is not None:
@@ -2078,35 +2115,37 @@ def run_generation(
                         )
                     )
                 predictor_model_id, predictor = _load_surrogate_predictor(surrogate_model_path_obj)
-            feature_rows = [_candidate_feature_row(candidate) for candidate in evaluable_candidates]
+            feature_rows = [
+                _candidate_feature_row(candidate) for candidate in prefiltered_candidates
+            ]
             predictions = predictor(feature_rows)
             if len(predictions) != len(feature_rows):
                 raise ValueError(
                     "surrogate predictor returned %d predictions for %d candidates"
                     % (len(predictions), len(feature_rows))
                 )
-            for candidate, prediction in zip(evaluable_candidates, predictions, strict=True):
+            for candidate, prediction in zip(prefiltered_candidates, predictions, strict=True):
                 metrics, probability = _normalize_prediction_entry(prediction)
                 candidate.predicted_metrics = metrics or {}
                 candidate.pass_probability = probability
                 candidate.predicted_full_dps = candidate.predicted_metrics.get("full_dps", 0.0)
-            _log_degenerate_surrogate_predictions(session_id, evaluable_candidates)
+            _log_degenerate_surrogate_predictions(session_id, prefiltered_candidates)
             surrogate_summary["model_id"] = predictor_model_id
-            is_degenerate = _surrogate_predictions_degenerate(evaluable_candidates)
+            is_degenerate = _surrogate_predictions_degenerate(prefiltered_candidates)
             if is_degenerate:
                 surrogate_summary["status"] = "fallback"
                 surrogate_summary["fallback_reason"] = "degenerate_predictions"
                 pruned_candidates: list[Candidate] = []
                 if top_k is None:
-                    selected_candidates = evaluable_candidates[:]
+                    selected_candidates = prefiltered_candidates[:]
                 else:
-                    selection_limit = min(top_k, len(evaluable_candidates))
+                    selection_limit = min(top_k, len(prefiltered_candidates))
                     rng = random.Random(seed_start)
-                    selected_candidates = rng.sample(evaluable_candidates, selection_limit)
+                    selected_candidates = rng.sample(prefiltered_candidates, selection_limit)
                     selected_ids = {candidate.build_id for candidate in selected_candidates}
                     pruned_candidates = [
                         candidate
-                        for candidate in evaluable_candidates
+                        for candidate in prefiltered_candidates
                         if candidate.build_id not in selected_ids
                     ]
                 for candidate in selected_candidates:
@@ -2122,7 +2161,7 @@ def run_generation(
                         candidate,
                         _surrogate_rank_key(candidate, tie_breaker=ranker.random()),
                     )
-                    for candidate in evaluable_candidates
+                    for candidate in prefiltered_candidates
                 ]
                 ranked_candidates.sort(key=lambda item: item[1])
                 scored_candidates = [candidate for candidate, _ in ranked_candidates]
@@ -2161,7 +2200,7 @@ def run_generation(
                     candidate.selection_reason = "surrogate_pruned"
                 selected_candidates = top_candidates + exploration_candidates
                 surrogate_summary["status"] = "active"
-            for candidate in evaluable_candidates:
+            for candidate in prefiltered_candidates:
                 candidate.surrogate_prediction_payload = _prediction_payload(
                     candidate,
                     surrogate_summary["model_id"],
@@ -2176,7 +2215,7 @@ def run_generation(
                     surrogate_summary["model_path"],
                     prediction_timestamp,
                 )
-                for candidate in evaluable_candidates
+                for candidate in prefiltered_candidates
             ]
         except Exception as exc:  # pylint: disable=broad-except
             surrogate_summary["status"] = "fallback"

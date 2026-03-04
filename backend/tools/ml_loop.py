@@ -56,6 +56,7 @@ IMPROVEMENT_EPSILON = 1e-6
 PROMOTION_CLASSIFIER_BRIER_WEIGHT = 0.05
 VAL_SPLIT_MOD = 5
 VAL_SPLIT_REMAINDER = 0
+ONLINE_LEARNING_EVAL_THRESHOLD = 100  # Retrain surrogate every N PoB evaluations
 
 
 def _log_loop_phase(
@@ -282,6 +283,8 @@ def _build_initial_state(
         "last_skipped_iteration": None,
         "last_skip_reason_code": None,
         "last_skip_reason_message": None,
+        "online_learning_eval_count": 0,
+        "online_learning_last_retrain_iteration": None,
     }
 
 
@@ -693,6 +696,98 @@ def _resolve_ruleset_id(args: argparse.Namespace) -> str:
     )
 
 
+def _retrain_surrogate_if_needed(
+    state: dict[str, Any],
+    state_path: Path,
+    loop_id: str,
+    iteration: int,
+    snapshots_root: Path,
+    models_root: Path,
+    args: argparse.Namespace,
+) -> tuple[bool, str | None]:
+    """
+    Check if surrogate should be retrained based on evaluation count.
+    
+    Returns: (was_retrained, new_model_path)
+    """
+    eval_count = _coerce_int(state.get("online_learning_eval_count")) or 0
+    last_retrain_iteration = _coerce_int(state.get("online_learning_last_retrain_iteration")) or 0
+    
+    if eval_count < ONLINE_LEARNING_EVAL_THRESHOLD:
+        return False, None
+    
+    # Time to retrain
+    _log_loop_phase(
+        loop_id,
+        "online_learning_retrain",
+        iteration=iteration,
+        detail=f"eval_count={eval_count} threshold={ONLINE_LEARNING_EVAL_THRESHOLD}",
+    )
+    
+    try:
+        # Use all historical data for retraining
+        snapshot_id = f"online-learning-iter-{iteration:04d}"
+        retrain_started_at = monotonic()
+        snapshot = build_dataset_snapshot(
+            data_path=snapshots_root.parent.parent / "data",
+            output_root=snapshots_root,
+            snapshot_id=snapshot_id,
+            exclude_stub_rows=True,
+            profile_id=None,
+            scenario_id=None,
+        )
+        
+        if snapshot.row_count <= 0:
+            _log_loop_phase(
+                loop_id,
+                "online_learning_skipped",
+                iteration=iteration,
+                detail="no data available for retraining",
+            )
+            return False, None
+        
+        # Train new model with all historical data
+        model_id = f"{loop_id}-online-learning-{iteration:04d}"
+        train_result = train(
+            dataset_path=snapshot.dataset_path.parent,
+            output_root=models_root,
+            model_id=model_id,
+            compute_backend=args.surrogate_backend,
+            split_mod=VAL_SPLIT_MOD,
+            split_remainder=VAL_SPLIT_REMAINDER,
+        )
+        
+        elapsed = max(0.0, monotonic() - retrain_started_at)
+        _log_loop_phase(
+            loop_id,
+            "online_learning_complete",
+            iteration=iteration,
+            detail=(
+                f"model_id={train_result.model_id} rows={snapshot.row_count} "
+                f"elapsed={elapsed:.1f}s"
+            ),
+        )
+        
+        # Reset eval counter and update state
+        _persist_state(
+            state_path,
+            state,
+            online_learning_eval_count=0,
+            online_learning_last_retrain_iteration=iteration,
+        )
+        
+        return True, str(train_result.model_path)
+    
+    except Exception as exc:
+        logger.warning(
+            "ml loop %s iteration %d online learning retrain failed: %s",
+            loop_id,
+            iteration,
+            exc,
+        )
+        return False, None
+
+
 def start_loop(args: argparse.Namespace) -> int:
     loop_id = _validate_loop_id(args.loop_id)
     if args.iterations < 0:
@@ -831,16 +926,16 @@ def start_loop(args: argparse.Namespace) -> int:
             last_failure_checkpoint_path=None,
         )
 
-     repo: ClickhouseRepository | None = None
-     evaluator: BuildEvaluator | None = None
-     archive: ArchiveStore | None = None
+    repo: ClickhouseRepository | None = None
+    evaluator: BuildEvaluator | None = None
+    archive: ArchiveStore | None = None
 
-     stop_triggered = False
-     current_iteration = 0
-     iteration = start_iteration
-     current_run_id: str | None = None
-     iteration_seed_start: int | None = None
-     try:
+    stop_triggered = False
+    current_iteration = 0
+    iteration = start_iteration
+    current_run_id: str | None = None
+    iteration_seed_start: int | None = None
+    try:
          repo = ClickhouseRepository()
          evaluator = BuildEvaluator(repo=repo, base_path=data_root)
          evaluator.require_worker_metrics_for_profile(profile_id)
@@ -1295,25 +1390,49 @@ def start_loop(args: argparse.Namespace) -> int:
             checkpoint_path = _iteration_checkpoint_path(loop_root, iteration)
             checkpoint_path.write_text(json.dumps(record), encoding="utf-8")
             print(json.dumps(record))
-            _persist_state(
-                state_path,
-                state,
-                phase="idle",
-                iteration=iteration,
-                last_model_id=promoted_model_id,
-                last_model_path=promoted_model_path,
-                last_improvement=improvement,
-                last_error=None,
-                last_iteration_outcome="completed",
-                last_skip_reason_code=None,
-                last_skip_reason_message=None,
-                failed_iteration=None,
-                failed_phase=None,
-                failed_at_utc=None,
-                last_failure_checkpoint_path=None,
-            )
-            _log_loop_phase(loop_id, "idle", iteration=iteration, detail="iteration complete")
-            iteration += 1
+             # Update online learning eval counter
+             current_eval_count = _coerce_int(state.get("online_learning_eval_count")) or 0
+             new_eval_count = current_eval_count + verified_count
+             
+             _persist_state(
+                 state_path,
+                 state,
+                 phase="idle",
+                 iteration=iteration,
+                 last_model_id=promoted_model_id,
+                 last_model_path=promoted_model_path,
+                 last_improvement=improvement,
+                 last_error=None,
+                 last_iteration_outcome="completed",
+                 last_skip_reason_code=None,
+                 last_skip_reason_message=None,
+                 failed_iteration=None,
+                 failed_phase=None,
+                 failed_at_utc=None,
+                 last_failure_checkpoint_path=None,
+                 online_learning_eval_count=new_eval_count,
+             )
+             
+             # Check if online learning retrain is needed
+             state = _load_state(state_path)
+             was_retrained, new_model_path = _retrain_surrogate_if_needed(
+                 state=state,
+                 state_path=state_path,
+                 loop_id=loop_id,
+                 iteration=iteration,
+                 snapshots_root=snapshots_root,
+                 models_root=models_root,
+                 args=args,
+             )
+             if was_retrained and new_model_path:
+                 _persist_state(
+                     state_path,
+                     state,
+                     last_model_path=new_model_path,
+                 )
+             
+             _log_loop_phase(loop_id, "idle", iteration=iteration, detail="iteration complete")
+             iteration += 1
         if not stop_triggered and total_iterations is not None:
             final_state = _load_state(state_path)
             _persist_state(

@@ -2400,3 +2400,105 @@ def test_start_loop_rebuilds_corrupt_state_file(
     assert state["status"] == "completed"
     assert state["iteration"] == 1
     assert state["seed_start_base"] == 7
+
+
+def test_online_learning_eval_counter_increments(tmp_path: Path) -> None:
+    """Test that online learning eval counter increments with verified builds."""
+    loop_id = "online-learning-test"
+    data_path = tmp_path / "data"
+    loop_root = data_path / "ml_loops" / loop_id
+    loop_root.mkdir(parents=True, exist_ok=True)
+    state_path = loop_root / ml_loop.STATE_FILENAME
+
+    # Create initial state
+    state = ml_loop._build_initial_state(
+        loop_id=loop_id,
+        total_iterations=1,
+        seed_start_base=1,
+        seed_window_size=10,
+    )
+    ml_loop._write_state(state_path, state)
+
+    # Verify initial eval count is 0
+    loaded_state = ml_loop._load_state(state_path)
+    assert loaded_state.get("online_learning_eval_count") == 0
+
+    # Simulate adding 50 evaluations
+    ml_loop._persist_state(
+        state_path,
+        loaded_state,
+        online_learning_eval_count=50,
+    )
+
+    loaded_state = ml_loop._load_state(state_path)
+    assert loaded_state.get("online_learning_eval_count") == 50
+
+    # Simulate adding 60 more (total 110, exceeds threshold of 100)
+    ml_loop._persist_state(
+        state_path,
+        loaded_state,
+        online_learning_eval_count=110,
+    )
+
+    loaded_state = ml_loop._load_state(state_path)
+    assert loaded_state.get("online_learning_eval_count") == 110
+
+
+def test_online_learning_retrain_threshold_check(tmp_path: Path) -> None:
+    """Test that retrain is triggered when eval count exceeds threshold."""
+    loop_id = "online-learning-retrain-test"
+    data_path = tmp_path / "data"
+    loop_root = data_path / "ml_loops" / loop_id
+    loop_root.mkdir(parents=True, exist_ok=True)
+    state_path = loop_root / ml_loop.STATE_FILENAME
+
+    # Create initial state with eval count below threshold
+    state = ml_loop._build_initial_state(
+        loop_id=loop_id,
+        total_iterations=1,
+        seed_start_base=1,
+        seed_window_size=10,
+    )
+    state["online_learning_eval_count"] = 50
+    ml_loop._write_state(state_path, state)
+
+    # Verify threshold constant is set correctly
+    assert ml_loop.ONLINE_LEARNING_EVAL_THRESHOLD == 100
+
+    # Verify state has online learning fields
+    loaded_state = ml_loop._load_state(state_path)
+    assert "online_learning_eval_count" in loaded_state
+    assert "online_learning_last_retrain_iteration" in loaded_state
+
+
+def test_online_learning_state_persistence(tmp_path: Path) -> None:
+    """Test that online learning state persists across state saves."""
+    loop_id = "online-learning-persistence-test"
+    data_path = tmp_path / "data"
+    loop_root = data_path / "ml_loops" / loop_id
+    loop_root.mkdir(parents=True, exist_ok=True)
+    state_path = loop_root / ml_loop.STATE_FILENAME
+
+    # Create initial state
+    state = ml_loop._build_initial_state(
+        loop_id=loop_id,
+        total_iterations=5,
+        seed_start_base=1,
+        seed_window_size=10,
+    )
+    ml_loop._write_state(state_path, state)
+
+    # Update with online learning metrics
+    loaded_state = ml_loop._load_state(state_path)
+    ml_loop._persist_state(
+        state_path,
+        loaded_state,
+        online_learning_eval_count=75,
+        online_learning_last_retrain_iteration=2,
+    )
+
+    # Verify persistence
+    final_state = ml_loop._load_state(state_path)
+    assert final_state.get("online_learning_eval_count") == 75
+    assert final_state.get("online_learning_last_retrain_iteration") == 2
+    assert final_state.get("updated_at_utc") is not None

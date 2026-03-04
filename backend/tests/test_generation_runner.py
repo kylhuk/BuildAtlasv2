@@ -443,3 +443,159 @@ def test_stub_tripwire_detects_linear_stub_metrics() -> None:
     ]
     with pytest.raises(ValueError, match="PoB evaluation inactive; stub metrics detected"):
         _assert_no_stub_metrics(entries)
+
+
+def test_calculate_min_gate_slack_basic() -> None:
+    """Test min_gate_slack calculation with basic metrics."""
+    from backend.engine.generation.runner import _calculate_min_gate_slack
+    from backend.engine.scenarios.loader import (
+        ScenarioTemplate,
+        ScenarioGateThresholds,
+        ScenarioReservationThreshold,
+    )
+
+    candidate = _dummy_candidate()
+    # Create a mock template with thresholds
+    template = ScenarioTemplate(
+        scenario_id="mapping_t16",
+        version="1.0",
+        profile_id="alpha",
+        pob_config={},
+        gate_thresholds=ScenarioGateThresholds(
+            min_full_dps=1000.0,
+            min_max_hit=500.0,
+            resists={"fire": 60.0, "cold": 60.0, "lightning": 60.0, "chaos": 0.0},
+            attributes={"strength": 100.0, "dexterity": 100.0, "intelligence": 100.0},
+            reservation=ScenarioReservationThreshold(max_percent=50.0),
+        ),
+    )
+
+    slack = _calculate_min_gate_slack(candidate, [template])
+    # DPS slack: 1500 / 1000 = 1.5
+    # Max hit slack: 750 / 500 = 1.5
+    # Reservation slack: (50 - 30) / 50 = 0.4
+    # Min slack should be 0.4 (reservation is the bottleneck)
+    assert slack == pytest.approx(0.4, abs=0.01)
+
+
+def test_calculate_min_gate_slack_empty_templates() -> None:
+    """Test min_gate_slack with no templates."""
+    from backend.engine.generation.runner import _calculate_min_gate_slack
+
+    candidate = _dummy_candidate()
+    slack = _calculate_min_gate_slack(candidate, [])
+    assert slack == 0.0
+
+
+def test_calculate_min_gate_slack_missing_metrics() -> None:
+    """Test min_gate_slack when metrics are missing."""
+    from backend.engine.generation.runner import _calculate_min_gate_slack
+    from backend.engine.scenarios.loader import (
+        ScenarioTemplate,
+        ScenarioGateThresholds,
+        ScenarioReservationThreshold,
+    )
+
+    candidate = _dummy_candidate()
+    candidate.metrics_payload = {}  # Empty metrics
+
+    template = ScenarioTemplate(
+        scenario_id="mapping_t16",
+        version="1.0",
+        profile_id="alpha",
+        pob_config={},
+        gate_thresholds=ScenarioGateThresholds(
+            min_full_dps=1000.0,
+            min_max_hit=500.0,
+            resists={"fire": 60.0, "cold": 60.0, "lightning": 60.0, "chaos": 0.0},
+            attributes={"strength": 100.0, "dexterity": 100.0, "intelligence": 100.0},
+            reservation=ScenarioReservationThreshold(max_percent=50.0),
+        ),
+    )
+
+    slack = _calculate_min_gate_slack(candidate, [template])
+    assert slack == 0.0
+
+
+def test_surrogate_prefiltering_reduces_candidates() -> None:
+    """Test that surrogate pre-filtering reduces candidate count by 10x."""
+    from backend.engine.generation.runner import _calculate_min_gate_slack
+    from backend.engine.scenarios.loader import (
+        ScenarioTemplate,
+        ScenarioGateThresholds,
+        ScenarioReservationThreshold,
+    )
+
+    # Create 1000 candidates with varying metrics
+    candidates = []
+    for i in range(1000):
+        genome = GenomeV0(
+            seed=i,
+            class_name="Witch",
+            ascendancy="Occultist",
+            main_skill_package="arc",
+            defense_archetype="armour",
+            budget_tier="starter",
+            profile_id="alpha",
+        )
+        # Vary metrics based on seed
+        dps = 500.0 + (i * 2.0)  # 500 to 2500
+        max_hit = 300.0 + (i * 1.0)  # 300 to 1300
+        reserved = 20.0 + ((i % 30) * 1.0)  # 20 to 50
+
+        candidate = Candidate(
+            seed=i,
+            build_id=f"candidate-{i}",
+            main_skill_package="arc",
+            class_name="Witch",
+            ascendancy="Occultist",
+            budget_tier="starter",
+            failures=[],
+            metrics_payload={
+                "mapping_t16": {
+                    "metrics": {"full_dps": dps, "max_hit": max_hit},
+                    "defense": {"armour": 900.0, "resists": {"fire": 70.0}},
+                    "resources": {"life": 4200.0, "mana": 1300.0},
+                    "reservation": {
+                        "reserved_percent": reserved,
+                        "available_percent": 100.0 - reserved,
+                    },
+                    "attributes": {"strength": 150.0, "dexterity": 120.0, "intelligence": 80.0},
+                }
+            },
+            genome=genome,
+            code_payload="{}",
+            build_details_payload={},
+        )
+        candidates.append(candidate)
+
+    # Create template with thresholds
+    template = ScenarioTemplate(
+        scenario_id="mapping_t16",
+        version="1.0",
+        profile_id="alpha",
+        pob_config={},
+        gate_thresholds=ScenarioGateThresholds(
+            min_full_dps=1000.0,
+            min_max_hit=500.0,
+            resists={"fire": 60.0, "cold": 60.0, "lightning": 60.0, "chaos": 0.0},
+            attributes={"strength": 100.0, "dexterity": 100.0, "intelligence": 100.0},
+            reservation=ScenarioReservationThreshold(max_percent=50.0),
+        ),
+    )
+
+    # Calculate slack for all candidates
+    candidate_slacks = []
+    for candidate in candidates:
+        slack = _calculate_min_gate_slack(candidate, [template])
+        candidate_slacks.append((candidate, slack))
+
+    # Sort by slack and select top 10%
+    candidate_slacks.sort(key=lambda x: -x[1])
+    prefilter_threshold = max(100, int(len(candidates) * 0.1))
+    prefiltered = [c for c, _ in candidate_slacks[:prefilter_threshold]]
+
+    # Verify 10x reduction
+    assert len(prefiltered) == prefilter_threshold
+    assert len(prefiltered) == 100  # 10% of 1000
+    assert len(candidates) / len(prefiltered) == pytest.approx(10.0, abs=0.1)

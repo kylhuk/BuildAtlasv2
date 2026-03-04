@@ -1,4 +1,5 @@
 import concurrent.futures
+import hashlib
 import itertools
 import json
 import logging
@@ -7,11 +8,16 @@ import random
 import subprocess
 import threading
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WORKER_CMD: Sequence[str] = ("luajit", "backend/pob_worker/pob_worker.lua")
+
+# Cache configuration
+RESULT_CACHE_MAX_SIZE = 10000
+CACHE_HIT_STATS_INTERVAL = 100  # Log stats every N requests
 
 WORKER_TERMINATED_ERROR_CODE = -32000
 WORKER_PROTOCOL_ERROR_CODE = -32001
@@ -338,6 +344,9 @@ class WorkerPool:
         self._round_robin_lock = threading.Lock()
         self._next_worker = 0
         self._closing = threading.Event()
+        self._result_cache: Dict[str, Dict[str, Any]] = {}
+        self._cache_lock = threading.Lock()
+        self._cache_stats = {"hits": 0, "misses": 0, "requests": 0}
 
     def evaluate_batch(
         self,
@@ -351,11 +360,51 @@ class WorkerPool:
             return []
         futures: List[concurrent.futures.Future] = []
         future_to_index: dict[concurrent.futures.Future, int] = {}
+        cached_results: list[dict[str, Any] | None] = [None] * len(payloads)
+        pending_indices: list[int] = []
+
         for index, payload in enumerate(payloads):
-            worker_idx = self._assign_worker()
-            future = self._executor.submit(self._send_with_retries, worker_idx, payload)
-            futures.append(future)
-            future_to_index[future] = index
+            cache_key = self._compute_cache_key(payload)
+            cached = self._get_cached_result(cache_key)
+            if cached is not None:
+                cached_results[index] = cached
+                with self._cache_lock:
+                    self._cache_stats["hits"] += 1
+            else:
+                with self._cache_lock:
+                    self._cache_stats["misses"] += 1
+                pending_indices.append(index)
+                worker_idx = self._assign_worker()
+                future = self._executor.submit(
+                    self._send_with_retries, worker_idx, payload, cache_key
+                )
+                futures.append(future)
+                future_to_index[future] = index
+
+        with self._cache_lock:
+            self._cache_stats["requests"] += len(payloads)
+            if self._cache_stats["requests"] % CACHE_HIT_STATS_INTERVAL == 0:
+                hit_rate = (
+                    self._cache_stats["hits"] / self._cache_stats["requests"]
+                    if self._cache_stats["requests"] > 0
+                    else 0.0
+                )
+                logger.info(
+                    "cache stats: hits=%d misses=%d requests=%d hit_rate=%.1f%%",
+                    self._cache_stats["hits"],
+                    self._cache_stats["misses"],
+                    self._cache_stats["requests"],
+                    hit_rate * 100,
+                )
+
+        if not futures:
+            typed_results: List[Dict[str, Any]] = []
+            for result in cached_results:
+                if result is None:
+                    raise WorkerProtocolError("worker pool returned incomplete batch results")
+                typed_results.append(result)
+            return typed_results
+
         total = len(futures)
         results: list[dict[str, Any] | None] = [None] * total
         pending: set[concurrent.futures.Future] = set(futures)
@@ -382,8 +431,8 @@ class WorkerPool:
                 )
                 continue
             for future in done:
-                index = future_to_index[future]
-                results[index] = future.result()
+                pending_idx = future_to_index[future]
+                results[pending_idx] = future.result()
                 completed += 1
 
         if total > 1:
@@ -397,10 +446,14 @@ class WorkerPool:
             )
 
         typed_results: List[Dict[str, Any]] = []
-        for result in results:
-            if result is None:
-                raise WorkerProtocolError("worker pool returned incomplete batch results")
-            typed_results.append(result)
+        for i, result in enumerate(cached_results):
+            if result is not None:
+                typed_results.append(result)
+            else:
+                pending_result_idx = pending_indices.index(i)
+                if results[pending_result_idx] is None:
+                    raise WorkerProtocolError("worker pool returned incomplete batch results")
+                typed_results.append(results[pending_result_idx])
         return typed_results
 
     def close(self) -> None:
