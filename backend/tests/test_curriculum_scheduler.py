@@ -107,26 +107,26 @@ class TestCurriculumState:
 
     def test_transition_criteria(self):
         """Test transition criteria (>10% feasibility)."""
-        # Below threshold
+        # Below 25% threshold - should NOT transition
         state_below = CurriculumState(
             current_phase=CurriculumPhase.MAPPING,
             total_samples=100,
-            feasible_samples=10,
+            feasible_samples=24,
             phase_samples=100,
-            phase_feasible_samples=10,
+            phase_feasible_samples=24,
         )
-        assert state_below.phase_feasibility == 0.1
+        assert state_below.phase_feasibility == 0.24
         assert not state_below.should_transition
 
-        # Above threshold
+        # Above 25% threshold - should transition
         state_above = CurriculumState(
             current_phase=CurriculumPhase.MAPPING,
             total_samples=100,
-            feasible_samples=12,
+            feasible_samples=26,
             phase_samples=100,
-            phase_feasible_samples=12,
+            phase_feasible_samples=26,
         )
-        assert state_above.phase_feasibility == 0.12
+        assert state_above.phase_feasibility == 0.26
         assert state_above.should_transition
 
     def test_next_phase(self):
@@ -285,15 +285,16 @@ class TestCurriculumScheduler:
     def test_record_evaluation_feasible(self):
         """Test recording feasible evaluation."""
         scheduler = CurriculumScheduler()
-        # Record one feasible sample
+        # Record one feasible sample - at 100% feasibility, should transition immediately
         scheduler.record_evaluation(gate_passed=True)
 
-        # With guardrails (MIN_SAMPLES_PER_PHASE=100), no transition occurs yet
+        # Pure metric-based: 100% > 25% threshold triggers transition
         assert scheduler.state.total_samples == 1
         assert scheduler.state.feasible_samples == 1
-        # Phase counters NOT reset (no transition with guardrails)
-        assert scheduler.state.phase_samples == 1
-        assert scheduler.state.phase_feasible_samples == 1
+        # Phase counters reset after transition to BOSSING
+        assert scheduler.current_phase == CurriculumPhase.BOSSING
+        assert scheduler.state.phase_samples == 0
+        assert scheduler.state.phase_feasible_samples == 0
 
     def test_record_evaluation_infeasible(self):
         """Test recording infeasible evaluation."""
@@ -306,15 +307,17 @@ class TestCurriculumScheduler:
         assert scheduler.state.phase_feasible_samples == 0
 
     def test_phase_transition_on_threshold(self):
-        """Test automatic phase transition when feasibility exceeds 10%."""
+        """Test automatic phase transition when feasibility exceeds 25%."""
         scheduler = CurriculumScheduler(initial_phase=CurriculumPhase.MAPPING)
 
+        # First 100 builds fail
         for _ in range(100):
             scheduler.record_evaluation(gate_passed=False)
 
         assert scheduler.current_phase == CurriculumPhase.MAPPING
 
-        for _ in range(12):
+        # Need >25% feasibility to transition: 34/134 = 25.37%
+        for _ in range(34):
             scheduler.record_evaluation(gate_passed=True)
 
         assert scheduler.current_phase == CurriculumPhase.BOSSING
@@ -328,9 +331,10 @@ class TestCurriculumScheduler:
         phases_visited = [scheduler.current_phase]
 
         for phase_idx in range(3):
+            # Need >25% pass rate to transition per phase
             for _ in range(100):
                 scheduler.record_evaluation(gate_passed=False)
-            for _ in range(12):
+            for _ in range(34):  # 34/134 = 25.37% > 25% threshold
                 scheduler.record_evaluation(gate_passed=True)
 
             phases_visited.append(scheduler.current_phase)
@@ -399,4 +403,4 @@ class TestCurriculumIntegration:
 
     def test_feasibility_transition_threshold_constant(self):
         """Test that transition threshold is properly defined."""
-        assert FEASIBILITY_TRANSITION_THRESHOLD == 0.10
+        assert FEASIBILITY_TRANSITION_THRESHOLD == 0.25

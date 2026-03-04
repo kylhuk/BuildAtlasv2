@@ -69,14 +69,14 @@ def test_record_iteration_no_transition():
 
 
 def test_record_iteration_with_transition():
-    """Test iteration recording triggers phase transition at >10%."""
+    """Test iteration recording triggers phase transition at >25%."""
     mgr = CurriculumManager()
 
     # First batch: 100 failures (0% pass rate)
     mgr.record_iteration([False] * 100)
 
-    # Second batch: 20 passes (20/120 ~= 16.7% > 10% threshold)
-    result = mgr.record_iteration([True] * 20)
+    # Second batch: 34 passes (34/134 ~= 25.4% > 25% threshold)
+    result = mgr.record_iteration([True] * 34)
 
     assert result["transitioned"] is True
     assert result["from_phase"] == "MAPPING"
