@@ -23,7 +23,7 @@ from backend.engine.metrics_source import (
     METRICS_SOURCE_STUB,
     normalize_metrics_source,
 )
-from backend.engine.scenarios.loader import ScenarioTemplate, list_templates
+from backend.engine.scenarios.loader import ScenarioGateThresholds, ScenarioTemplate, list_templates
 from backend.engine.worker_pool import WorkerPool, WorkerPoolError
 
 logger = logging.getLogger(__name__)
@@ -115,7 +115,12 @@ class BuildEvaluator:
         except Exception:
             pass
 
-    def evaluate_build(self, build_id: str) -> tuple[BuildStatus, List[ScenarioMetricRow]]:
+    def evaluate_build(
+        self,
+        build_id: str,
+        *,
+        gate_thresholds: ScenarioGateThresholds | None = None,
+    ) -> tuple[BuildStatus, List[ScenarioMetricRow]]:
         build = self._repo.get_build(build_id)
         if not build:
             raise APIError(404, "build_not_found", f"build {build_id} not found")
@@ -127,7 +132,7 @@ class BuildEvaluator:
         self._ensure_transition(current_status, BuildStatus.queued)
         self._repo.update_build_status(build_id, BuildStatus.queued.value)
         try:
-            scenario_rows = self._collect_scenario_rows(build)
+            scenario_rows = self._collect_scenario_rows(build, gate_thresholds=gate_thresholds)
             self._repo.insert_scenario_metrics(scenario_rows)
             final_status = BuildStatus.evaluated
             self._repo.update_build_status(build_id, final_status.value)
@@ -144,7 +149,12 @@ class BuildEvaluator:
                 details=str(exc),
             ) from exc
 
-    def _collect_scenario_rows(self, build: dict[str, Any]) -> List[ScenarioMetricRow]:
+    def _collect_scenario_rows(
+        self,
+        build: dict[str, Any],
+        *,
+        gate_thresholds: ScenarioGateThresholds | None,
+    ) -> List[ScenarioMetricRow]:
         build_id = build.get("build_id")
         if not build_id:
             raise APIError(400, "invalid_build", "build record missing build_id")
@@ -169,20 +179,20 @@ class BuildEvaluator:
         scenarios_used = []
         for template in templates:
             if hasattr(template.gate_thresholds, "model_dump"):
-                gate_thresholds = template.gate_thresholds.model_dump(mode="json")
+                gate_thresholds_payload = template.gate_thresholds.model_dump(mode="json")
             elif hasattr(template.gate_thresholds, "dict"):
-                gate_thresholds = template.gate_thresholds.dict()
+                gate_thresholds_payload = template.gate_thresholds.dict()
             elif is_dataclass(template.gate_thresholds):
-                gate_thresholds = asdict(template.gate_thresholds)
+                gate_thresholds_payload = asdict(template.gate_thresholds)
             else:
-                gate_thresholds = dict(template.gate_thresholds)
+                gate_thresholds_payload = dict(template.gate_thresholds)
             scenarios_used.append(
                 {
                     "scenario_id": template.scenario_id,
                     "version": template.version,
                     "profile_id": template.profile_id,
                     "pob_config": template.pob_config,
-                    "gate_thresholds": gate_thresholds,
+                    "gate_thresholds": gate_thresholds_payload,
                 }
             )
         # FL-03: Add gate_pass to raw_metrics for ML training
@@ -192,7 +202,10 @@ class BuildEvaluator:
             if payload is not None and isinstance(payload, dict):
                 normalized = map_worker_output(payload)
                 normalized = adjust_metrics_for_profile(template.profile_id, normalized)
-                gate_eval = evaluate_gates(normalized, template.gate_thresholds)
+                effective_thresholds = (
+                    gate_thresholds if gate_thresholds is not None else template.gate_thresholds
+                )
+                gate_eval = evaluate_gates(normalized, effective_thresholds)
                 payload["gate_pass"] = gate_eval.gate_pass
                 payload["gate_fail_reasons"] = list(gate_eval.gate_fail_reasons)
                 payload["gate_slacks"] = asdict(gate_eval.gate_slacks)
@@ -392,6 +405,24 @@ class BuildEvaluator:
         stub_only = bool(raw_metrics) and not bool(filtered)
         return filtered, stub_only
 
+    def _build_requires_worker_batch(
+        self,
+        templates: Sequence[ScenarioTemplate],
+        raw_metrics: Mapping[str, Any],
+        *,
+        worker_required: bool,
+    ) -> bool:
+        required_scenarios = {template.scenario_id for template in templates}
+        has_all_metrics = required_scenarios.issubset(raw_metrics.keys())
+        if has_all_metrics:
+            # If we have all metrics and they are not stub-only, we don't need the worker.
+            # Note: raw_metrics here is already filtered by _filter_stub_metrics in _resolve_raw_metrics.
+            return False
+
+        if not worker_required:
+            return False
+        return True
+
     def _is_stub_metrics_payload(self, payload: Any) -> bool:
         if not isinstance(payload, Mapping):
             return False
@@ -427,6 +458,14 @@ class BuildEvaluator:
         fallback_metrics = self._map_raw_metrics(artifacts.raw_metrics)
         filtered_metrics, stub_only = self._filter_stub_metrics(fallback_metrics)
         scenario_ids = {template.scenario_id for template in templates}
+        worker_batch_required = self._build_requires_worker_batch(
+            templates,
+            filtered_metrics,
+            worker_required=worker_required,
+        )
+
+        if worker_required and not worker_batch_required:
+            return filtered_metrics
 
         if not worker_required and "mapping_t16" in scenario_ids and not filtered_metrics:
             xml_metrics = self._extract_mapping_playerstats_metrics(artifacts)
@@ -445,7 +484,7 @@ class BuildEvaluator:
                     },
                 )
 
-        if worker_required:
+        if worker_batch_required:
             worker_metrics = self._collect_worker_metrics(
                 build_id,
                 build,
