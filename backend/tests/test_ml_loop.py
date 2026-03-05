@@ -1703,15 +1703,27 @@ def test_compute_improvement_uses_pass_log1p_and_classifier_brier() -> None:
         row_count=1,
         metric_mae={"full_dps": 1.0, "max_hit": 1.0},
         metric_mae_log1p_pass={"full_dps": 0.40, "max_hit": 0.30},
-        classifier_metrics={"brier": 0.20},
+        classifier_metrics={
+            "brier": 0.20,
+            "positive_count": 1,
+            "negative_count": 1,
+            "labeled_count": 2,
+        },
         pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+        labeled_count_pass=1,
     )
     previous = EvaluationResult(
         row_count=1,
         metric_mae={"full_dps": 1.0, "max_hit": 1.0},
         metric_mae_log1p_pass={"full_dps": 0.52, "max_hit": 0.41},
-        classifier_metrics={"brier": 0.24},
+        classifier_metrics={
+            "brier": 0.24,
+            "positive_count": 1,
+            "negative_count": 1,
+            "labeled_count": 2,
+        },
         pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+        labeled_count_pass=1,
     )
     improvement = ml_loop._compute_improvement(current, previous)
     assert improvement["improved"] is True
@@ -1724,15 +1736,27 @@ def test_compute_improvement_requires_epsilon_gap() -> None:
         row_count=1,
         metric_mae={"full_dps": 1.0, "max_hit": 1.0},
         metric_mae_log1p_pass={"full_dps": 0.50, "max_hit": 0.50},
-        classifier_metrics={"brier": 0.20},
+        classifier_metrics={
+            "brier": 0.20,
+            "positive_count": 1,
+            "negative_count": 1,
+            "labeled_count": 2,
+        },
         pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+        labeled_count_pass=1,
     )
     previous = EvaluationResult(
         row_count=1,
         metric_mae={"full_dps": 1.0, "max_hit": 1.0},
         metric_mae_log1p_pass={"full_dps": 0.50, "max_hit": 0.50},
-        classifier_metrics={"brier": 0.20},
+        classifier_metrics={
+            "brier": 0.20,
+            "positive_count": 1,
+            "negative_count": 1,
+            "labeled_count": 2,
+        },
         pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+        labeled_count_pass=1,
     )
     improvement = ml_loop._compute_improvement(current, previous)
     assert improvement["improved"] is False
