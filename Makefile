@@ -67,7 +67,7 @@ ui-dev:
 test: backend-test ui-test
 
 backend-test:
-	$(BACKEND_RUN_DEV) python -m pytest $(BACKEND_DIR)/tests -q -rs
+	VIRTUAL_ENV= $(UV) --project $(BACKEND_DIR) run --extra dev --extra ml python -m pytest $(BACKEND_DIR)/tests -q -rs
 
 ui-test:
 	npm --prefix $(UI_DIR) run lint
