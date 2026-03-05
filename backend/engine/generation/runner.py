@@ -2318,7 +2318,9 @@ def run_generation(
         abort_for_non_pob_metrics = False
         try:
             _persist_candidate(candidate)
-            status, rows = evaluator.evaluate_build(candidate.build_id)
+            status, rows = evaluator.evaluate_build(
+                candidate.build_id, gate_thresholds=gate_thresholds
+            )
             provenance = evaluator.pop_last_evaluation_provenance()
             _record_provenance_counts(provenance, evaluation_counters)
             candidate.evaluation_status = status.value

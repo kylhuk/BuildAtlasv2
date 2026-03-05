@@ -128,29 +128,49 @@ def build_dataset_snapshot(
         )
     )
 
-    # Evolutionary selection: kill bottom 10% by fitness (FullDPS × MaxHit)
+    # Evolutionary selection: label bottom (1-survival_rate) builds as gate_fail
+    #
+    # IMPORTANT: We do NOT drop the worst rows here. Instead we overwrite gate_pass
+    # based on per-build fitness ranking. This provides both positive and negative
+    # labels for the classifier while ensuring regressors train only on the
+    # surviving builds (gate_pass=True).
     evolutionary_stats = None
     if evolutionary_selection and rows:
-        original_count = len(rows)
-        # Calculate fitness score for each row
-        rows_with_fitness = []
+        original_row_count = len(rows)
+        fitness_by_build: dict[str, float] = {}
         for row in rows:
+            build_id = str(row.get("build_id") or "").strip()
+            if not build_id:
+                continue
             full_dps = float(row.get("full_dps") or 0)
             max_hit = float(row.get("max_hit") or 0)
             fitness = full_dps * max_hit
-            rows_with_fitness.append((fitness, row))
+            previous = fitness_by_build.get(build_id)
+            if previous is None or fitness > previous:
+                fitness_by_build[build_id] = fitness
 
-        # Sort by fitness descending and keep top survival_rate
-        rows_with_fitness.sort(key=lambda x: x[0], reverse=True)
-        keep_count = max(1, int(len(rows_with_fitness) * survival_rate))
-        rows = [row for _, row in rows_with_fitness[:keep_count]]
+        ranked_builds = sorted(fitness_by_build.items(), key=lambda item: item[1], reverse=True)
+        total_builds = len(ranked_builds)
+        keep_builds = max(1, int(total_builds * survival_rate)) if total_builds else 0
+        kept_ids = {build_id for build_id, _ in ranked_builds[:keep_builds]}
 
-        killed_count = original_count - len(rows)
+        # Overwrite gate_pass for every row (per build) so ML training sees labels.
+        mutated = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            build_id = str(row.get("build_id") or "").strip()
+            row["gate_pass"] = bool(build_id and build_id in kept_ids)
+            mutated += 1
+
         evolutionary_stats = {
-            "original_count": original_count,
-            "killed_count": killed_count,
             "survival_rate": survival_rate,
-            "final_count": len(rows),
+            "original_row_count": original_row_count,
+            "final_row_count": len(rows),
+            "build_count": total_builds,
+            "kept_build_count": keep_builds,
+            "killed_build_count": max(0, total_builds - keep_builds),
+            "rows_labeled": mutated,
         }
 
     dataset_path = snapshot_dir / _DATASET_FILENAME

@@ -84,6 +84,7 @@ def _prepare_client(tmp_path: Path) -> tuple[TestClient, FakeRepository]:
     app.dependency_overrides[get_build_evaluator] = lambda: BuildEvaluator(
         repo=fake_repo,
         base_path=tmp_path,
+        profiles_requiring_worker_metrics=("uber_pinnacle",),
     )
     return TestClient(app), fake_repo
 
