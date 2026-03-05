@@ -1592,6 +1592,7 @@ def test_start_loop_endless_respects_stop_request(
         exclude_stub_rows: bool,
         profile_id: str | None = None,
         scenario_id: str | None = None,
+        **kwargs: Any,
     ) -> SnapshotResult:
         nonlocal last_snapshot_id, last_snapshot_root
         assert exclude_stub_rows is True

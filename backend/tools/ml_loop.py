@@ -37,7 +37,11 @@ from backend.engine.ruleset import (
     read_pob_commit,
     scenario_version_from_profile,
 )
-from backend.engine.scenarios.loader import list_templates
+from backend.engine.scenarios.loader import (
+    ScenarioGateThresholds,
+    ScenarioReservationThreshold,
+    list_templates,
+)
 from backend.engine.curriculum import CurriculumManager, CurriculumPhase
 from backend.engine.surrogate import (
     EvaluationResult,
@@ -125,7 +129,9 @@ def _load_constraints(path: Path | None) -> Mapping[str, Any] | None:
 
 def _write_state(state_path: Path, payload: Mapping[str, Any]) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    # Exclude transient/internal fields (starting with _) from JSON payload
+    serializable_payload = {k: v for k, v in payload.items() if not k.startswith("_")}
+    state_path.write_text(json.dumps(serializable_payload, indent=2), encoding="utf-8")
 
 
 def _load_state(state_path: Path) -> dict[str, Any]:
@@ -940,9 +946,21 @@ def start_loop(args: argparse.Namespace) -> int:
     state["_curriculum_manager"] = curriculum
     _persist_state(state_path, state)
 
-    base_thresholds = None
+    gate_profile = getattr(args, "gate_profile", None)
+
+    def _no_gate_thresholds() -> ScenarioGateThresholds:
+        # Thresholds that make all gate checks pass.
+        return ScenarioGateThresholds(
+            resists={},
+            reservation=ScenarioReservationThreshold(max_percent=100.0),
+            attributes={},
+            min_max_hit=0.0,
+            min_full_dps=0.0,
+        )
+
+    base_thresholds: ScenarioGateThresholds | None = None
     # Only load gate thresholds if --gate-profile is explicitly set
-    if curriculum.enabled and getattr(args, "gate_profile", None):
+    if curriculum.enabled and gate_profile:
         try:
             base_thresholds = load_thresholds_for_profile(profile_id)
             logger.info("ml loop %s loaded gate thresholds for profile %s", loop_id, profile_id)
@@ -1079,11 +1097,14 @@ def start_loop(args: argparse.Namespace) -> int:
                         predictor_name if predictor_name else "surrogate_predictor"
                     )
                     surrogate_predictor = _surrogate_predictor_wrapper
-            effective_thresholds = (
-                curriculum.get_thresholds(base_thresholds)
-                if curriculum.enabled and base_thresholds is not None
-                else None
-            )
+            if gate_profile is None:
+                effective_thresholds = _no_gate_thresholds()
+            else:
+                effective_thresholds = (
+                    curriculum.get_thresholds(base_thresholds)
+                    if curriculum.enabled and base_thresholds is not None
+                    else base_thresholds
+                )
             run_summary = run_generation(
                 count=generate_count,
                 seed_start=iteration_seed_start,
@@ -1322,6 +1343,8 @@ def start_loop(args: argparse.Namespace) -> int:
                 exclude_stub_rows=True,
                 profile_id=profile_id,
                 scenario_id=snapshot_scenario_id,
+                evolutionary_selection=getattr(args, "gate_profile", None) is None,
+                survival_rate=0.9,
             )
             if snapshot.row_count <= 0 and profile_id:
                 _log_loop_phase(
@@ -1340,6 +1363,8 @@ def start_loop(args: argparse.Namespace) -> int:
                     exclude_stub_rows=True,
                     profile_id=None,
                     scenario_id=snapshot_scenario_id,
+                    evolutionary_selection=getattr(args, "gate_profile", None) is None,
+                    survival_rate=0.9,
                 )
             if snapshot.row_count <= 0:
                 reason_code = "snapshot_not_trained"
