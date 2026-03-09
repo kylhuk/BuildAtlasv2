@@ -1,45 +1,55 @@
-"""Curriculum learning scheduler for progressive gate tightening.
-
-Implements a 4-phase curriculum that progressively tightens gate constraints:
-- Phase 1 (Mapping): Easy gates, high feasibility target
-- Phase 2 (Bossing): Medium gates, moderate feasibility target
-- Phase 3 (Pinnacle): Hard gates, lower feasibility target
-- Phase 4 (Uber): Extreme gates, minimal feasibility target
-
-Transitions occur when feasibility exceeds 10% threshold.
-"""
+"""Curriculum learning scheduler for progressive gate tightening."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Mapping
 
-from backend.engine.evaluation.gates import GateSlackMetrics
 from backend.engine.scenarios.loader import ScenarioGateThresholds, ScenarioReservationThreshold
 
 
 class CurriculumPhase(Enum):
-    """Curriculum learning phases ordered by difficulty."""
+    """Legacy curriculum phases ordered by difficulty."""
 
+    ZERO_GATES = auto()
     MAPPING = auto()
     BOSSING = auto()
     PINNACLE = auto()
     UBER = auto()
 
     @property
+    def _ordered_phases(self) -> tuple["CurriculumPhase", ...]:
+        """Return deterministic phase order for curriculum progression."""
+        return (
+            CurriculumPhase.ZERO_GATES,
+            CurriculumPhase.MAPPING,
+            CurriculumPhase.BOSSING,
+            CurriculumPhase.PINNACLE,
+            CurriculumPhase.UBER,
+        )
+
+    @property
     def phase_number(self) -> int:
-        """Return phase number (1-4)."""
-        return list(CurriculumPhase).index(self) + 1
+        """Return phase number in the deterministic progression ladder."""
+        return self._ordered_phases.index(self)
+
+    def next_phase(self) -> "CurriculumPhase":
+        """Get next phase in deterministic progression ladder."""
+        ordered = list(self._ordered_phases)
+        current_idx = ordered.index(self)
+        if current_idx < len(ordered) - 1:
+            return ordered[current_idx + 1]
+        return CurriculumPhase.UBER
 
     @property
     def description(self) -> str:
         """Return human-readable phase description."""
         descriptions = {
-            CurriculumPhase.MAPPING: "Mapping gates (easy)",
+            CurriculumPhase.ZERO_GATES: "Zero-gates entry phase (permissive)",
+            CurriculumPhase.MAPPING: "Mapping gates (easier)",
             CurriculumPhase.BOSSING: "Bossing gates (medium)",
-            CurriculumPhase.PINNACLE: "Pinnacle gates (hard)",
-            CurriculumPhase.UBER: "Uber gates (extreme)",
+            CurriculumPhase.PINNACLE: "Pinnacle gates (hardest)",
+            CurriculumPhase.UBER: "Uber gates (most extreme)",
         }
         return descriptions[self]
 
@@ -59,44 +69,55 @@ class CurriculumGateConfig:
 
 # Phase configurations: progressively tighten gates
 PHASE_CONFIGS = {
-    CurriculumPhase.MAPPING: CurriculumGateConfig(
-        phase=CurriculumPhase.MAPPING,
-        resists_multiplier=0.70,  # 70% of original resist requirements
-        attributes_multiplier=0.70,
-        max_hit_multiplier=0.70,
-        full_dps_multiplier=0.70,
-        reservation_multiplier=1.30,  # More lenient (higher max %)
-        feasibility_target=0.80,  # Target 80% feasibility
-    ),
-    CurriculumPhase.BOSSING: CurriculumGateConfig(
-        phase=CurriculumPhase.BOSSING,
-        resists_multiplier=0.85,  # 85% of original
-        attributes_multiplier=0.85,
-        max_hit_multiplier=0.85,
-        full_dps_multiplier=0.85,
-        reservation_multiplier=1.15,
-        feasibility_target=0.60,  # Target 60% feasibility
-    ),
-    CurriculumPhase.PINNACLE: CurriculumGateConfig(
-        phase=CurriculumPhase.PINNACLE,
-        resists_multiplier=0.95,  # 95% of original
-        attributes_multiplier=0.95,
-        max_hit_multiplier=0.95,
-        full_dps_multiplier=0.95,
-        reservation_multiplier=1.05,
-        feasibility_target=0.35,  # Target 35% feasibility
-    ),
-    CurriculumPhase.UBER: CurriculumGateConfig(
-        phase=CurriculumPhase.UBER,
-        resists_multiplier=1.00,  # 100% of original (full constraints)
+    CurriculumPhase.ZERO_GATES: CurriculumGateConfig(
+        phase=CurriculumPhase.ZERO_GATES,
+        resists_multiplier=1.00,
         attributes_multiplier=1.00,
         max_hit_multiplier=1.00,
         full_dps_multiplier=1.00,
         reservation_multiplier=1.00,
-        feasibility_target=0.10,  # Target 10% feasibility
+        feasibility_target=0.80,
+    ),
+    CurriculumPhase.MAPPING: CurriculumGateConfig(
+        phase=CurriculumPhase.MAPPING,
+        resists_multiplier=0.70,
+        attributes_multiplier=0.70,
+        max_hit_multiplier=0.70,
+        full_dps_multiplier=0.70,
+        reservation_multiplier=1.22,
+        feasibility_target=0.60,
+    ),
+    CurriculumPhase.BOSSING: CurriculumGateConfig(
+        phase=CurriculumPhase.BOSSING,
+        resists_multiplier=0.80,  # 80% of original
+        attributes_multiplier=0.95,
+        max_hit_multiplier=0.80,
+        full_dps_multiplier=0.80,
+        reservation_multiplier=1.15,
+        feasibility_target=0.50,
+    ),
+    CurriculumPhase.PINNACLE: CurriculumGateConfig(
+        phase=CurriculumPhase.PINNACLE,
+        resists_multiplier=1.00,
+        attributes_multiplier=1.05,
+        max_hit_multiplier=1.00,
+        full_dps_multiplier=1.00,
+        reservation_multiplier=1.00,
+        feasibility_target=0.10,
+    ),
+    CurriculumPhase.UBER: CurriculumGateConfig(
+        phase=CurriculumPhase.UBER,
+        resists_multiplier=1.00,  # 100% of original (full constraints)
+        attributes_multiplier=1.10,
+        max_hit_multiplier=1.00,
+        full_dps_multiplier=1.00,
+        reservation_multiplier=1.00,
+        feasibility_target=0.05,  # Target 5% feasibility
     ),
 }
 
+MIN_PHASE_SAMPLES = 20
+MAX_PHASE_SAMPLES = 1000
 FEASIBILITY_TRANSITION_THRESHOLD = 0.25  # Transition when 25% of builds pass gates
 
 
@@ -126,18 +147,24 @@ class CurriculumState:
 
     @property
     def should_transition(self) -> bool:
-        """Progress purely based on metric achievement.
+        """Advance only when phase samples and feasibility criteria align.
 
-        Transitions when enough builds pass gates (25%).
-        No arbitrary min/max sample limits - runs as long as needed.
+        Do not advance if UBER is active or if we still lack the minimum
+        number of samples. Transition immediately once the cap is reached
+        (to prevent indefinite waiting) or when feasibility exceeds the
+        configured threshold.
         """
         if self.current_phase == CurriculumPhase.UBER:
             return False
+        if self.phase_samples < MIN_PHASE_SAMPLES:
+            return False
+        if self.phase_samples >= MAX_PHASE_SAMPLES:
+            return True
         return self.phase_feasibility > FEASIBILITY_TRANSITION_THRESHOLD
 
     def next_phase(self) -> CurriculumPhase:
         """Get next phase in curriculum."""
-        phases = list(CurriculumPhase)
+        phases = list(self.current_phase._ordered_phases)
         current_idx = phases.index(self.current_phase)
         if current_idx < len(phases) - 1:
             return phases[current_idx + 1]

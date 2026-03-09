@@ -7,6 +7,18 @@ This guide is the practical loop for running generation + surrogate training on 
 - Make sure PoB assets exist: `git submodule update --init --recursive`.
 - Optional while iterating: `make dev`, `make test`, `make lint`, `make fmt`.
 
+## Atlas/operator preflight (fail-fast)
+- Run this command before Atlas/operator runs that touch generation or model updates:
+  - `make preflight`
+- The sequence is intentionally strict and fail-fast:
+  1. `make db-check`
+  2. `make backend-lint`
+  3. `make ui-test`
+- The preflight output stops at the first failed step and points you back to the exact command to rerun before retrying the full sequence.
+
+## Commit guardrail
+- Before committing, review `git diff --stat` and stop if scope drift appears.
+
 ## Automated loop (start/stop/status)
 Use the new loop tool when you want one command to keep generating, training, and reporting improvement.
 

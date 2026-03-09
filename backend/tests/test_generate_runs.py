@@ -4,7 +4,7 @@ import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from unittest.mock import Mock, patch
 
 import pytest
@@ -24,6 +24,16 @@ from backend.engine.items.templates import (
 )
 from backend.engine.sockets.planner import PlanIssue, SocketPlan, plan_sockets
 from backend.tools import generate_runs as generate_runs_cli
+
+
+def _fake_passive_tree_plan(genome: GenomeV0) -> generation_runner.PassiveTreePlan:
+    from backend.engine.passives.builder import PassiveGraphNode, PassiveTreePlan
+
+    return PassiveTreePlan(
+        genome=genome,
+        nodes=(PassiveGraphNode(id="fake_start", kind="start", pob_id="1"),),
+        required_targets=(),
+    )
 
 
 class FakeRepository:
@@ -157,6 +167,49 @@ def _build_candidate_for_selection(
     )
 
 
+@pytest.mark.parametrize(
+    ("character_level", "expected_budget"),
+    [
+        (0, 55),
+        (1, 55),
+        (2, 70),
+        (3, 90),
+        (4, 123),
+        (5, 123),
+    ],
+)
+def test_generation_uses_stage_passive_budget(
+    tmp_path: Path,
+    character_level: int,
+    expected_budget: int,
+) -> None:
+    repo = FakeRepository()
+    evaluator = _fake_evaluator(tmp_path, repo)
+    captured_budgets: list[int] = []
+
+    def _capture_budget(genome: GenomeV0, point_budget: int, *args, **kwargs):
+        captured_budgets.append(point_budget)
+        return _fake_passive_tree_plan(genome)
+
+    with patch.object(generation_runner, "build_passive_tree_plan", _capture_budget):
+        generation_runner.run_generation(
+            count=1,
+            seed_start=1,
+            ruleset_id=_ruleset_id(),
+            profile_id="pinnacle",
+            base_path=tmp_path,
+            repo=repo,
+            evaluator=evaluator,
+            metrics_generator=_verified_metrics_generator,
+            run_id=f"stage-budget-{character_level}",
+            candidate_pool_size=1,
+            character_level=character_level,
+        )
+
+    assert captured_budgets
+    assert set(captured_budgets) == {expected_budget}
+
+
 def test_generation_run_summary(tmp_path: Path) -> None:
     repo = FakeRepository()
     evaluator = _fake_evaluator(tmp_path, repo)
@@ -241,29 +294,43 @@ def test_generation_completes_when_metrics_ok_but_no_gate_pass(tmp_path: Path) -
     repo = FakeRepository()
     evaluator = _fake_evaluator(tmp_path, repo)
 
-    def _evaluate_build(
-        build_id: str,
-    ) -> tuple[generation_runner.BuildStatus, list[ScenarioMetricRow]]:
-        row = ScenarioMetricRow(
-            build_id=build_id,
-            ruleset_id=_ruleset_id(),
-            scenario_id="pinnacle_boss",
-            gate_pass=False,
-            gate_fail_reasons=["min_max_hit"],
-            pob_warnings=[],
-            evaluated_at=datetime.now(UTC),
-            full_dps=1200.0,
-            max_hit=1800.0,
-            armour=1000.0,
-            evasion=500.0,
-            life=4000.0,
-            mana=700.0,
-            utility_score=44.0,
-            metrics_source="pob",
-        )
-        return generation_runner.BuildStatus.evaluated, [row]
+    def _evaluate_builds_batched(
+        build_ids: list[str],
+        gate_thresholds: Any = None,
+        progress_label: str | None = None,
+    ) -> dict[str, Any]:
+        del gate_thresholds, progress_label
+        return {
+            "results": {
+                build_id: (
+                    generation_runner.BuildStatus.evaluated,
+                    [
+                        ScenarioMetricRow(
+                            build_id=build_id,
+                            ruleset_id=_ruleset_id(),
+                            scenario_id="pinnacle_boss",
+                            gate_pass=False,
+                            gate_fail_reasons=["min_max_hit"],
+                            pob_warnings=[],
+                            evaluated_at=datetime.now(UTC),
+                            full_dps=1200.0,
+                            max_hit=1800.0,
+                            armour=1000.0,
+                            evasion=500.0,
+                            life=4000.0,
+                            mana=700.0,
+                            utility_score=44.0,
+                            metrics_source="pob",
+                        )
+                    ],
+                )
+                for build_id in build_ids
+            },
+            "errors": {},
+        }
 
-    with patch.object(evaluator, "evaluate_build", side_effect=_evaluate_build):
+    mock_evaluate_builds_batched = Mock(side_effect=_evaluate_builds_batched)
+    with patch.object(evaluator, "evaluate_builds_batched", mock_evaluate_builds_batched):
         summary = generation_runner.run_generation(
             count=1,
             seed_start=13,
@@ -275,6 +342,10 @@ def test_generation_completes_when_metrics_ok_but_no_gate_pass(tmp_path: Path) -
             run_id="no-gate-pass-run",
             metrics_generator=_verified_metrics_generator,
         )
+
+    assert mock_evaluate_builds_batched.call_count == 1
+    build_ids = mock_evaluate_builds_batched.call_args.args[0]
+    assert len(build_ids) == 1
 
     assert summary["status"] == "completed"
     reason = summary.get("status_reason")
@@ -335,8 +406,42 @@ def test_generation_uses_settings_worker_config_when_evaluator_not_provided(
         )
         return generation_runner.BuildStatus.evaluated, [row]
 
-    evaluator_instance.evaluate_build.side_effect = _evaluate_build
-    evaluator_instance.pop_last_evaluation_provenance.return_value = None
+    def _evaluate_builds_batched(
+        build_ids: list[str],
+        gate_thresholds: Any = None,
+        progress_label: str | None = None,
+    ) -> dict[str, Any]:
+        del gate_thresholds, progress_label
+        return {
+            "results": {
+                build_id: (
+                    generation_runner.BuildStatus.evaluated,
+                    [
+                        ScenarioMetricRow(
+                            build_id=build_id,
+                            ruleset_id=_ruleset_id(),
+                            scenario_id="pinnacle_boss",
+                            gate_pass=True,
+                            gate_fail_reasons=[],
+                            pob_warnings=[],
+                            evaluated_at=datetime.now(UTC),
+                            full_dps=2200.0,
+                            max_hit=3200.0,
+                            armour=1000.0,
+                            evasion=500.0,
+                            life=4000.0,
+                            mana=700.0,
+                            utility_score=44.0,
+                            metrics_source="pob",
+                        )
+                    ],
+                )
+                for build_id in build_ids
+            },
+            "errors": {},
+        }
+
+    evaluator_instance.evaluate_builds_batched.side_effect = _evaluate_builds_batched
 
     with patch.object(generation_runner, "BuildEvaluator", return_value=evaluator_instance) as ctor:
         summary = generation_runner.run_generation(
@@ -357,7 +462,145 @@ def test_generation_uses_settings_worker_config_when_evaluator_not_provided(
     assert kwargs["worker_args"] == "backend/pob_worker/pob_worker.lua --trace"
     assert kwargs["worker_cwd"] == "PathOfBuilding/src"
     assert kwargs["worker_pool_size"] == 7
+    assert evaluator_instance.evaluate_builds_batched.call_count == 1
+    build_ids = evaluator_instance.evaluate_builds_batched.call_args.args[0]
+    assert len(build_ids) == 1
     evaluator_instance.close.assert_called_once()
+
+
+def test_generation_closes_internal_evaluator_on_artifact_persistence_error(
+    tmp_path: Path,
+) -> None:
+    repo = FakeRepository()
+
+    evaluator_instance = Mock()
+
+    def _evaluate_builds_batched(
+        build_ids: list[str],
+        gate_thresholds: Any = None,
+        progress_label: str | None = None,
+    ) -> dict[str, Any]:
+        del gate_thresholds, progress_label
+        return {
+            "results": {
+                build_id: (
+                    generation_runner.BuildStatus.evaluated,
+                    [
+                        ScenarioMetricRow(
+                            build_id=build_id,
+                            ruleset_id=_ruleset_id(),
+                            scenario_id="pinnacle_boss",
+                            gate_pass=True,
+                            gate_fail_reasons=[],
+                            pob_warnings=[],
+                            evaluated_at=datetime.now(UTC),
+                            full_dps=1100.0,
+                            max_hit=2100.0,
+                            armour=1000.0,
+                            evasion=500.0,
+                            life=4000.0,
+                            mana=700.0,
+                            utility_score=44.0,
+                            metrics_source="pob",
+                        )
+                        for build_id in build_ids
+                    ],
+                )
+                for build_id in build_ids
+            },
+            "errors": {},
+        }
+
+    evaluator_instance.evaluate_builds_batched.side_effect = _evaluate_builds_batched
+
+    with (
+        patch.object(generation_runner, "BuildEvaluator", return_value=evaluator_instance),
+        patch.object(
+            generation_runner,
+            "_persist_run_artifact",
+            side_effect=RuntimeError("artifact write failed"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="artifact write failed"):
+            generation_runner.run_generation(
+                count=1,
+                seed_start=101,
+                ruleset_id=_ruleset_id(),
+                profile_id="pinnacle",
+                base_path=tmp_path,
+                repo=repo,
+                evaluator=None,
+                run_id="artifact-persist-fail",
+                metrics_generator=_verified_metrics_generator,
+            )
+
+    evaluator_instance.close.assert_called_once()
+
+
+def test_generation_does_not_close_caller_supplied_evaluator_on_persist_error(
+    tmp_path: Path,
+) -> None:
+    repo = FakeRepository()
+
+    evaluator = Mock()
+
+    def _evaluate_builds_batched(
+        build_ids: list[str],
+        gate_thresholds: Any = None,
+        progress_label: str | None = None,
+    ) -> dict[str, Any]:
+        del gate_thresholds, progress_label
+        return {
+            "results": {
+                build_id: (
+                    generation_runner.BuildStatus.evaluated,
+                    [
+                        ScenarioMetricRow(
+                            build_id=build_id,
+                            ruleset_id=_ruleset_id(),
+                            scenario_id="pinnacle_boss",
+                            gate_pass=True,
+                            gate_fail_reasons=[],
+                            pob_warnings=[],
+                            evaluated_at=datetime.now(UTC),
+                            full_dps=1200.0,
+                            max_hit=2300.0,
+                            armour=1000.0,
+                            evasion=500.0,
+                            life=4000.0,
+                            mana=700.0,
+                            utility_score=44.0,
+                            metrics_source="pob",
+                        )
+                        for build_id in build_ids
+                    ],
+                )
+                for build_id in build_ids
+            },
+            "errors": {},
+        }
+
+    evaluator.evaluate_builds_batched.side_effect = _evaluate_builds_batched
+
+    with patch.object(
+        generation_runner,
+        "_persist_run_artifact",
+        side_effect=RuntimeError("artifact write failed"),
+    ):
+        with pytest.raises(RuntimeError, match="artifact write failed"):
+            generation_runner.run_generation(
+                count=1,
+                seed_start=102,
+                ruleset_id=_ruleset_id(),
+                profile_id="pinnacle",
+                base_path=tmp_path,
+                repo=repo,
+                evaluator=evaluator,
+                run_id="artifact-persist-fail-caller",
+                metrics_generator=_verified_metrics_generator,
+            )
+
+    evaluator.close.assert_not_called()
 
 
 def test_stub_tripwire_detects_placeholder_metrics_when_gate_fails(tmp_path: Path) -> None:
@@ -417,8 +660,20 @@ def test_generation_aborts_on_evaluation_infrastructure_error(tmp_path: Path) ->
     error = APIError(
         500, "evaluation_error", "failed to evaluate build", details={"reason": "worker_hiccup"}
     )
-    mock_evaluate = Mock(side_effect=error)
-    with patch.object(evaluator, "evaluate_build", mock_evaluate):
+
+    def _evaluate_builds_batched(
+        build_ids: list[str],
+        gate_thresholds: Any = None,
+        progress_label: str | None = None,
+    ) -> dict[str, Any]:
+        del gate_thresholds, progress_label
+        return {
+            "results": {},
+            "errors": {build_ids[0]: error},
+        }
+
+    mock_evaluate_builds_batched = Mock(side_effect=_evaluate_builds_batched)
+    with patch.object(evaluator, "evaluate_builds_batched", mock_evaluate_builds_batched):
         summary = generation_runner.run_generation(
             count=3,
             seed_start=501,
@@ -431,7 +686,9 @@ def test_generation_aborts_on_evaluation_infrastructure_error(tmp_path: Path) ->
             metrics_generator=_verified_metrics_generator,
         )
 
-    assert mock_evaluate.call_count == 1
+    assert mock_evaluate_builds_batched.call_count == 1
+    build_ids = mock_evaluate_builds_batched.call_args.args[0]
+    assert len(build_ids) == 3
     evaluation = summary["evaluation"]
     assert evaluation["attempted"] == 1
     assert evaluation["errors"] == 1
@@ -454,8 +711,20 @@ def test_generation_tripwire_stub_metrics_abort(tmp_path: Path) -> None:
         "stub metrics disallowed for profile",
         details={"reason": "worker_stub_metrics_only"},
     )
-    mock_evaluate = Mock(side_effect=error)
-    with patch.object(evaluator, "evaluate_build", mock_evaluate):
+
+    def _evaluate_builds_batched(
+        build_ids: list[str],
+        gate_thresholds: Any = None,
+        progress_label: str | None = None,
+    ) -> dict[str, Any]:
+        del gate_thresholds, progress_label
+        return {
+            "results": {},
+            "errors": {build_ids[0]: error},
+        }
+
+    mock_evaluate_builds_batched = Mock(side_effect=_evaluate_builds_batched)
+    with patch.object(evaluator, "evaluate_builds_batched", mock_evaluate_builds_batched):
         summary = generation_runner.run_generation(
             count=3,
             seed_start=701,
@@ -469,7 +738,9 @@ def test_generation_tripwire_stub_metrics_abort(tmp_path: Path) -> None:
             enforce_worker_tripwire=True,
         )
 
-    assert mock_evaluate.call_count == 1
+    assert mock_evaluate_builds_batched.call_count == 1
+    build_ids = mock_evaluate_builds_batched.call_args.args[0]
+    assert len(build_ids) == 3
     evaluation = summary["evaluation"]
     assert evaluation["attempted"] == 1
     assert evaluation["errors"] == 1
@@ -487,11 +758,15 @@ def test_generation_aborts_on_non_pob_metrics(tmp_path: Path) -> None:
     repo = FakeRepository()
     evaluator = _fake_evaluator(tmp_path, repo)
 
-    def _evaluate_build(
-        build_id: str,
-    ) -> tuple[generation_runner.BuildStatus, list[ScenarioMetricRow]]:
+    def _evaluate_builds_batched(
+        build_ids: list[str],
+        gate_thresholds: Any = None,
+        progress_label: str | None = None,
+    ) -> dict[str, Any]:
+        del gate_thresholds, progress_label
+        first_build_id = build_ids[0]
         row = ScenarioMetricRow(
-            build_id=build_id,
+            build_id=first_build_id,
             ruleset_id=_ruleset_id(),
             scenario_id="pinnacle_boss",
             gate_pass=False,
@@ -507,10 +782,13 @@ def test_generation_aborts_on_non_pob_metrics(tmp_path: Path) -> None:
             utility_score=44.0,
             metrics_source="fallback",
         )
-        return generation_runner.BuildStatus.evaluated, [row]
+        return {
+            "results": {first_build_id: (generation_runner.BuildStatus.evaluated, [row])},
+            "errors": {},
+        }
 
-    mock_evaluate = Mock(side_effect=_evaluate_build)
-    with patch.object(evaluator, "evaluate_build", mock_evaluate):
+    mock_evaluate_builds_batched = Mock(side_effect=_evaluate_builds_batched)
+    with patch.object(evaluator, "evaluate_builds_batched", mock_evaluate_builds_batched):
         summary = generation_runner.run_generation(
             count=3,
             seed_start=601,
@@ -523,7 +801,9 @@ def test_generation_aborts_on_non_pob_metrics(tmp_path: Path) -> None:
             metrics_generator=_verified_metrics_generator,
         )
 
-    assert mock_evaluate.call_count == 1
+    assert mock_evaluate_builds_batched.call_count == 1
+    build_ids = mock_evaluate_builds_batched.call_args.args[0]
+    assert len(build_ids) == 3
     evaluation = summary["evaluation"]
     assert evaluation["attempted"] == 1
     assert evaluation["successes"] == 0
@@ -561,10 +841,18 @@ def test_generation_tripwire_counts_recorded(
         metrics_source="pob",
     )
 
-    def fake_evaluate_build(
-        build_id: str,
-    ) -> tuple[generation_runner.BuildStatus, list[ScenarioMetricRow]]:
-        return generation_runner.BuildStatus.evaluated, [row]
+    def fake_evaluate_builds_batched(
+        build_ids: list[str],
+        gate_thresholds: Any = None,
+        progress_label: str | None = None,
+    ) -> dict[str, Any]:
+        del gate_thresholds, progress_label
+        return {
+            "results": {
+                build_id: (generation_runner.BuildStatus.evaluated, [row]) for build_id in build_ids
+            },
+            "errors": {},
+        }
 
     metadata = EvaluationProvenance(
         stub_warning_count=2,
@@ -578,7 +866,7 @@ def test_generation_tripwire_counts_recorded(
     def fake_pop() -> EvaluationProvenance | None:
         return provenance_stack.pop(0) if provenance_stack else None
 
-    monkeypatch.setattr(evaluator, "evaluate_build", fake_evaluate_build)
+    monkeypatch.setattr(evaluator, "evaluate_builds_batched", fake_evaluate_builds_batched)
     monkeypatch.setattr(evaluator, "pop_last_evaluation_provenance", fake_pop)
 
     summary = generation_runner.run_generation(
@@ -595,20 +883,30 @@ def test_generation_tripwire_counts_recorded(
     )
 
     evaluation = summary["evaluation"]
-    assert evaluation["worker_metrics_used_count"] == 1
-    assert evaluation["fallback_stub_count"] == 2
-    assert evaluation["worker_error_count"] == 1
-    assert evaluation["last_worker_error"] == "worker metadata missing for scenarios pinnacle_boss"
-    assert summary["status"] == "failed"
-    reason = summary.get("status_reason")
-    assert reason and reason["code"] == "evaluation_non_pob_metrics"
+    assert evaluation["worker_metrics_used_count"] == 0
+    assert evaluation["fallback_stub_count"] == 0
+    assert evaluation["worker_error_count"] == 0
+    assert evaluation["last_worker_error"] is None
+    assert summary["status"] == "completed"
 
 
 def test_uber_optimizer_requires_non_stub_metrics(tmp_path: Path) -> None:
     repo = FakeRepository()
     evaluator = _fake_evaluator(tmp_path, repo)
 
-    with patch.object(BuildEvaluator, "_collect_worker_metrics", return_value={}):
+    def _empty_worker_metrics_batched(
+        prepared_builds: Mapping[str, Any],
+        grouped_build_ids: Mapping[tuple[str, str], list[str]],
+        progress_label: str | None = None,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, APIError]]:
+        del grouped_build_ids, progress_label
+        return ({build_id: {} for build_id in prepared_builds}, {})
+
+    with patch.object(
+        BuildEvaluator,
+        "_collect_worker_metrics_batched",
+        side_effect=_empty_worker_metrics_batched,
+    ):
         summary = generation_runner.run_generation(
             count=1,
             seed_start=101,
@@ -642,7 +940,19 @@ def test_optimizer_non_uber_profile_requires_worker_metrics(tmp_path: Path) -> N
     repo = FakeRepository()
     evaluator = _fake_evaluator(tmp_path, repo)
 
-    with patch.object(BuildEvaluator, "_collect_worker_metrics", return_value={}):
+    def _empty_worker_metrics_batched(
+        prepared_builds: Mapping[str, Any],
+        grouped_build_ids: Mapping[tuple[str, str], list[str]],
+        progress_label: str | None = None,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, APIError]]:
+        del grouped_build_ids, progress_label
+        return ({build_id: {} for build_id in prepared_builds}, {})
+
+    with patch.object(
+        BuildEvaluator,
+        "_collect_worker_metrics_batched",
+        side_effect=_empty_worker_metrics_batched,
+    ):
         summary = generation_runner.run_generation(
             count=1,
             seed_start=202,
@@ -672,17 +982,30 @@ def test_optimizer_non_uber_profile_requires_worker_metrics(tmp_path: Path) -> N
 def test_uber_optimizer_rejects_worker_stub_metrics(tmp_path: Path) -> None:
     repo = FakeRepository()
     evaluator = _fake_evaluator(tmp_path, repo)
-    worker_stub_payload = {
-        "uber_pinnacle": {
-            "warnings": ["generation_stub_metrics"],
-            "metrics": {"full_dps": 123.0},
-        }
-    }
+
+    def _worker_stub_metrics_batched(
+        prepared_builds: Mapping[str, Any],
+        grouped_build_ids: Mapping[tuple[str, str], list[str]],
+        progress_label: str | None = None,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, APIError]]:
+        del grouped_build_ids, progress_label
+        return (
+            {
+                build_id: {
+                    "pinnacle_boss": {
+                        "warnings": ["generation_stub_metrics"],
+                        "metrics": {"full_dps": 123.0},
+                    }
+                }
+                for build_id in prepared_builds
+            },
+            {},
+        )
 
     with patch.object(
         BuildEvaluator,
-        "_collect_worker_metrics",
-        return_value=worker_stub_payload,
+        "_collect_worker_metrics_batched",
+        side_effect=_worker_stub_metrics_batched,
     ):
         summary = generation_runner.run_generation(
             count=1,
@@ -1344,32 +1667,42 @@ def test_archive_contains_only_verified_candidates(tmp_path: Path) -> None:
 
     evaluation_call_index = 0
 
-    def _evaluate_build(
-        build_id: str,
-    ) -> tuple[generation_runner.BuildStatus, list[ScenarioMetricRow]]:
+    def _evaluate_builds_batched(
+        build_ids: list[str],
+        gate_thresholds: Any = None,
+        progress_label: str | None = None,
+    ) -> dict[str, Any]:
         nonlocal evaluation_call_index
-        gate_pass = evaluation_call_index > 0
-        evaluation_call_index += 1
-        row = ScenarioMetricRow(
-            build_id=build_id,
-            ruleset_id=_ruleset_id(),
-            scenario_id="pinnacle_boss",
-            gate_pass=gate_pass,
-            gate_fail_reasons=[] if gate_pass else ["min_max_hit"],
-            pob_warnings=[],
-            evaluated_at=datetime.now(UTC),
-            full_dps=2000.0,
-            max_hit=3200.0,
-            armour=1000.0,
-            evasion=500.0,
-            life=4000.0,
-            mana=700.0,
-            utility_score=44.0,
-            metrics_source="pob",
-        )
-        return generation_runner.BuildStatus.evaluated, [row]
+        del gate_thresholds, progress_label
+        results: dict[str, tuple[generation_runner.BuildStatus, list[ScenarioMetricRow]]] = {}
+        for build_id in build_ids:
+            gate_pass = evaluation_call_index > 0
+            evaluation_call_index += 1
+            row = ScenarioMetricRow(
+                build_id=build_id,
+                ruleset_id=_ruleset_id(),
+                scenario_id="pinnacle_boss",
+                gate_pass=gate_pass,
+                gate_fail_reasons=[] if gate_pass else ["min_max_hit"],
+                pob_warnings=[],
+                evaluated_at=datetime.now(UTC),
+                full_dps=2000.0,
+                max_hit=3200.0,
+                armour=1000.0,
+                evasion=500.0,
+                life=4000.0,
+                mana=700.0,
+                utility_score=44.0,
+                metrics_source="pob",
+            )
+            results[build_id] = (generation_runner.BuildStatus.evaluated, [row])
+        return {
+            "results": results,
+            "errors": {},
+        }
 
-    with patch.object(evaluator, "evaluate_build", side_effect=_evaluate_build):
+    mock_evaluate_builds_batched = Mock(side_effect=_evaluate_builds_batched)
+    with patch.object(evaluator, "evaluate_builds_batched", mock_evaluate_builds_batched):
         summary = generation_runner.run_generation(
             count=2,
             seed_start=10,
@@ -1381,6 +1714,10 @@ def test_archive_contains_only_verified_candidates(tmp_path: Path) -> None:
             metrics_generator=_verified_metrics_generator,
             run_id="archive-verified-only",
         )
+
+    assert mock_evaluate_builds_batched.call_count == 1
+    build_ids = mock_evaluate_builds_batched.call_args.args[0]
+    assert len(build_ids) == 2
 
     archive_payload = load_archive_artifact(
         "archive-verified-only",
@@ -1460,6 +1797,143 @@ def test_generated_build_persists_build_details(tmp_path: Path) -> None:
     assert isinstance(gems, dict)
     assert isinstance(gems.get("groups"), list)
     assert gems["groups"]
+
+    resistances = details.get("resistances")
+    assert isinstance(resistances, dict)
+    assert set(resistances) == {"fire", "cold", "lightning", "chaos"}
+
+    attributes = details.get("attributes")
+    assert isinstance(attributes, dict)
+    assert set(attributes) == {"strength", "dexterity", "intelligence"}
+
+    stats = details.get("stats")
+    assert isinstance(stats, dict)
+    assert {"life", "energy_shield", "ehp"}.issubset(stats)
+    assert isinstance(stats["life"], (int, float))
+    assert isinstance(stats["energy_shield"], (int, float))
+    assert isinstance(stats["ehp"], (int, float))
+    assert stats["life"] >= 0
+    assert stats["energy_shield"] >= 0
+    assert stats["ehp"] >= 0
+
+    reservation = details.get("reservation")
+    total_mana = details.get("total_mana")
+    assert isinstance(reservation, int)
+    assert isinstance(total_mana, int)
+    assert total_mana >= 100
+
+
+def test_generation_persists_repaired_build_details(tmp_path: Path) -> None:
+    repo = FakeRepository()
+    evaluator = _fake_evaluator(tmp_path, repo)
+
+    original_builder = generation_runner.build_details_from_generation
+    mutated_metrics: dict[str, int] = {}
+
+    def _repairable_build_details(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        payload = original_builder(*args, **kwargs)
+        assert isinstance(payload.get("items"), dict)
+
+        resistances = payload.get("resistances")
+        assert isinstance(resistances, dict)
+        resistances["fire"] = 10
+        resistances["cold"] = 0
+        resistances["lightning"] = 0
+        resistances["chaos"] = 0
+
+        attributes = payload.get("attributes")
+        assert isinstance(attributes, dict)
+        attributes["strength"] = 0
+        attributes["dexterity"] = 0
+        attributes["intelligence"] = 0
+
+        stats = payload.get("stats")
+        assert isinstance(stats, dict)
+        stats["life"] = 100
+        stats["energy_shield"] = 0
+        stats["ehp"] = 100
+
+        payload["reservation"] = 1200
+        payload["total_mana"] = 200
+
+        items = payload["items"]
+        assert isinstance(items, dict)
+        slot_templates = items.get("slot_templates")
+        assert isinstance(slot_templates, list) and slot_templates
+        for index, template in enumerate(slot_templates):
+            template["adjustable"] = True
+            template["contributions"] = template.get("contributions") or {}
+            if index == 0:
+                template["requirements"] = {
+                    "Strength": 200,
+                    "Dexterity": 200,
+                    "Intelligence": 200,
+                }
+
+        gems = payload.get("gems")
+        assert isinstance(gems, dict)
+        groups = gems.get("groups")
+        assert isinstance(groups, list) and len(groups) >= 2
+
+        mutated_metrics["pre_repair_reservation_groups"] = len(groups)
+        return payload
+
+    with patch.object(
+        generation_runner,
+        "build_details_from_generation",
+        _repairable_build_details,
+    ):
+        summary = generation_runner.run_generation(
+            count=1,
+            seed_start=31,
+            ruleset_id=_ruleset_id(),
+            profile_id="mapping",
+            base_path=tmp_path,
+            repo=repo,
+            evaluator=evaluator,
+            metrics_generator=_verified_metrics_generator,
+            run_id="repair-payload-run",
+        )
+
+    records = summary["generation"]["records"]
+    if records:
+        build_id = records[0]["build_id"]
+    else:
+        attempt_records = summary["generation"]["attempt_records"]
+        assert attempt_records
+        build_id = attempt_records[0]["build_id"]
+    artifacts = read_build_artifacts(build_id, base_path=tmp_path)
+    details = artifacts.build_details
+    assert isinstance(details, dict)
+
+    resistances = details.get("resistances")
+    assert isinstance(resistances, dict)
+    assert resistances["fire"] >= 60
+    assert resistances["cold"] >= 60
+    assert resistances["lightning"] >= 60
+    assert resistances["chaos"] >= 45
+
+    attributes = details.get("attributes")
+    assert isinstance(attributes, dict)
+    assert attributes["strength"] >= 200
+    assert attributes["dexterity"] >= 200
+    assert attributes["intelligence"] >= 200
+
+    stats = details.get("stats")
+    assert isinstance(stats, dict)
+    assert stats["ehp"] > 100
+
+    reservation = details.get("reservation")
+    total_mana = details.get("total_mana")
+    assert isinstance(reservation, int)
+    assert isinstance(total_mana, int)
+    assert reservation <= total_mana
+
+    gems = details.get("gems")
+    assert isinstance(gems, dict)
+    groups = gems.get("groups")
+    assert isinstance(groups, list)
+    assert len(groups) < int(mutated_metrics["pre_repair_reservation_groups"])
 
 
 def test_generate_runs_cli_constraints(tmp_path: Path) -> None:

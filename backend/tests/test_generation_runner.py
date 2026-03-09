@@ -2,23 +2,41 @@ import json
 import random
 from pathlib import Path
 from typing import Any, Sequence
+from unittest.mock import patch
 from xml.etree import ElementTree as ET
 
 import pytest
 
+from backend.app.api.evaluator import BuildEvaluator
+from backend.engine.archive import (
+    ArchiveStore,
+    ExploitEmitter,
+    NoveltyEmitter,
+    UncertaintyEmitter,
+    deterministic_allocator,
+)
+from backend.engine.generation import runner as generation_runner
 from backend.engine.generation.runner import (
     CANONICAL_ITEM_SLOTS,
     POB_TARGET_VERSION,
     Candidate,
     _assert_no_stub_metrics,
     _build_worker_xml_payload,
+    _calculate_min_gate_slack,
     _load_surrogate_predictor,
     _optimizer_objectives_from_payload,
     _predict_candidates,
     _select_optimizer_elites,
     _select_surrogate_optimizer_elites,
+    _surrogate_probability_screen,
+    run_generation,
 )
 from backend.engine.genome import GenomeV0
+from backend.engine.scenarios.loader import (
+    ScenarioGateThresholds,
+    ScenarioReservationThreshold,
+    ScenarioTemplate,
+)
 
 
 def _dummy_candidate() -> Candidate:
@@ -98,6 +116,9 @@ def _dummy_candidate() -> Candidate:
         code_payload="{}",
         build_details_payload=build_details_payload,
     )
+
+
+_RULESET_ID = "pob:local|scenarios:pinnacle@v0|prices:local"
 
 
 def _make_optimizer_candidate(
@@ -445,14 +466,45 @@ def test_stub_tripwire_detects_linear_stub_metrics() -> None:
         _assert_no_stub_metrics(entries)
 
 
+def test_archive_emitter_summary_reports_uncertainty_with_probabilities() -> None:
+    store = ArchiveStore()
+    descriptor_a = (0.1, 0.1, 0.1)
+    descriptor_b = (1.1, 1.1, 1.1)
+    descriptor_c = (2.1, 2.1, 2.1)
+    store.insert(
+        "candidate-high", score=1.0, descriptor=descriptor_a, metadata={"pass_probability": 0.6}
+    )
+    store.insert(
+        "candidate-low", score=1.0, descriptor=descriptor_b, metadata={"pass_probability": 0.2}
+    )
+    store.insert("candidate-unscored", score=1.0, descriptor=descriptor_c)
+    entries = store.entries()
+    emitters = (ExploitEmitter(), NoveltyEmitter(), UncertaintyEmitter())
+    candidate_count = 3
+    budgets = deterministic_allocator(candidate_count, emitters)
+    emitter_summaries: list[dict[str, int]] = []
+    selected_for_uncertainty: list | None = None
+
+    for emitter in emitters:
+        budget = budgets.get(emitter.name, 0)
+        selected = emitter.select(entries, budget)
+        emitter_summaries.append(
+            {"name": emitter.name, "budget": budget, "selected": len(selected)}
+        )
+        if emitter.name == "uncertainty":
+            selected_for_uncertainty = selected
+
+    assert selected_for_uncertainty is not None
+    assert len(selected_for_uncertainty) == 1
+    assert selected_for_uncertainty[0].build_id == "candidate-high"
+    uncertainty_summary = next(
+        summary for summary in emitter_summaries if summary["name"] == "uncertainty"
+    )
+    assert uncertainty_summary["selected"] == 1
+
+
 def test_calculate_min_gate_slack_basic() -> None:
     """Test min_gate_slack calculation with basic metrics."""
-    from backend.engine.generation.runner import _calculate_min_gate_slack
-    from backend.engine.scenarios.loader import (
-        ScenarioTemplate,
-        ScenarioGateThresholds,
-        ScenarioReservationThreshold,
-    )
 
     candidate = _dummy_candidate()
     # Create a mock template with thresholds
@@ -480,7 +532,6 @@ def test_calculate_min_gate_slack_basic() -> None:
 
 def test_calculate_min_gate_slack_empty_templates() -> None:
     """Test min_gate_slack with no templates."""
-    from backend.engine.generation.runner import _calculate_min_gate_slack
 
     candidate = _dummy_candidate()
     slack = _calculate_min_gate_slack(candidate, [])
@@ -489,12 +540,6 @@ def test_calculate_min_gate_slack_empty_templates() -> None:
 
 def test_calculate_min_gate_slack_missing_metrics() -> None:
     """Test min_gate_slack when metrics are missing."""
-    from backend.engine.generation.runner import _calculate_min_gate_slack
-    from backend.engine.scenarios.loader import (
-        ScenarioTemplate,
-        ScenarioGateThresholds,
-        ScenarioReservationThreshold,
-    )
 
     candidate = _dummy_candidate()
     candidate.metrics_payload = {}  # Empty metrics
@@ -519,13 +564,6 @@ def test_calculate_min_gate_slack_missing_metrics() -> None:
 
 def test_surrogate_prefiltering_reduces_candidates() -> None:
     """Test that surrogate pre-filtering reduces candidate count by 10x."""
-    from backend.engine.generation.runner import _calculate_min_gate_slack
-    from backend.engine.scenarios.loader import (
-        ScenarioTemplate,
-        ScenarioGateThresholds,
-        ScenarioReservationThreshold,
-    )
-
     # Create 1000 candidates with varying metrics
     candidates = []
     for i in range(1000):
@@ -599,3 +637,137 @@ def test_surrogate_prefiltering_reduces_candidates() -> None:
     assert len(prefiltered) == prefilter_threshold
     assert len(prefiltered) == 100  # 10% of 1000
     assert len(candidates) / len(prefiltered) == pytest.approx(10.0, abs=0.1)
+
+
+def test_surrogate_probability_gate_screens_low_probability_candidates() -> None:
+    high_candidates = [
+        _make_optimizer_candidate(
+            build_id=f"high-{idx}",
+            seed=idx,
+            actual_full_dps=1000.0 + idx,
+            predicted_full_dps=1200.0 + idx,
+            predicted_max_hit=1300.0,
+            predicted_pass_probability=0.8,
+        )
+        for idx in range(3)
+    ]
+    low_candidates = [
+        _make_optimizer_candidate(
+            build_id=f"low-{idx}",
+            seed=100 + idx,
+            actual_full_dps=500.0,
+            predicted_full_dps=600.0,
+            predicted_max_hit=800.0,
+            predicted_pass_probability=0.2,
+        )
+        for idx in range(2)
+    ]
+    ranked = high_candidates + low_candidates
+    top_candidates, screened, backfilled = _surrogate_probability_screen(
+        ranked,
+        top_k=3,
+        threshold=0.75,
+    )
+    assert {candidate.build_id for candidate in top_candidates} == {
+        "high-0",
+        "high-1",
+        "high-2",
+    }
+    assert {candidate.build_id for candidate in screened} == {"low-0", "low-1"}
+    assert backfilled == []
+
+
+def test_surrogate_probability_gate_backfills_when_budget_unmet() -> None:
+    high = _make_optimizer_candidate(
+        build_id="high",
+        seed=1,
+        actual_full_dps=1100.0,
+        predicted_full_dps=1300.0,
+        predicted_max_hit=1400.0,
+        predicted_pass_probability=0.8,
+    )
+    low_candidates = [
+        _make_optimizer_candidate(
+            build_id=f"low-{idx}",
+            seed=10 + idx,
+            actual_full_dps=500.0,
+            predicted_full_dps=600.0,
+            predicted_max_hit=800.0,
+            predicted_pass_probability=0.15,
+        )
+        for idx in range(3)
+    ]
+    ranked = [high] + low_candidates
+    top_candidates, screened, backfilled = _surrogate_probability_screen(
+        ranked,
+        top_k=3,
+        threshold=0.75,
+    )
+    assert len(top_candidates) == 3
+    assert len(backfilled) == 2
+    assert [candidate.build_id for candidate in backfilled] == ["low-0", "low-1"]
+    assert {candidate.build_id for candidate in screened} == {"low-0", "low-1", "low-2"}
+
+
+def test_surrogate_probability_gate_inactive_when_no_top_k() -> None:
+    candidates = [
+        _make_optimizer_candidate(
+            build_id="alpha",
+            seed=1,
+            actual_full_dps=1000.0,
+            predicted_full_dps=1100.0,
+            predicted_max_hit=1200.0,
+            predicted_pass_probability=0.4,
+        ),
+        _make_optimizer_candidate(
+            build_id="beta",
+            seed=2,
+            actual_full_dps=900.0,
+            predicted_full_dps=1000.0,
+            predicted_max_hit=1150.0,
+            predicted_pass_probability=0.1,
+        ),
+    ]
+    top_candidates, screened, backfilled = _surrogate_probability_screen(
+        candidates,
+        top_k=None,
+        threshold=0.6,
+    )
+    assert [candidate.build_id for candidate in top_candidates] == [
+        "alpha",
+        "beta",
+    ]
+    assert screened == []
+    assert backfilled == []
+
+
+def test_run_generation_closes_local_evaluator_on_failure() -> None:
+    closed_instances: list[BuildEvaluator] = []
+    original_close = BuildEvaluator.close
+
+    def tracked_close(self: BuildEvaluator) -> None:
+        closed_instances.append(self)
+        return original_close(self)
+
+    class DummyRepo:
+        def close(self) -> None:
+            pass
+
+    with (
+        patch.object(BuildEvaluator, "close", tracked_close),
+        patch.object(
+            generation_runner,
+            "_run_generation_internal",
+            side_effect=RuntimeError("boom"),
+        ),
+    ):
+        with pytest.raises(RuntimeError):
+            run_generation(
+                count=1,
+                seed_start=0,
+                ruleset_id=_RULESET_ID,
+                profile_id="pinnacle",
+                repo=DummyRepo(),
+            )
+
+    assert closed_instances

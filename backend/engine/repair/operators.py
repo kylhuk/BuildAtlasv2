@@ -1,5 +1,6 @@
 from typing import Any
-from backend.engine.items.templates import RESIST_BASELINE, ATTRIBUTE_BASELINE, LIFE_BASELINE
+
+from backend.engine.items.templates import RESIST_BASELINE
 
 
 class ResistanceRepair:
@@ -82,7 +83,7 @@ class LifeRepair:
                 item["contributions"] = contribs
             else:
                 current_val = getattr(contribs, "life", 0)
-                setattr(contribs, "life", current_val + increment)
+                contribs.life = current_val + increment
             added_life += increment
 
         # Update stats (simplified)

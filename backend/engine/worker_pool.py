@@ -8,9 +8,8 @@ import random
 import subprocess
 import threading
 import time
-from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import orjson
 import xxhash
@@ -369,44 +368,9 @@ class WorkerPool:
             raise WorkerPoolClosedError("worker pool is closed")
         if not payloads:
             return []
-        futures: List[concurrent.futures.Future] = []
-        future_to_index: dict[concurrent.futures.Future, int] = {}
-        cached_results: list[dict[str, Any] | None] = [None] * len(payloads)
-        pending_indices: list[int] = []
-
-        for index, payload in enumerate(payloads):
-            cache_key = self._compute_cache_key(payload)
-            cached = self._get_cached_result(cache_key)
-            if cached is not None:
-                cached_results[index] = cached
-                with self._cache_lock:
-                    self._cache_stats["hits"] += 1
-            else:
-                with self._cache_lock:
-                    self._cache_stats["misses"] += 1
-                pending_indices.append(index)
-                worker_idx = self._assign_worker()
-                future = self._executor.submit(
-                    self._send_with_retries, worker_idx, payload, cache_key
-                )
-                futures.append(future)
-                future_to_index[future] = index
-
-        with self._cache_lock:
-            self._cache_stats["requests"] += len(payloads)
-            if self._cache_stats["requests"] % CACHE_HIT_STATS_INTERVAL == 0:
-                hit_rate = (
-                    self._cache_stats["hits"] / self._cache_stats["requests"]
-                    if self._cache_stats["requests"] > 0
-                    else 0.0
-                )
-                logger.info(
-                    "cache stats: hits=%d misses=%d requests=%d hit_rate=%.1f%%",
-                    self._cache_stats["hits"],
-                    self._cache_stats["misses"],
-                    self._cache_stats["requests"],
-                    hit_rate * 100,
-                )
+        cached_results, futures, future_to_index = self._prepare_batch_requests(
+            payloads, cache_non_ok=True
+        )
 
         if not futures:
             typed_results: List[Dict[str, Any]] = []
@@ -417,7 +381,7 @@ class WorkerPool:
             return typed_results
 
         total = len(futures)
-        results: list[dict[str, Any] | None] = [None] * total
+        results_by_index: dict[int, Dict[str, Any]] = {}
         pending: set[concurrent.futures.Future] = set(futures)
         completed = 0
         batch_started_at = time.monotonic()
@@ -443,7 +407,7 @@ class WorkerPool:
                 continue
             for future in done:
                 pending_idx = future_to_index[future]
-                results[pending_idx] = future.result()
+                results_by_index[pending_idx] = future.result()
                 completed += 1
 
         if total > 1:
@@ -461,12 +425,161 @@ class WorkerPool:
             if result is not None:
                 typed_results.append(result)
             else:
-                pending_result_idx = pending_indices.index(i)
-                pending_result = results[pending_result_idx]
+                pending_result = results_by_index.get(i)
                 if pending_result is None:
                     raise WorkerProtocolError("worker pool returned incomplete batch results")
                 typed_results.append(pending_result)
         return typed_results
+
+    def evaluate_batch_best_effort(
+        self,
+        payloads: Sequence[Any],
+        *,
+        progress_label: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        if self._closing.is_set():
+            raise WorkerPoolClosedError("worker pool is closed")
+        if not payloads:
+            return []
+
+        cached_results, futures, future_to_index = self._prepare_batch_requests(
+            payloads, cache_non_ok=False
+        )
+
+        if not futures:
+            typed_results: List[Dict[str, Any]] = []
+            for result in cached_results:
+                if result is None:
+                    typed_results.append(
+                        self._build_best_effort_error(
+                            "worker pool returned incomplete batch results"
+                        )
+                    )
+                else:
+                    typed_results.append(result)
+            return typed_results
+
+        total = len(futures)
+        results_by_index: dict[int, Dict[str, Any]] = {}
+        pending: set[concurrent.futures.Future] = set(futures)
+        completed = 0
+        batch_started_at = time.monotonic()
+        heartbeat_interval = max(5.0, min(30.0, self._request_timeout / 2.0))
+
+        while pending:
+            done, pending = concurrent.futures.wait(
+                pending,
+                timeout=heartbeat_interval,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done:
+                elapsed = max(0.0, time.monotonic() - batch_started_at)
+                label_prefix = f"{progress_label} " if progress_label else ""
+                logger.warning(
+                    "worker pool batch %sstill running (completed=%d/%d pending=%d elapsed=%.1fs)",
+                    label_prefix,
+                    completed,
+                    total,
+                    len(pending),
+                    elapsed,
+                )
+                continue
+            for future in done:
+                pending_idx = future_to_index[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = self._build_best_effort_error(exc)
+                results_by_index[pending_idx] = result
+                completed += 1
+
+        if total > 1:
+            elapsed = max(0.0, time.monotonic() - batch_started_at)
+            label_prefix = f"{progress_label} " if progress_label else ""
+            logger.info(
+                "worker pool batch %scompleted (completed=%d elapsed=%.1fs)",
+                label_prefix,
+                total,
+                elapsed,
+            )
+
+        typed_results: List[Dict[str, Any]] = []
+        for i, result in enumerate(cached_results):
+            if result is not None:
+                typed_results.append(result)
+            else:
+                pending_result = results_by_index.get(i)
+                if pending_result is None:
+                    pending_result = self._build_best_effort_error(
+                        "worker pool returned incomplete batch results"
+                    )
+                typed_results.append(pending_result)
+        return typed_results
+
+    def _prepare_batch_requests(
+        self,
+        payloads: Sequence[Any],
+        cache_non_ok: bool,
+    ) -> Tuple[
+        List[dict[str, Any] | None],
+        List[concurrent.futures.Future],
+        dict[concurrent.futures.Future, int],
+    ]:
+        futures: List[concurrent.futures.Future] = []
+        future_to_index: dict[concurrent.futures.Future, int] = {}
+        cached_results: list[dict[str, Any] | None] = [None] * len(payloads)
+
+        for index, payload in enumerate(payloads):
+            cache_key = self._compute_cache_key(payload)
+            cached = self._get_cached_result(cache_key)
+            if cached is not None:
+                cached_results[index] = cached
+                with self._cache_lock:
+                    self._cache_stats["hits"] += 1
+            else:
+                with self._cache_lock:
+                    self._cache_stats["misses"] += 1
+                worker_idx = self._assign_worker()
+                future = self._executor.submit(
+                    self._send_with_retries,
+                    worker_idx,
+                    payload,
+                    cache_key,
+                    cache_non_ok,
+                )
+                futures.append(future)
+                future_to_index[future] = index
+
+        with self._cache_lock:
+            self._cache_stats["requests"] += len(payloads)
+            if self._cache_stats["requests"] % CACHE_HIT_STATS_INTERVAL == 0:
+                hit_rate = (
+                    self._cache_stats["hits"] / self._cache_stats["requests"]
+                    if self._cache_stats["requests"] > 0
+                    else 0.0
+                )
+                logger.info(
+                    "cache stats: hits=%d misses=%d requests=%d hit_rate=%.1f%%",
+                    self._cache_stats["hits"],
+                    self._cache_stats["misses"],
+                    self._cache_stats["requests"],
+                    hit_rate * 100,
+                )
+
+        return cached_results, futures, future_to_index
+
+    def _build_best_effort_error(self, exc: Exception | str) -> Dict[str, Any]:
+        if isinstance(exc, str):
+            message = exc
+        else:
+            message = f"{exc.__class__.__name__}: {exc}"
+        return {
+            "id": 0,
+            "ok": False,
+            "error": {
+                "message": message,
+            },
+        }
 
     def close(self) -> None:
         if self._closing.is_set():
@@ -519,7 +632,11 @@ class WorkerPool:
             return idx
 
     def _send_with_retries(
-        self, worker_idx: int, payload: Any, cache_key: Optional[str] = None
+        self,
+        worker_idx: int,
+        payload: Any,
+        cache_key: Optional[str] = None,
+        cache_non_ok: bool = True,
     ) -> Dict[str, Any]:
         if self._is_fast_reject_candidate(payload):
             logger.debug("fast-reject: invalid build structure detected")
@@ -537,7 +654,7 @@ class WorkerPool:
         for attempt in range(WORKER_RETRY_COUNT + 1):
             try:
                 result = worker.send_request("evaluate", payload)
-                if cache_key is not None:
+                if cache_key is not None and (cache_non_ok or result.get("ok") is True):
                     self._cache_result(cache_key, result)
                 return result
             except (WorkerTimeoutError, WorkerCrashedError, WorkerProtocolError) as exc:

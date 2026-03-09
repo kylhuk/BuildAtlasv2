@@ -63,13 +63,43 @@ EXPECTED_SCENARIOS = {
     "delve_tier_2",
     "delve_tier_3",
     "support_party",
+    "mapping_t16_zero_gates",
+    "delve_tier_1_zero_gates",
+    "delve_tier_2_zero_gates",
+    "delve_tier_3_zero_gates",
+    "pinnacle_zero_gates",
+    "uber_pinnacle_zero_gates",
+    "support_party_zero_gates",
+    "progression_tutorial",
 }
+
+
+ZERO_GATES_PROFILE_IDS = {
+    "mapping_t16_zero_gates": "mapping_zero_gates",
+    "delve_tier_1_zero_gates": "delve_tier_1_zero_gates",
+    "delve_tier_2_zero_gates": "delve_tier_2_zero_gates",
+    "delve_tier_3_zero_gates": "delve_tier_3_zero_gates",
+    "pinnacle_zero_gates": "pinnacle_zero_gates",
+    "uber_pinnacle_zero_gates": "uber_pinnacle_zero_gates",
+    "support_party_zero_gates": "support_party_zero_gates",
+}
+
+
+def _zero_gate_payload():
+    return {
+        "metrics": {"full_dps": 0.0, "max_hit": 0.0},
+        "defense": {"resists": {"fire": 0.0, "cold": 0.0, "lightning": 0.0, "chaos": 0.0}},
+        "attributes": {"strength": 0.0, "dexterity": 0.0, "intelligence": 0.0},
+        "reservation": {"reserved_percent": 0.0, "available_percent": 0.0},
+    }
 
 
 def test_scenario_templates_and_version_helpers():
     templates = list_templates()
-    assert len(templates) == len(EXPECTED_SCENARIOS)
-    assert {template.scenario_id for template in templates} == EXPECTED_SCENARIOS
+    loaded_scenario_ids = {template.scenario_id for template in templates}
+    assert len(templates) >= len(EXPECTED_SCENARIOS)
+    assert EXPECTED_SCENARIOS <= loaded_scenario_ids
+    assert "progression_tutorial" in loaded_scenario_ids
 
     mapping_template = load_template("mapping_t16", "v0")
     assert mapping_template.profile_id == "mapping"
@@ -78,6 +108,57 @@ def test_scenario_templates_and_version_helpers():
     assert scenario_version_tag(mapping_template) == "mapping_t16@v0"
     ruleset_id = compose_ruleset_id("abc123", mapping_template, "prices-demo")
     assert ruleset_id == "pob:abc123|scenarios:mapping_t16@v0|prices:prices-demo"
+
+
+def test_zero_gates_templates_are_loadable_and_permissive():
+    for scenario_id, expected_profile_id in ZERO_GATES_PROFILE_IDS.items():
+        template = load_template(scenario_id)
+        assert template.scenario_id == scenario_id
+        assert template.profile_id == expected_profile_id
+        assert template.version == "v0"
+        assert template.gate_thresholds.min_max_hit == 0.0
+        assert template.gate_thresholds.min_full_dps == 0.0
+        assert template.gate_thresholds.reservation.max_percent == 100.0
+        assert template.gate_thresholds.resists == {
+            "fire": 0.0,
+            "cold": 0.0,
+            "lightning": 0.0,
+            "chaos": 0.0,
+        }
+        assert template.gate_thresholds.attributes == {
+            "strength": 0.0,
+            "dexterity": 0.0,
+            "intelligence": 0.0,
+        }
+
+        gate_result = evaluate_gates(
+            map_worker_output(_zero_gate_payload()), template.gate_thresholds
+        )
+        assert gate_result.gate_pass
+        assert gate_result.gate_fail_reasons == ()
+        assert gate_result.gate_slacks.min_gate_slack == 0.0
+        assert gate_result.gate_slacks.num_gate_violations == 0
+
+
+def test_progression_tutorial_template_is_loadable_and_early_game():
+    template = load_template("progression_tutorial")
+    assert template.scenario_id == "progression_tutorial"
+    assert template.profile_id == "progression_tutorial"
+    assert template.version == "v0"
+    assert template.gate_thresholds.min_full_dps == 200.0
+    assert template.gate_thresholds.min_max_hit == 800.0
+    assert template.gate_thresholds.resists == {
+        "fire": 45,
+        "cold": 45,
+        "lightning": 45,
+        "chaos": 0,
+    }
+    assert template.gate_thresholds.attributes == {
+        "strength": 40,
+        "dexterity": 30,
+        "intelligence": 20,
+    }
+    assert template.gate_thresholds.reservation.max_percent == 100.0
 
 
 def test_normalized_mapping_handles_nested_payloads_and_defaults():

@@ -2,6 +2,7 @@
   "scenario_id": "delve_tier_1",
   "version": "v0",
   "profile_id": "delve",
+  "budget_tier": "starter",
   "pob_config": {
     "name": "Delve Depth Tier 1",
     "boss": "Delve_Guardian_1",

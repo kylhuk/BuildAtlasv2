@@ -1,9 +1,8 @@
-import pytest
 from backend.engine.repair.operators import (
-    ResistanceRepair,
-    LifeRepair,
     AttributeRepair,
+    LifeRepair,
     ReservationRepair,
+    ResistanceRepair,
 )
 
 
@@ -80,7 +79,7 @@ def test_reservation_repair():
 
 def test_no_repair_needed():
     res_repair = ResistanceRepair()
-    build = {"resistances": {"fire": 75, "cold": 75, "lightning": 75, "chaos": 75}, "items": []}
+    build = {"resistances": {"fire": 90, "cold": 90, "lightning": 90, "chaos": 60}, "items": []}
     assert res_repair.needs_repair(build) is False
 
     res_repair_apply = res_repair.apply(build)

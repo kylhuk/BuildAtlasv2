@@ -1,0 +1,34 @@
+{
+  "scenario_id": "progression_white_maps",
+  "version": "v0",
+  "profile_id": "progression_white_maps",
+  "budget_tier": "midgame",
+  "pob_config": {
+    "name": "Progression White Maps",
+    "boss": "White_Map_Boss",
+    "debuffs": ["enfeeble"],
+    "flasks": {
+      "granite": 1,
+      "basalt": 1,
+      "quicksilver": 1
+    }
+  },
+  "gate_thresholds": {
+    "resists": {
+      "fire": 75,
+      "cold": 75,
+      "lightning": 75,
+      "chaos": 35
+    },
+    "reservation": {
+      "max_percent": 95
+    },
+    "attributes": {
+      "strength": 115,
+      "dexterity": 90,
+      "intelligence": 65
+    },
+    "min_max_hit": 2200,
+    "min_full_dps": 5000
+  }
+}

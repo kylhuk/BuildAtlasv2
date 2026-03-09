@@ -79,9 +79,13 @@ class BuildCSP:
         for i, item in enumerate(items):
             reqs = item.get("requirements", {})
             for attr, value in reqs.items():
-                if attributes.get(attr.lower(), 0) < value:
+                attr_key = attr.lower()
+                if attributes.get(attr_key, 0) < value:
                     errors.append(
-                        f"Item {i} requires {value} {attr}, but build only has {attributes.get(attr.lower())}"
+                        (
+                            f"Item {i} requires {value} {attr}, but build only has "
+                            f"{attributes.get(attr_key)}"
+                        )
                     )
         return errors
 
@@ -93,7 +97,8 @@ class BuildCSP:
     def _check_passive_connectivity(self, build_data: dict[str, Any]) -> bool:
         """
         Checks if all allocated passive nodes are connected to a starting node.
-        Expects 'passive_tree' to have 'allocated' (List[int]) and 'adjacencies' (Dict[int, List[int]]).
+        Expects 'passive_tree' to have 'allocated' (List[int])
+        and 'adjacencies' (Dict[int, List[int]]).
         'start_nodes' (List[int]) should also be provided.
         """
         tree_data = build_data.get("passive_tree", {})

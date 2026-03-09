@@ -1,0 +1,32 @@
+{
+  "scenario_id": "mapping_t16_zero_gates",
+  "version": "v0",
+  "profile_id": "mapping_zero_gates",
+  "pob_config": {
+    "name": "Mapping T16 Zero Gates",
+    "boss": "T16_Flea",
+    "debuffs": ["elementalWeakness", "enfeeble"],
+    "flasks": {
+      "granite": 1,
+      "basalt": 1
+    }
+  },
+  "gate_thresholds": {
+    "resists": {
+      "fire": 0,
+      "cold": 0,
+      "lightning": 0,
+      "chaos": 0
+    },
+    "reservation": {
+      "max_percent": 100
+    },
+    "attributes": {
+      "strength": 0,
+      "dexterity": 0,
+      "intelligence": 0
+    },
+    "min_max_hit": 0,
+    "min_full_dps": 0
+  }
+}

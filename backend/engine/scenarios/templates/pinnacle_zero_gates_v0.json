@@ -1,0 +1,32 @@
+{
+  "scenario_id": "pinnacle_zero_gates",
+  "version": "v0",
+  "profile_id": "pinnacle_zero_gates",
+  "pob_config": {
+    "name": "Pinnacle Zero Gates",
+    "boss": "Pinnacle",
+    "debuffs": ["bane", "temporalChains"],
+    "flasks": {
+      "granite": 5,
+      "basalt": 5
+    }
+  },
+  "gate_thresholds": {
+    "resists": {
+      "fire": 0,
+      "cold": 0,
+      "lightning": 0,
+      "chaos": 0
+    },
+    "reservation": {
+      "max_percent": 100
+    },
+    "attributes": {
+      "strength": 0,
+      "dexterity": 0,
+      "intelligence": 0
+    },
+    "min_max_hit": 0,
+    "min_full_dps": 0
+  }
+}

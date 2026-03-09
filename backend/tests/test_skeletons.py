@@ -1,4 +1,9 @@
+import json
+
 import pytest
+
+from backend.app.settings import settings
+from backend.engine.skeletons.loader import list_skeletons
 from backend.engine.skeletons.schema import Skeleton
 
 
@@ -75,9 +80,6 @@ def test_skeleton_from_to_dict():
 
 
 def test_list_skeletons(tmp_path, monkeypatch):
-    from backend.engine.skeletons.loader import list_skeletons
-    from backend.app.settings import settings
-    import json
 
     # Create a temporary skeletons directory
     skeletons_dir = tmp_path / "skeletons"

@@ -3,14 +3,15 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from backend.app.main import app, get_artifact_base_path
-from backend.engine.archive import (
+from ..app.main import app, get_artifact_base_path
+from ..engine.archive import (
     ArchiveStore,
     DescriptorAxisSpec,
     load_archive_artifact,
     persist_archive,
 )
-from backend.engine.archive.store import ARCHIVE_ARTIFACT_SCHEMA_VERSION
+from ..engine.archive.store import ARCHIVE_ARTIFACT_SCHEMA_VERSION
+from ..reports.archive_viz import visualize_archive
 
 
 def test_archive_endpoints(tmp_path: Path) -> None:
@@ -56,7 +57,7 @@ def test_default_axes_persist_transform_metadata(tmp_path: Path) -> None:
     store.insert(
         "default",
         score=1.0,
-        descriptor=(1000.0, 1200.0),
+        descriptor=(1000.0, 1200.0, 2.0),
     )
     persist_archive(
         "default-axes",
@@ -68,6 +69,8 @@ def test_default_axes_persist_transform_metadata(tmp_path: Path) -> None:
     axes = {axis["name"]: axis for axis in artifact["axes"]}
     assert axes["damage"]["transform"] == "log10"
     assert axes["max_hit"]["transform"] == "log10"
+    assert axes["utility"]["metric_key"] == "utility_score"
+    assert axes["utility"]["transform"] == "identity"
 
 
 def test_load_archive_artifact_normalizes_missing_axis_transform(tmp_path: Path) -> None:
@@ -103,6 +106,33 @@ def test_load_archive_artifact_normalizes_missing_axis_transform(tmp_path: Path)
     assert before == after
     axis_entry = artifact["axes"][0]
     assert axis_entry["transform"] == "identity"
+
+
+def test_visualize_archive_handles_persisted_artifact(tmp_path: Path) -> None:
+    store = ArchiveStore()
+    store.insert(
+        "viz-entry",
+        score=3.0,
+        descriptor=(1.0, 2.0, 3.0),
+    )
+    run_id = "viz-artifact"
+    persist_archive(
+        run_id,
+        store,
+        base_path=tmp_path,
+        created_at="2025-01-04T00:00:00Z",
+    )
+
+    viz_data = visualize_archive(run_id, base_path=tmp_path)
+    assert viz_data.run_id == run_id
+    assert viz_data.bins_filled == 1
+    assert len(viz_data.axes) == 3
+    expected_heatmaps = {
+        "damage_vs_max_hit",
+        "damage_vs_utility",
+        "max_hit_vs_utility",
+    }
+    assert set(viz_data.heatmap_data) == expected_heatmaps
 
 
 def test_archive_frontier_endpoint(tmp_path: Path) -> None:

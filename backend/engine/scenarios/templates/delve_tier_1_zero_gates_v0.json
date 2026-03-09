@@ -1,0 +1,33 @@
+{
+  "scenario_id": "delve_tier_1_zero_gates",
+  "version": "v0",
+  "profile_id": "delve_tier_1_zero_gates",
+  "pob_config": {
+    "name": "Delve Depth Tier 1 Zero Gates",
+    "boss": "Delve_Guardian_1",
+    "debuffs": ["enfeeble", "temporalChains"],
+    "flasks": {
+      "granite": 2,
+      "basalt": 2,
+      "quicksilver": 1
+    }
+  },
+  "gate_thresholds": {
+    "resists": {
+      "fire": 0,
+      "cold": 0,
+      "lightning": 0,
+      "chaos": 0
+    },
+    "reservation": {
+      "max_percent": 100
+    },
+    "attributes": {
+      "strength": 0,
+      "dexterity": 0,
+      "intelligence": 0
+    },
+    "min_max_hit": 0,
+    "min_full_dps": 0
+  }
+}

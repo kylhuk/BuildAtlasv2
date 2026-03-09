@@ -32,6 +32,7 @@ class ScenarioTemplate:
     profile_id: str
     pob_config: Mapping[str, Any]
     gate_thresholds: ScenarioGateThresholds
+    budget_tier: str | None = None
 
 
 def _coerce_float(value: Any, default: float = 0.0) -> float:
@@ -53,6 +54,14 @@ def _expect_str(value: Any, name: str) -> str:
     return value.strip()
 
 
+def _optional_str(value: Any, name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string if provided")
+    return value.strip()
+
+
 def _template_paths() -> Sequence[Path]:
     if not TEMPLATES_DIR.exists():
         return ()
@@ -64,6 +73,7 @@ def _load_template_from_path(path: Path) -> ScenarioTemplate:
     scenario_id = _expect_str(raw.get("scenario_id"), "scenario_id")
     version = _expect_str(raw.get("version"), "version")
     profile_id = _expect_str(raw.get("profile_id"), "profile_id")
+    budget_tier = _optional_str(raw.get("budget_tier"), "budget_tier")
     pob_config = raw.get("pob_config")
     if not isinstance(pob_config, AbcMapping):
         raise ValueError("pob_config must be a mapping")
@@ -95,6 +105,7 @@ def _load_template_from_path(path: Path) -> ScenarioTemplate:
         scenario_id=scenario_id,
         version=version,
         profile_id=profile_id,
+        budget_tier=budget_tier,
         pob_config=pob_config,
         gate_thresholds=gate_thresholds,
     )

@@ -14,7 +14,7 @@ RESIST_KEYS = ("fire", "cold", "lightning", "chaos")
 ATTRIBUTE_KEYS = ("strength", "dexterity", "intelligence")
 ALL_STAT_KEYS = (*RESIST_KEYS, *ATTRIBUTE_KEYS, "life", "energy_shield")
 
-RESIST_BASELINE = {"fire": 60, "cold": 60, "lightning": 60, "chaos": 45}
+RESIST_BASELINE = {"fire": 90, "cold": 90, "lightning": 90, "chaos": 60}
 ATTRIBUTE_BASELINE = {"strength": 170, "dexterity": 140, "intelligence": 140}
 LIFE_BASELINE = 900
 ES_BASELINE = 600
@@ -155,7 +155,7 @@ class ItemTemplatePlan:
 
 SLOT_PROFILES: dict[str, SlotProfile] = {
     "weapon_2h": SlotProfile(
-        base_type="Two-Handed Weapon",
+        base_type="Karui Maul",
         adjustable=False,
         base_resists=(2, 1, 1, 1),
         base_attributes=(25, 5, 0),
@@ -163,7 +163,7 @@ SLOT_PROFILES: dict[str, SlotProfile] = {
         base_energy_shield=0,
     ),
     "body_armour": SlotProfile(
-        base_type="Body Armour",
+        base_type="Plate Vest",
         adjustable=True,
         base_resists=(8, 8, 8, 4),
         base_attributes=(10, 5, 5),
@@ -171,7 +171,7 @@ SLOT_PROFILES: dict[str, SlotProfile] = {
         base_energy_shield=30,
     ),
     "helmet": SlotProfile(
-        base_type="Helmet",
+        base_type="Iron Hat",
         adjustable=True,
         base_resists=(6, 6, 6, 3),
         base_attributes=(8, 3, 8),
@@ -179,7 +179,7 @@ SLOT_PROFILES: dict[str, SlotProfile] = {
         base_energy_shield=20,
     ),
     "gloves": SlotProfile(
-        base_type="Gloves",
+        base_type="Iron Gauntlets",
         adjustable=True,
         base_resists=(4, 3, 4, 2),
         base_attributes=(5, 8, 3),
@@ -187,7 +187,7 @@ SLOT_PROFILES: dict[str, SlotProfile] = {
         base_energy_shield=15,
     ),
     "boots": SlotProfile(
-        base_type="Boots",
+        base_type="Rawhide Boots",
         adjustable=True,
         base_resists=(4, 5, 4, 2),
         base_attributes=(3, 10, 4),

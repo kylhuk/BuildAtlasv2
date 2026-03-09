@@ -23,7 +23,8 @@ class BuildDNA:
     items: list[str] = field(default_factory=list)
 
     # Gems: list of gem groups
-    # Each group is a dict with: { "slot": str, "gems": [ { "name": str, "level": int, "quality": int, "enabled": bool } ] }
+    # Each group is a dict with a "slot" string and a "gems" list
+    # whose entries look like { "name": str, "level": int, "quality": int, "enabled": bool }
     gem_groups: list[dict[str, Any]] = field(default_factory=list)
 
     # Configuration/Metadata

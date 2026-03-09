@@ -1,8 +1,7 @@
-import pytest
-import torch
 import numpy as np
-from pathlib import Path
-from backend.engine.surrogate.model import train, load_model, FEATURE_SIGNAL_KEYS
+import pytest
+
+from backend.engine.surrogate.model import FEATURE_SIGNAL_KEYS, load_model, train
 
 
 def test_slack_regressor_training(tmp_path):

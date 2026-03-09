@@ -1,0 +1,34 @@
+{
+  "scenario_id": "progression_yellow_maps",
+  "version": "v0",
+  "profile_id": "progression_yellow_maps",
+  "budget_tier": "midgame",
+  "pob_config": {
+    "name": "Progression Yellow Maps",
+    "boss": "Yellow_Map_Boss",
+    "debuffs": ["elementalWeakness", "enfeeble"],
+    "flasks": {
+      "granite": 1,
+      "basalt": 1,
+      "jade": 1
+    }
+  },
+  "gate_thresholds": {
+    "resists": {
+      "fire": 75,
+      "cold": 75,
+      "lightning": 75,
+      "chaos": 45
+    },
+    "reservation": {
+      "max_percent": 93
+    },
+    "attributes": {
+      "strength": 130,
+      "dexterity": 105,
+      "intelligence": 75
+    },
+    "min_max_hit": 2600,
+    "min_full_dps": 20000
+  }
+}

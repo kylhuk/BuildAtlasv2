@@ -11,12 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from backend.app.settings import settings
-from backend.engine.archive import (
-    ArchiveStore,
-    DescriptorAxisSpec,
-    load_archive_artifact,
-)
+from ..engine.archive import load_archive_artifact
 
 
 @dataclass(frozen=True)
@@ -58,63 +53,113 @@ class ArchiveVisualizationData:
     heatmap_data: dict[str, list[list[float]]]
 
 
+@dataclass(frozen=True)
+class ArchiveArtifactEntry:
+    bin_key: str
+    build_id: str
+    score: float
+    descriptor_values: tuple[float, ...]
+
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_bin_indices(bin_key: str) -> list[int]:
+    if not bin_key:
+        return []
+    indices: list[int] = []
+    for part in bin_key.split("-"):
+        try:
+            indices.append(int(part))
+        except ValueError:
+            continue
+    return indices
+
+
+def _build_entries(artifact: dict[str, Any]) -> list[ArchiveArtifactEntry]:
+    axes = artifact.get("axes", []) or []
+    entries: list[ArchiveArtifactEntry] = []
+    axis_names = [axis.get("name") or f"axis_{idx}" for idx, axis in enumerate(axes)]
+    for entry_data in artifact.get("bins", []) or []:
+        descriptor_payload = entry_data.get("descriptor") or {}
+        descriptor_values = tuple(
+            _coerce_float(descriptor_payload.get(name)) for name in axis_names
+        )
+        entries.append(
+            ArchiveArtifactEntry(
+                bin_key=str(entry_data.get("bin_key", "")),
+                build_id=str(entry_data.get("build_id", "")),
+                score=_coerce_float(entry_data.get("score")),
+                descriptor_values=descriptor_values,
+            )
+        )
+    return sorted(entries, key=lambda entry: entry.bin_key)
+
+
 def _get_axis_coverage(
-    store: ArchiveStore,
+    axes: list[dict[str, Any]],
+    entries: list[ArchiveArtifactEntry],
     axis_index: int,
 ) -> AxisCoverageStats:
-    """Calculate coverage statistics for a single axis."""
-    axis = store.axes[axis_index]
-    entries = store.entries()
-
-    # Count filled bins for this axis
-    filled_bins = set()
+    """Calculate coverage statistics for a single axis using persisted artifact data."""
+    axis = axes[axis_index]
+    axis_bins = _coerce_int(axis.get("bins"))
+    filled_bins: set[int] = set()
     for entry in entries:
-        bin_indices = [int(x) for x in entry.bin_key.split("-")]
+        bin_indices = _parse_bin_indices(entry.bin_key)
         if axis_index < len(bin_indices):
             filled_bins.add(bin_indices[axis_index])
 
-    coverage = len(filled_bins) / axis.bins if axis.bins > 0 else 0.0
+    coverage = len(filled_bins) / axis_bins if axis_bins > 0 else 0.0
+    axis_name = axis.get("name") or f"axis_{axis_index}"
 
     return AxisCoverageStats(
-        axis_name=axis.name,
+        axis_name=axis_name,
         bins_filled=len(filled_bins),
-        total_bins=axis.bins,
+        total_bins=axis_bins,
         coverage_percentage=coverage * 100.0,
-        min_value=axis.min_value,
-        max_value=axis.max_value,
+        min_value=_coerce_float(axis.get("min_value")),
+        max_value=_coerce_float(axis.get("max_value")),
     )
 
 
 def _generate_heatmap_data(
-    store: ArchiveStore,
+    axes: list[dict[str, Any]],
+    entries: list[ArchiveArtifactEntry],
 ) -> dict[str, list[list[float]]]:
-    """Generate heatmap data for all axis pairs.
-
-    Returns a dict mapping "axis1_vs_axis2" to a 2D grid of scores.
-    """
+    """Generate heatmap data for all axis pairs from persisted artifact data."""
     heatmaps: dict[str, list[list[float]]] = {}
-    axes = store.axes
-    entries = store.entries()
-
-    # Generate heatmaps for each pair of axes
     for i in range(len(axes)):
         for j in range(i + 1, len(axes)):
             axis_x = axes[i]
             axis_y = axes[j]
-            key = f"{axis_x.name}_vs_{axis_y.name}"
+            axis_x_bins = _coerce_int(axis_x.get("bins"))
+            axis_y_bins = _coerce_int(axis_y.get("bins"))
+            axis_x_name = axis_x.get("name") or f"axis_{i}"
+            axis_y_name = axis_y.get("name") or f"axis_{j}"
+            key = f"{axis_x_name}_vs_{axis_y_name}"
 
-            # Initialize grid with zeros
             grid: list[list[float]] = [
-                [0.0 for _ in range(axis_x.bins)] for _ in range(axis_y.bins)
+                [0.0 for _ in range(axis_x_bins)] for _ in range(axis_y_bins)
             ]
 
-            # Fill grid with scores
             for entry in entries:
-                bin_indices = [int(x) for x in entry.bin_key.split("-")]
+                bin_indices = _parse_bin_indices(entry.bin_key)
                 if i < len(bin_indices) and j < len(bin_indices):
                     x_idx = bin_indices[i]
                     y_idx = bin_indices[j]
-                    if 0 <= x_idx < axis_x.bins and 0 <= y_idx < axis_y.bins:
+                    if 0 <= x_idx < axis_x_bins and 0 <= y_idx < axis_y_bins:
                         grid[y_idx][x_idx] = max(grid[y_idx][x_idx], entry.score)
 
             heatmaps[key] = grid
@@ -126,22 +171,13 @@ def visualize_archive(
     run_id: str,
     base_path: Path | None = None,
 ) -> ArchiveVisualizationData:
-    """Load archive and generate visualization data.
+    """Load archive artifact and generate visualization data."""
+    artifact = load_archive_artifact(run_id, base_path)
+    axes = artifact.get("axes", []) or []
+    entries = _build_entries(artifact)
+    metrics = artifact.get("metrics") or {}
 
-    Args:
-        run_id: The run ID to visualize
-        base_path: Optional base path for data directory
-
-    Returns:
-        ArchiveVisualizationData with all visualization metrics
-    """
-    store = load_archive_artifact(run_id, base_path)
-    metrics = store.metrics()
-
-    # Prepare axis data
-    axes_data = [axis.to_dict() for axis in store.axes]
-
-    # Prepare bin entries
+    axes_data = [dict(axis) for axis in axes]
     bin_entries = [
         {
             "bin_key": entry.bin_key,
@@ -149,22 +185,19 @@ def visualize_archive(
             "score": entry.score,
             "descriptor_values": list(entry.descriptor_values),
         }
-        for entry in store.entries()
+        for entry in entries
     ]
 
-    # Calculate axis coverage
-    axis_coverage = [asdict(_get_axis_coverage(store, i)) for i in range(len(store.axes))]
-
-    # Generate heatmaps
-    heatmaps = _generate_heatmap_data(store)
+    axis_coverage = [asdict(_get_axis_coverage(axes, entries, i)) for i in range(len(axes))]
+    heatmaps = _generate_heatmap_data(axes, entries)
 
     return ArchiveVisualizationData(
         run_id=run_id,
         timestamp=datetime.now(timezone.utc).isoformat(),
-        total_bins=metrics.total_bins,
-        bins_filled=metrics.bins_filled,
-        coverage_percentage=metrics.coverage * 100.0,
-        qd_score=metrics.qd_score,
+        total_bins=_coerce_int(metrics.get("total_bins")),
+        bins_filled=_coerce_int(metrics.get("bins_filled")),
+        coverage_percentage=_coerce_float(metrics.get("coverage")) * 100.0,
+        qd_score=_coerce_float(metrics.get("qd_score")),
         axes=axes_data,
         bin_entries=bin_entries,
         axis_coverage=axis_coverage,

@@ -38,8 +38,8 @@ def test_archive_store_metrics_and_replacement():
 def test_emitters_and_allocator():
     axes = (DescriptorAxisSpec("a", "a", bins=2, min_value=0.0, max_value=2.0),)
     store = ArchiveStore(axes=axes)
-    store.insert("high", score=100.0, descriptor=(0.1,))
-    store.insert("low", score=10.0, descriptor=(1.9,))
+    store.insert("high", score=100.0, descriptor=(0.1,), metadata={"pass_probability": 0.6})
+    store.insert("low", score=10.0, descriptor=(1.9,), metadata={"pass_probability": 0.2})
     entries = store.entries()
 
     emitters = (ExploitEmitter(), NoveltyEmitter(), UncertaintyEmitter())
@@ -53,26 +53,31 @@ def test_emitters_and_allocator():
     assert len(novelty_selected) == 2
     assert novelty_selected[0].bin_key <= novelty_selected[1].bin_key
 
-    assert emitters[2].select(entries, allocation["uncertainty"]) == []
+    uncertainty_selected = emitters[2].select(entries, allocation["uncertainty"])
+    assert [entry.build_id for entry in uncertainty_selected] == ["high"]
 
 
 def test_default_descriptor_axes_use_log_damage_and_max_hit():
     store = ArchiveStore()
+    assert len(store.axes) == 3
     assert store.axes[0].metric_key == "full_dps"
     assert store.axes[0].transform == "log10"
     assert store.axes[1].metric_key == "max_hit"
     assert store.axes[1].transform == "log10"
+    assert store.axes[2].metric_key == "utility_score"
+    assert store.axes[2].transform == "identity"
 
 
 def test_high_dps_values_fill_multiple_damage_bins():
     store = ArchiveStore()
     constant_max_hit = 1200.0
+    constant_utility_score = 2.0
     dps_values = [5000.0, 20000.0, 1e7]
     for idx, dps in enumerate(dps_values):
         assert store.insert(
             f"build-{idx}",
             score=float(idx),
-            descriptor=(dps, constant_max_hit),
+            descriptor=(dps, constant_max_hit, constant_utility_score),
         )
     entries = store.entries()
     assert len(entries) == len(dps_values)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -130,3 +132,21 @@ def test_affected_profiles_uses_selected_profile_or_unique_build_profiles() -> N
         ],
     )
     assert profiles == ["pinnacle", "support"]
+
+
+def test_main_closes_internal_evaluator_when_evaluation_fails(tmp_path: Path) -> None:
+    repo = _DummyRepo()
+    repo.get_rows = {"build-1": {"build_id": "build-1", "profile_id": "pinnacle"}}
+    evaluator = Mock()
+
+    with (
+        patch.object(reevaluate_builds, "ClickhouseRepository", return_value=repo),
+        patch.object(reevaluate_builds, "BuildEvaluator", return_value=evaluator),
+        patch.object(reevaluate_builds, "_evaluate_builds", side_effect=RuntimeError("boom")),
+    ):
+        with pytest.raises(RuntimeError, match="boom"):
+            reevaluate_builds.main(
+                ["--build-id", "build-1", "--apply", "--ruleset-id", "rules-target"]
+            )
+
+    evaluator.close.assert_called_once()

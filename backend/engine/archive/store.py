@@ -84,6 +84,14 @@ DEFAULT_DESCRIPTOR_AXES: Tuple[DescriptorAxisSpec, ...] = (
         max_value=8.0,
         transform="log10",
     ),
+    DescriptorAxisSpec(
+        "utility",
+        "utility_score",
+        bins=5,
+        min_value=0.0,
+        max_value=10.0,
+        transform="identity",
+    ),
 )
 
 

@@ -102,6 +102,7 @@ def build_dataset_snapshot(
     exclude_stub_rows: bool = False,
     profile_id: str | None = None,
     scenario_id: str | None = None,
+    budget_tier: str | None = None,
     evolutionary_selection: bool = False,
     survival_rate: float = 0.9,
 ) -> SnapshotResult:
@@ -125,6 +126,7 @@ def build_dataset_snapshot(
             exclude_stub_rows=exclude_stub_rows,
             profile_id=profile_id,
             scenario_id=scenario_id,
+            budget_tier=budget_tier,
         )
     )
 
@@ -205,6 +207,7 @@ def _collect_rows(
     exclude_stub_rows: bool,
     profile_id: str | None,
     scenario_id: str | None,
+    budget_tier: str | None,
 ) -> Iterable[Mapping[str, Any]]:
     if not builds_root.exists():
         return ()
@@ -224,6 +227,7 @@ def _collect_rows(
                 exclude_stub_rows=exclude_stub_rows,
                 profile_id_filter=profile_id,
                 scenario_id_filter=scenario_id,
+                budget_tier_filter=budget_tier,
             )
         )
     return rows
@@ -238,6 +242,7 @@ def _rows_for_build(
     exclude_stub_rows: bool,
     profile_id_filter: str | None,
     scenario_id_filter: str | None,
+    budget_tier_filter: str | None,
 ) -> Iterable[Mapping[str, Any]]:
     pairs = sorted(
         ((str(key), key) for key in metrics),
@@ -255,6 +260,8 @@ def _rows_for_build(
         if not _matches_filter(row.get("profile_id"), profile_id_filter):
             continue
         if not _matches_filter(row.get("scenario_id"), scenario_id_filter):
+            continue
+        if not _matches_filter(row.get("budget_tier"), budget_tier_filter):
             continue
         yield row
 

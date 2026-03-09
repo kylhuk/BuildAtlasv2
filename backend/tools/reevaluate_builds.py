@@ -206,14 +206,18 @@ def main(argv: list[str] | None = None) -> int:
     if not args.apply:
         logger.info("dry run; no evaluations executed")
         return 0
+
     evaluator = BuildEvaluator(repo=repo, base_path=args.data_path)
-    results = _evaluate_builds(repo, evaluator, builds, target_ruleset)
-    successes = sum(1 for entry in results if entry.get("status") == "evaluated")
-    failures = len(results) - successes
-    logger.info("reevaluation complete: %d successes, %d failures", successes, failures)
-    for entry in results:
-        logger.info("build=%s status=%s", entry["build_id"], entry["status"])
-    return 0
+    try:
+        results = _evaluate_builds(repo, evaluator, builds, target_ruleset)
+        successes = sum(1 for entry in results if entry.get("status") == "evaluated")
+        failures = len(results) - successes
+        logger.info("reevaluation complete: %d successes, %d failures", successes, failures)
+        for entry in results:
+            logger.info("build=%s status=%s", entry["build_id"], entry["status"])
+        return 0
+    finally:
+        evaluator.close()
 
 
 if __name__ == "__main__":

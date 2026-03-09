@@ -77,16 +77,56 @@ class FakeRepository:
         self._scenario_metrics.pop(build_id, None)
 
 
-def _prepare_client(tmp_path: Path) -> tuple[TestClient, FakeRepository]:
+def _prepare_client(
+    tmp_path: Path, override_evaluator: bool = True
+) -> tuple[TestClient, FakeRepository]:
     fake_repo = FakeRepository()
     app.dependency_overrides.clear()
     app.dependency_overrides[get_repository] = lambda: fake_repo
     app.dependency_overrides[get_artifact_base_path] = lambda: tmp_path
-    app.dependency_overrides[get_build_evaluator] = lambda: BuildEvaluator(
-        repo=fake_repo,
-        base_path=tmp_path,
-    )
+    if override_evaluator:
+        app.dependency_overrides[get_build_evaluator] = lambda: BuildEvaluator(
+            repo=fake_repo,
+            base_path=tmp_path,
+        )
     return TestClient(app), fake_repo
+
+
+def test_generation_api_closes_evaluator_on_error(tmp_path: Path) -> None:
+    client, _repo = _prepare_client(tmp_path, override_evaluator=False)
+    try:
+        payload = {
+            "count": 1,
+            "seed_start": 0,
+            "ruleset_id": _ruleset_id(),
+            "profile_id": "pinnacle",
+        }
+
+        closed_instances: list[BuildEvaluator] = []
+        original_close = BuildEvaluator.close
+
+        def tracked_close(self: BuildEvaluator) -> None:
+            closed_instances.append(self)
+            return original_close(self)
+
+        with (
+            patch.object(
+                BuildEvaluator,
+                "close",
+                tracked_close,
+            ),
+            patch(
+                "backend.app.main.run_generation",
+                side_effect=RuntimeError("boom"),
+            ),
+        ):
+            response = client.post("/generation", json=payload)
+
+        assert response.status_code == 500
+        assert closed_instances
+    finally:
+        client.close()
+        app.dependency_overrides.clear()
 
 
 _ORIGINAL_DEFAULT_METRICS_GENERATOR = generation_runner._default_metrics_generator

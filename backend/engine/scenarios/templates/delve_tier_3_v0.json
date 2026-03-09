@@ -2,6 +2,7 @@
   "scenario_id": "delve_tier_3",
   "version": "v0",
   "profile_id": "delve",
+  "budget_tier": "endgame",
   "pob_config": {
     "name": "Delve Depth Tier 3",
     "boss": "Delve_Guardian_3",

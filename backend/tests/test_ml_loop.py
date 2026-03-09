@@ -267,6 +267,7 @@ def test_start_loop_executes_two_iterations(
         exclude_stub_rows: bool,
         profile_id: str | None = None,
         scenario_id: str | None = None,
+        **_: object,
     ) -> SnapshotResult:
         nonlocal last_snapshot_id, last_snapshot_root
         assert exclude_stub_rows is True
@@ -426,6 +427,7 @@ def test_start_loop_configures_evaluator_and_passes_it_into_generation(
         exclude_stub_rows: bool,
         profile_id: str | None = None,
         scenario_id: str | None = None,
+        **_: object,
     ) -> SnapshotResult:
         nonlocal last_snapshot_id, last_snapshot_root
         last_snapshot_id = snapshot_id
@@ -549,6 +551,7 @@ def test_start_loop_keeps_champion_when_challenger_regresses(
         exclude_stub_rows: bool,
         profile_id: str | None = None,
         scenario_id: str | None = None,
+        **_: object,
     ) -> SnapshotResult:
         nonlocal last_snapshot_id, last_snapshot_root
         assert exclude_stub_rows is True
@@ -758,6 +761,7 @@ def test_start_loop_resumes_with_next_seed(tmp_path: Path, monkeypatch: pytest.M
         exclude_stub_rows: bool,
         profile_id: str | None = None,
         scenario_id: str | None = None,
+        **_: object,
     ) -> SnapshotResult:
         nonlocal last_snapshot_id, last_snapshot_root
         assert exclude_stub_rows is True
@@ -876,6 +880,7 @@ def test_start_loop_records_failure_checkpoint_on_exception(
         exclude_stub_rows: bool,
         profile_id: str | None = None,
         scenario_id: str | None = None,
+        **_: object,
     ) -> SnapshotResult:
         raise RuntimeError("boom")
 
@@ -929,11 +934,14 @@ def test_start_loop_retries_snapshot_without_profile_filter_when_empty(
     last_snapshot_root: Path | None = None
     snapshot_call_profiles: list[str | None] = []
 
+    captured_levels = []
+
     def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        captured_levels.append(kwargs.get("character_level"))
         return {
             "run_id": kwargs.get("run_id"),
             "status": "completed",
-            "evaluation": {"attempted": 2, "successes": 2, "failures": 0, "errors": 0},
+            "evaluation": {"attempted": 1, "successes": 1, "failures": 0, "errors": 0},
         }
 
     def fake_build_dataset_snapshot(
@@ -944,6 +952,7 @@ def test_start_loop_retries_snapshot_without_profile_filter_when_empty(
         exclude_stub_rows: bool,
         profile_id: str | None = None,
         scenario_id: str | None = None,
+        **_: object,
     ) -> SnapshotResult:
         nonlocal last_snapshot_id, last_snapshot_root
         assert exclude_stub_rows is True
@@ -1375,6 +1384,7 @@ def test_start_loop_continues_after_unhealthy_generation(
         exclude_stub_rows: bool,
         profile_id: str | None = None,
         scenario_id: str | None = None,
+        **_: object,
     ) -> SnapshotResult:
         nonlocal snapshot_calls, last_snapshot_id, last_snapshot_root
         snapshot_calls += 1
@@ -2595,6 +2605,7 @@ def test_ml_loop_curriculum_integration(
         exclude_stub_rows: bool,
         profile_id: str | None = None,
         scenario_id: str | None = None,
+        **_: object,
     ) -> SnapshotResult:
         _ = data_path
         _ = profile_id
@@ -2699,6 +2710,904 @@ def test_ml_loop_curriculum_integration(
     state = json.loads(state_path.read_text(encoding="utf-8"))
     curriculum_state = state.get("curriculum", {})
     assert isinstance(curriculum_state, dict)
-    # With guardrails (MIN_SAMPLES_PER_PHASE=100), phase stays at MAPPING after 2 iterations
-    # (Only 6 samples total, need 100 to trigger transition)
+    # With MIN_PHASE_SAMPLES=20 and perfect pass rate, phase should advance to BOSSING.
+    assert curriculum_state.get("phase") == "BOSSING"
+
+
+def test_ml_loop_zero_gates_initial_phase_uses_zero_gate_profile_then_mapping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Zero-gates start should use zero-gates profile then switch to mapping profile."""
+
+    from backend.engine.scenarios.loader import ScenarioGateThresholds, ScenarioReservationThreshold
+
+    loop_id = "curriculum-zero-gates"
+    data_path = tmp_path / "data"
+
+    zero_gates_thresholds = ScenarioGateThresholds(
+        resists={
+            "fire": 0.0,
+            "cold": 0.0,
+            "lightning": 0.0,
+            "chaos": 0.0,
+        },
+        reservation=ScenarioReservationThreshold(max_percent=100.0),
+        attributes={
+            "strength": 0.0,
+            "dexterity": 0.0,
+            "intelligence": 0.0,
+        },
+        min_max_hit=0.0,
+        min_full_dps=0.0,
+    )
+    mapping_thresholds = ScenarioGateThresholds(
+        resists={"fire": 75.0, "cold": 75.0, "lightning": 75.0, "chaos": 0.0},
+        reservation=ScenarioReservationThreshold(max_percent=110.0),
+        attributes={"strength": 100.0, "dexterity": 100.0, "intelligence": 100.0},
+        min_max_hit=3000.0,
+        min_full_dps=5_000_000.0,
+    )
+
+    def fake_load_thresholds_for_profile(profile_id: str) -> ScenarioGateThresholds:
+        if profile_id == "pinnacle_zero_gates":
+            return zero_gates_thresholds
+        if profile_id == "pinnacle":
+            return mapping_thresholds
+        raise AssertionError(f"unexpected profile load request: {profile_id}")
+
+    captured_thresholds: list[ScenarioGateThresholds] = []
+    captured_run_generation_profiles: list[str | None] = []
+    captured_snapshot_profiles: list[str | None] = []
+    captured_snapshot_scenario_ids: list[str | None] = []
+
+    rows = [{"full_dps": 1.0, "max_hit": 2.0, "utility_score": 3.0, "build_id": "b1"}]
+
+    def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        iteration_gate_count = 20 if len(captured_thresholds) == 0 else 12
+        captured_thresholds.append(kwargs.get("gate_thresholds"))
+        generation_profile = kwargs.get("profile_id")
+        assert isinstance(generation_profile, str)
+        captured_run_generation_profiles.append(generation_profile)
+        assert isinstance(captured_thresholds[-1], ScenarioGateThresholds)
+        assert captured_run_generation_profiles[-1] in {"pinnacle_zero_gates", "pinnacle"}
+
+        gate_evaluations = [
+            {
+                "gate_pass": True,
+                "selected_for_evaluation": True,
+                "gate_fail_reasons": [],
+                "gate_slacks": {},
+            }
+            for _ in range(iteration_gate_count)
+        ]
+
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "completed",
+            "candidates": [],
+            "evaluation": {
+                "attempted": iteration_gate_count,
+                "successes": iteration_gate_count,
+                "failures": 0,
+                "errors": 0,
+                "gate_evaluations": gate_evaluations,
+            },
+        }
+
+    def fake_build_dataset_snapshot(
+        *,
+        data_path: Path | str,
+        output_root: Path | str,
+        snapshot_id: str,
+        exclude_stub_rows: bool,
+        profile_id: str | None = None,
+        scenario_id: str | None = None,
+        **_: object,
+    ) -> SnapshotResult:
+        assert exclude_stub_rows is True
+        assert isinstance(profile_id, str)
+        assert scenario_id is not None
+        captured_snapshot_profiles.append(profile_id)
+        captured_snapshot_scenario_ids.append(scenario_id)
+        _ = data_path
+        _ = scenario_id
+
+        snapshot_root = Path(output_root) / snapshot_id
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        dataset_path = snapshot_root / "dataset.jsonl"
+        dataset_path.write_text("[]", encoding="utf-8")
+        manifest_path = snapshot_root / "manifest.json"
+        manifest_path.write_text("{}", encoding="utf-8")
+        return SnapshotResult(
+            snapshot_id=snapshot_id,
+            dataset_path=dataset_path,
+            manifest_path=manifest_path,
+            row_count=len(rows),
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+            dataset_hash="hash",
+        )
+
+    def fake_train(
+        *,
+        dataset_path: Path | str,
+        output_root: Path | str,
+        model_id: str,
+        compute_backend: str,
+        **_: object,
+    ) -> TrainResult:
+        _ = dataset_path
+        _ = compute_backend
+        model_root = Path(output_root) / model_id
+        model_root.mkdir(parents=True, exist_ok=True)
+        model_path = model_root / "model.json"
+        model_path.write_text("{}", encoding="utf-8")
+        metrics_path = model_root / "metrics.json"
+        metrics_path.write_text("{}", encoding="utf-8")
+        meta_path = model_root / "meta.json"
+        meta_path.write_text("{}", encoding="utf-8")
+        return TrainResult(
+            model_id=model_id,
+            model_path=model_path,
+            metrics_path=metrics_path,
+            meta_path=meta_path,
+            dataset_snapshot_id="iter-0001",
+            dataset_hash="hash",
+            row_count=len(rows),
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+        )
+
+    def fake_load_dataset_rows(dataset_path: Path | str) -> list[dict[str, float]]:
+        _ = dataset_path
+        return [dict(row) for row in rows]
+
+    def fake_load_model(*args: object, **kwargs: object) -> _FakeModel:
+        _ = args
+        _ = kwargs
+        return _FakeModel()
+
+    def fake_evaluate_predictions(*args: object, **kwargs: object) -> EvaluationResult:
+        _ = args
+        _ = kwargs
+        return EvaluationResult(
+            row_count=len(rows),
+            metric_mae={"full_dps": 0.0, "max_hit": 0.0},
+            pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+        )
+
+    monkeypatch.setattr(ml_loop, "load_thresholds_for_profile", fake_load_thresholds_for_profile)
+    monkeypatch.setattr(ml_loop, "run_generation", fake_run_generation)
+    monkeypatch.setattr(ml_loop, "build_dataset_snapshot", fake_build_dataset_snapshot)
+    monkeypatch.setattr(ml_loop, "train", fake_train)
+    monkeypatch.setattr(ml_loop, "load_dataset_rows", fake_load_dataset_rows)
+    monkeypatch.setattr(ml_loop, "load_model", fake_load_model)
+    monkeypatch.setattr(ml_loop, "evaluate_predictions", fake_evaluate_predictions)
+
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        iterations=2,
+        count=3,
+        seed_start=1,
+        profile_id="pinnacle",
+        ruleset_id="ruleset-smoke",
+        scenario_version=None,
+        price_snapshot_id="price",
+        pob_commit=None,
+        constraints_file=None,
+        data_path=data_path,
+        surrogate_backend="cpu",
+        curriculum_enabled=True,
+        curriculum_initial_phase="ZERO_GATES",
+    )
+
+    result = ml_loop.start_loop(args)
+    assert result == 0
+
+    assert len(captured_thresholds) == 2
+    assert captured_run_generation_profiles == ["pinnacle_zero_gates", "pinnacle"]
+    assert captured_snapshot_profiles == ["pinnacle_zero_gates", "pinnacle"]
+    assert captured_snapshot_scenario_ids == ["pinnacle_zero_gates", "pinnacle"]
+    assert captured_thresholds[0].min_max_hit == 0.0
+    assert captured_thresholds[1].min_max_hit == pytest.approx(3000.0 * 0.70)
+
+    state_path = data_path / "ml_loops" / loop_id / ml_loop.STATE_FILENAME
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    curriculum_state = state.get("curriculum", {})
+    assert isinstance(curriculum_state, dict)
     assert curriculum_state.get("phase") == "MAPPING"
+
+
+def test_build_parser_allows_zero_gates_initial_phase() -> None:
+    parser = ml_loop._build_parser()
+    args = parser.parse_args(
+        [
+            "start",
+            "--loop-id",
+            "parser-parse-zero-gates",
+            "--iterations",
+            "1",
+            "--curriculum-initial-phase",
+            "ZERO_GATES",
+        ]
+    )
+    assert args.curriculum_initial_phase == "ZERO_GATES"
+
+
+def test_start_loop_budget_tier_snapshot_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patch_evaluator_and_repo: list,
+) -> None:
+    loop_id = "budget-tier-retry-test"
+    data_path = tmp_path / "data"
+    captured_snapshot_filters: list[tuple[str | None, str | None, str | None]] = []
+
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        iterations=1,
+        count=1,
+        seed_start=1,
+        profile_id="delve",
+        ruleset_id="pob:abc|scenarios:delve_tier_2@v0|prices:demo",
+        scenario_version=None,
+        price_snapshot_id="price",
+        pob_commit=None,
+        constraints_file=None,
+        data_path=data_path,
+        surrogate_backend="cpu",
+    )
+
+    def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "completed",
+            "evaluation": {"attempted": 1, "successes": 1, "failures": 0, "errors": 0},
+        }
+
+    def fake_build_dataset_snapshot(*args: object, **kwargs: object) -> SnapshotResult:
+        _ = args
+        captured_snapshot_filters.append(
+            (
+                kwargs.get("profile_id") if isinstance(kwargs.get("profile_id"), str) else None,
+                kwargs.get("scenario_id") if isinstance(kwargs.get("scenario_id"), str) else None,
+                kwargs.get("budget_tier") if isinstance(kwargs.get("budget_tier"), str) else None,
+            )
+        )
+        snapshot_id = str(kwargs.get("snapshot_id", "iter-0001"))
+        snapshot_root = Path(kwargs["output_root"]) / snapshot_id
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        dataset = snapshot_root / "dataset.jsonl"
+        dataset.write_text("[]", encoding="utf-8")
+        manifest = snapshot_root / "manifest.json"
+        manifest.write_text("{}", encoding="utf-8")
+        return SnapshotResult(
+            snapshot_id=snapshot_id,
+            dataset_path=dataset,
+            manifest_path=manifest,
+            row_count=0 if len(captured_snapshot_filters) == 1 else 1,
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+            dataset_hash="hash",
+        )
+
+    def fake_train(*args: object, **kwargs: object) -> TrainResult:
+        _ = args
+        model_root = Path(kwargs.get("output_root", tmp_path)) / str(
+            kwargs.get("model_id", "model")
+        )
+        model_root.mkdir(parents=True, exist_ok=True)
+        return TrainResult(
+            model_id="model",
+            model_path=model_root / "model.json",
+            metrics_path=model_root / "metrics.json",
+            meta_path=model_root / "meta.json",
+            dataset_snapshot_id="iter-0001",
+            dataset_hash="hash",
+            row_count=1,
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+        )
+
+    def fake_load_dataset_rows(dataset_path: Path | str) -> list[dict[str, float]]:
+        _ = dataset_path
+        return [{"full_dps": 1.0, "max_hit": 1.0}]
+
+    def fake_load_model(*args: object, **kwargs: object) -> _FakeModel:
+        _ = args
+        _ = kwargs
+        return _FakeModel()
+
+    def fake_evaluate_predictions(*args: object, **kwargs: object) -> EvaluationResult:
+        _ = args
+        _ = kwargs
+        return EvaluationResult(
+            row_count=1,
+            metric_mae={"full_dps": 0.0, "max_hit": 0.0},
+            pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+        )
+
+    monkeypatch.setattr(ml_loop, "run_generation", fake_run_generation)
+    monkeypatch.setattr(ml_loop, "build_dataset_snapshot", fake_build_dataset_snapshot)
+    monkeypatch.setattr(ml_loop, "train", fake_train)
+    monkeypatch.setattr(ml_loop, "load_dataset_rows", fake_load_dataset_rows)
+    monkeypatch.setattr(ml_loop, "load_model", fake_load_model)
+    monkeypatch.setattr(ml_loop, "evaluate_predictions", fake_evaluate_predictions)
+
+    result = ml_loop.start_loop(args)
+
+    assert result == 0
+    assert patch_evaluator_and_repo
+    assert captured_snapshot_filters == [
+        ("delve", "delve_tier_2", "midgame"),
+        ("delve", "delve_tier_2", None),
+    ]
+
+
+def test_compute_character_level() -> None:
+    # Formula: 1 + ((max(iteration, 1) - 1) // max(level_interval, 1))
+    # interval 10:
+    # iter 1 -> 1 + (0 // 10) = 1
+    # iter 10 -> 1 + (9 // 10) = 1
+    # iter 11 -> 1 + (10 // 10) = 2
+    assert ml_loop.compute_character_level(iteration=1, level_interval=10) == 1
+    assert ml_loop.compute_character_level(iteration=10, level_interval=10) == 1
+    assert ml_loop.compute_character_level(iteration=11, level_interval=10) == 2
+    assert ml_loop.compute_character_level(iteration=20, level_interval=10) == 2
+    assert ml_loop.compute_character_level(iteration=21, level_interval=10) == 3
+
+    # interval 5:
+    # iter 1 -> 1
+    # iter 5 -> 1
+    # iter 6 -> 2
+    assert ml_loop.compute_character_level(iteration=1, level_interval=5) == 1
+    assert ml_loop.compute_character_level(iteration=5, level_interval=5) == 1
+    assert ml_loop.compute_character_level(iteration=6, level_interval=5) == 2
+
+    # Edge cases
+    assert ml_loop.compute_character_level(iteration=0, level_interval=10) == 1
+    assert ml_loop.compute_character_level(iteration=1, level_interval=0) == 1
+    assert ml_loop.compute_character_level(iteration=2, level_interval=1) == 2
+
+
+def test_start_loop_persists_character_level(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patch_evaluator_and_repo: list,
+) -> None:
+    loop_id = "level-persist-test"
+    data_path = tmp_path / "data"
+    # level_interval=2 means:
+    # iter 1 -> level 1
+    # iter 2 -> level 1
+    # iter 3 -> level 2
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        iterations=3,
+        count=1,
+        seed_start=1,
+        profile_id="pinnacle",
+        ruleset_id="ruleset-smoke",
+        scenario_version=None,
+        price_snapshot_id="price",
+        pob_commit=None,
+        constraints_file=None,
+        data_path=data_path,
+        surrogate_backend="cpu",
+        level_interval=2,
+    )
+
+    captured_levels = []
+
+    def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        captured_levels.append(kwargs.get("character_level"))
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "completed",
+            "evaluation": {"attempted": 1, "successes": 1, "failures": 0, "errors": 0},
+        }
+
+    def fake_build_dataset_snapshot(*args: object, **kwargs: object) -> SnapshotResult:
+        snapshot_id = "iter-0001"
+        snapshot_root = (
+            Path(kwargs["output_root"]) / snapshot_id if "output_root" in kwargs else tmp_path
+        )
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        dataset = snapshot_root / "dataset.jsonl"
+        dataset.write_text("[]", encoding="utf-8")
+        (snapshot_root / "manifest.json").write_text("{}", encoding="utf-8")
+        return SnapshotResult(
+            snapshot_id=snapshot_id,
+            dataset_path=snapshot_root,
+            manifest_path=snapshot_root / "manifest.json",
+            row_count=1,
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+            dataset_hash="hash",
+        )
+
+    def fake_train(*args: object, **kwargs: object) -> TrainResult:
+        model_root = Path(kwargs.get("output_root", tmp_path)) / str(
+            kwargs.get("model_id", "model")
+        )
+        model_root.mkdir(parents=True, exist_ok=True)
+        return TrainResult(
+            model_id="model",
+            model_path=model_root / "model.json",
+            metrics_path=model_root / "metrics.json",
+            meta_path=model_root / "meta.json",
+            dataset_snapshot_id="iter-0001",
+            dataset_hash="hash",
+            row_count=1,
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+        )
+
+    def fake_load_dataset_rows(dataset_path: Path | str) -> list[dict[str, float]]:
+        return [{"full_dps": 1.0, "max_hit": 1.0}]
+
+    def fake_load_model(*args: object, **kwargs: object) -> _FakeModel:
+        return _FakeModel()
+
+    def fake_evaluate_predictions(*args: object, **kwargs: object) -> EvaluationResult:
+        return EvaluationResult(
+            row_count=1,
+            metric_mae={"full_dps": 0.0, "max_hit": 0.0},
+            pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+        )
+
+    monkeypatch.setattr(ml_loop, "run_generation", fake_run_generation)
+    monkeypatch.setattr(ml_loop, "build_dataset_snapshot", fake_build_dataset_snapshot)
+    monkeypatch.setattr(ml_loop, "train", fake_train)
+    monkeypatch.setattr(ml_loop, "load_dataset_rows", fake_load_dataset_rows)
+    monkeypatch.setattr(ml_loop, "load_model", fake_load_model)
+    monkeypatch.setattr(ml_loop, "evaluate_predictions", fake_evaluate_predictions)
+
+    ml_loop.start_loop(args)
+
+    loop_root = data_path / "ml_loops" / loop_id
+    iterations_path = loop_root / ml_loop.ITERATIONS_FILENAME
+    records = [
+        json.loads(line)
+        for line in iterations_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert len(records) == 3
+    assert records[0]["iteration"] == 1
+    assert records[0]["character_level"] == 1
+    assert records[1]["iteration"] == 2
+    assert records[1]["character_level"] == 1
+    assert records[2]["iteration"] == 3
+    assert records[2]["character_level"] == 2
+    assert captured_levels == [1, 1, 2]
+
+    state = json.loads((loop_root / ml_loop.STATE_FILENAME).read_text(encoding="utf-8"))
+    assert state["character_level"] == 2
+
+
+def test_progression_state_persists_when_no_iterations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop_id = "progression-initial"
+    data_path = tmp_path / "data"
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        iterations=1,
+        count=1,
+        seed_start=1,
+        profile_id="progression_tutorial",
+        ruleset_id="ruleset-smoke",
+        scenario_version=None,
+        price_snapshot_id="price",
+        pob_commit=None,
+        constraints_file=None,
+        data_path=data_path,
+        surrogate_backend="cpu",
+    )
+
+    def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        assert kwargs.get("profile_id") == "progression_tutorial"
+        raise RuntimeError("halt early")
+
+    monkeypatch.setattr(ml_loop, "run_generation", fake_run_generation)
+    result = ml_loop.start_loop(args)
+    assert result == 1
+
+    state_path = data_path / "ml_loops" / loop_id / ml_loop.STATE_FILENAME
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["progression_index"] == ml_loop.PROGRESSION_LADDER.index("progression_tutorial")
+    assert state["progression_stage"] == "progression_tutorial"
+
+
+def test_progression_stage_advances_after_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop_id = "progression-advance"
+    data_path = tmp_path / "data"
+    profile_history: list[str | None] = []
+
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        iterations=1,
+        count=1,
+        seed_start=1,
+        profile_id="progression_tutorial",
+        ruleset_id="ruleset-smoke",
+        scenario_version=None,
+        price_snapshot_id="price",
+        pob_commit=None,
+        constraints_file=None,
+        data_path=data_path,
+        surrogate_backend="cpu",
+    )
+
+    rows = [{"full_dps": 1.0, "max_hit": 1.0, "utility_score": 1.0}]
+
+    def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        profile_history.append(kwargs.get("profile_id"))
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "completed",
+            "evaluation": {"attempted": 1, "successes": 1, "failures": 0, "errors": 0},
+        }
+
+    def fake_build_dataset_snapshot(*args: object, **kwargs: object) -> SnapshotResult:
+        snapshot_id = str(kwargs.get("snapshot_id", "iter-0001"))
+        snapshot_root = Path(kwargs.get("output_root", data_path)) / snapshot_id
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        dataset_path = snapshot_root / "dataset.jsonl"
+        dataset_path.write_text("[]", encoding="utf-8")
+        manifest_path = snapshot_root / "manifest.json"
+        manifest_path.write_text("{}", encoding="utf-8")
+        return SnapshotResult(
+            snapshot_id=snapshot_id,
+            dataset_path=dataset_path,
+            manifest_path=manifest_path,
+            row_count=len(rows),
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+            dataset_hash="hash",
+        )
+
+    def fake_train(*args: object, **kwargs: object) -> TrainResult:
+        model_root = Path(kwargs.get("output_root", data_path)) / str(
+            kwargs.get("model_id", "model")
+        )
+        model_root.mkdir(parents=True, exist_ok=True)
+        return TrainResult(
+            model_id="model",
+            model_path=model_root / "model.json",
+            metrics_path=model_root / "metrics.json",
+            meta_path=model_root / "meta.json",
+            dataset_snapshot_id="iter-0001",
+            dataset_hash="hash",
+            row_count=len(rows),
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+        )
+
+    def fake_load_dataset_rows(dataset_path: Path | str) -> list[dict[str, float]]:
+        _ = dataset_path
+        return rows
+
+    def fake_load_model(*args: object, **kwargs: object) -> _FakeModel:
+        _ = args
+        _ = kwargs
+        return _FakeModel()
+
+    def fake_evaluate_predictions(*args: object, **kwargs: object) -> EvaluationResult:
+        _ = args
+        _ = kwargs
+        return EvaluationResult(
+            row_count=len(rows),
+            metric_mae={"full_dps": 0.0, "max_hit": 0.0},
+            pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+        )
+
+    monkeypatch.setattr(ml_loop, "run_generation", fake_run_generation)
+    monkeypatch.setattr(ml_loop, "build_dataset_snapshot", fake_build_dataset_snapshot)
+    monkeypatch.setattr(ml_loop, "train", fake_train)
+    monkeypatch.setattr(ml_loop, "load_dataset_rows", fake_load_dataset_rows)
+    monkeypatch.setattr(ml_loop, "load_model", fake_load_model)
+    monkeypatch.setattr(ml_loop, "evaluate_predictions", fake_evaluate_predictions)
+
+    result = ml_loop.start_loop(args)
+    assert result == 0
+
+    assert profile_history == ["progression_tutorial"]
+    state_path = data_path / "ml_loops" / loop_id / ml_loop.STATE_FILENAME
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["progression_index"] == 1
+    assert state["progression_stage"] == "progression_act5"
+
+
+def test_progression_stage_uses_stage_thresholds_and_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop_id = "progression-threshold-routing"
+    data_path = tmp_path / "data"
+
+    from backend.engine.scenarios.loader import (
+        ScenarioGateThresholds,
+        ScenarioReservationThreshold,
+        ScenarioTemplate,
+    )
+
+    threshold_calls: list[str] = []
+    run_profiles: list[str | None] = []
+    run_threshold_mins: list[float] = []
+    snapshot_profiles: list[str | None] = []
+    snapshot_scenarios: list[str | None] = []
+
+    tutorial_threshold = ScenarioGateThresholds(
+        resists={},
+        reservation=ScenarioReservationThreshold(max_percent=100.0),
+        attributes={},
+        min_max_hit=1200.0,
+        min_full_dps=1_000_000.0,
+    )
+    act5_threshold = ScenarioGateThresholds(
+        resists={},
+        reservation=ScenarioReservationThreshold(max_percent=100.0),
+        attributes={},
+        min_max_hit=2200.0,
+        min_full_dps=2_000_000.0,
+    )
+    threshold_by_profile = {
+        "progression_tutorial": tutorial_threshold,
+        "progression_act5": act5_threshold,
+    }
+
+    def fake_load_thresholds_for_profile(profile_id: str) -> ScenarioGateThresholds:
+        threshold_calls.append(profile_id)
+        try:
+            return threshold_by_profile[profile_id]
+        except KeyError as exc:
+            raise AssertionError(f"unexpected threshold profile request: {profile_id}") from exc
+
+    def fake_list_templates() -> tuple[ScenarioTemplate, ...]:
+        return (
+            ScenarioTemplate(
+                scenario_id="progression_tutorial",
+                version="v1",
+                profile_id="progression_tutorial",
+                pob_config={"dummy": True},
+                gate_thresholds=tutorial_threshold,
+            ),
+            ScenarioTemplate(
+                scenario_id="progression_act5",
+                version="v1",
+                profile_id="progression_act5",
+                pob_config={"dummy": True},
+                gate_thresholds=act5_threshold,
+            ),
+        )
+
+    def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        profile = kwargs.get("profile_id")
+        assert isinstance(profile, str)
+        run_profiles.append(profile)
+
+        thresholds = kwargs.get("gate_thresholds")
+        assert isinstance(thresholds, ScenarioGateThresholds)
+        run_threshold_mins.append(thresholds.min_max_hit)
+
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "completed",
+            "candidates": [],
+            "evaluation": {
+                "attempted": 1,
+                "successes": 1,
+                "failures": 0,
+                "errors": 0,
+                "gate_evaluations": [
+                    {
+                        "gate_pass": True,
+                        "selected_for_evaluation": True,
+                        "gate_fail_reasons": [],
+                        "gate_slacks": {},
+                    }
+                ],
+            },
+        }
+
+    def fake_build_dataset_snapshot(
+        *,
+        data_path: Path | str,
+        output_root: Path | str,
+        snapshot_id: str,
+        exclude_stub_rows: bool,
+        profile_id: str | None = None,
+        scenario_id: str | None = None,
+        **_: object,
+    ) -> SnapshotResult:
+        _ = data_path
+        assert exclude_stub_rows is True
+        if profile_id is not None:
+            snapshot_profiles.append(profile_id)
+        if scenario_id is not None:
+            snapshot_scenarios.append(scenario_id)
+        snapshot_root = Path(output_root) / snapshot_id
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        dataset_path = snapshot_root / "dataset.jsonl"
+        dataset_path.write_text("[]", encoding="utf-8")
+        manifest_path = snapshot_root / "manifest.json"
+        manifest_path.write_text("{}", encoding="utf-8")
+        return SnapshotResult(
+            snapshot_id=snapshot_id,
+            dataset_path=dataset_path,
+            manifest_path=manifest_path,
+            row_count=1,
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+            dataset_hash="hash",
+        )
+
+    def fake_train(*args: object, **kwargs: object) -> TrainResult:
+        model_root = Path(kwargs.get("output_root", data_path)) / str(
+            kwargs.get("model_id", "model")
+        )
+        model_root.mkdir(parents=True, exist_ok=True)
+        return TrainResult(
+            model_id="model",
+            model_path=model_root / "model.json",
+            metrics_path=model_root / "metrics.json",
+            meta_path=model_root / "meta.json",
+            dataset_snapshot_id="iter-0001",
+            dataset_hash="hash",
+            row_count=1,
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+        )
+
+    def fake_load_dataset_rows(dataset_path: Path | str) -> list[dict[str, float]]:
+        _ = dataset_path
+        return [{"full_dps": 1.0, "max_hit": 1.0}]
+
+    def fake_load_model(*args: object, **kwargs: object) -> _FakeModel:
+        _ = args
+        _ = kwargs
+        return _FakeModel()
+
+    def fake_evaluate_predictions(*args: object, **kwargs: object) -> EvaluationResult:
+        _ = args
+        _ = kwargs
+        return EvaluationResult(
+            row_count=1,
+            metric_mae={"full_dps": 0.0, "max_hit": 0.0},
+            pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+        )
+
+    monkeypatch.setattr(ml_loop, "load_thresholds_for_profile", fake_load_thresholds_for_profile)
+    monkeypatch.setattr(ml_loop, "list_templates", fake_list_templates)
+    monkeypatch.setattr(ml_loop, "run_generation", fake_run_generation)
+    monkeypatch.setattr(ml_loop, "build_dataset_snapshot", fake_build_dataset_snapshot)
+    monkeypatch.setattr(ml_loop, "train", fake_train)
+    monkeypatch.setattr(ml_loop, "load_dataset_rows", fake_load_dataset_rows)
+    monkeypatch.setattr(ml_loop, "load_model", fake_load_model)
+    monkeypatch.setattr(ml_loop, "evaluate_predictions", fake_evaluate_predictions)
+
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        iterations=2,
+        count=1,
+        seed_start=1,
+        profile_id="progression_tutorial",
+        ruleset_id="ruleset-smoke",
+        scenario_version=None,
+        price_snapshot_id="price",
+        pob_commit=None,
+        constraints_file=None,
+        data_path=data_path,
+        surrogate_backend="cpu",
+        curriculum_enabled=True,
+    )
+
+    result = ml_loop.start_loop(args)
+
+    assert result == 0
+    assert run_profiles == ["progression_tutorial", "progression_act5"]
+    assert snapshot_profiles == ["progression_tutorial", "progression_act5"]
+    assert snapshot_scenarios == ["progression_tutorial", "progression_act5"]
+    assert run_threshold_mins == [1200.0, 2200.0]
+    assert threshold_calls == ["progression_tutorial", "progression_act5"]
+
+    state = json.loads(
+        (data_path / "ml_loops" / loop_id / ml_loop.STATE_FILENAME).read_text(encoding="utf-8")
+    )
+    assert state["progression_index"] == 2
+    assert state["progression_stage"] == "progression_act10"
+
+
+def test_zero_gates_phase_uses_zero_gates_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    loop_id = "zero-gates-progression"
+    data_path = tmp_path / "data"
+    captured_profiles: list[str | None] = []
+
+    args = argparse.Namespace(
+        loop_id=loop_id,
+        iterations=1,
+        count=1,
+        seed_start=1,
+        profile_id="pinnacle",
+        ruleset_id="ruleset-smoke",
+        scenario_version=None,
+        price_snapshot_id="price",
+        pob_commit=None,
+        constraints_file=None,
+        data_path=data_path,
+        surrogate_backend="cpu",
+        curriculum_enabled=True,
+        curriculum_initial_phase="ZERO_GATES",
+    )
+
+    def fake_run_generation(**kwargs: object) -> dict[str, object]:
+        captured_profiles.append(kwargs.get("profile_id"))
+        return {
+            "run_id": kwargs.get("run_id"),
+            "status": "completed",
+            "evaluation": {"attempted": 1, "successes": 1, "failures": 0, "errors": 0},
+        }
+
+    def fake_build_dataset_snapshot(*args: object, **kwargs: object) -> SnapshotResult:
+        snapshot_id = str(kwargs.get("snapshot_id", "iter-0001"))
+        snapshot_root = Path(kwargs.get("output_root", data_path)) / snapshot_id
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        dataset_path = snapshot_root / "dataset.jsonl"
+        dataset_path.write_text("[]", encoding="utf-8")
+        manifest_path = snapshot_root / "manifest.json"
+        manifest_path.write_text("{}", encoding="utf-8")
+        return SnapshotResult(
+            snapshot_id=snapshot_id,
+            dataset_path=dataset_path,
+            manifest_path=manifest_path,
+            row_count=1,
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+            dataset_hash="hash",
+        )
+
+    def fake_train(*args: object, **kwargs: object) -> TrainResult:
+        model_root = Path(kwargs.get("output_root", data_path)) / str(
+            kwargs.get("model_id", "model")
+        )
+        model_root.mkdir(parents=True, exist_ok=True)
+        return TrainResult(
+            model_id="model",
+            model_path=model_root / "model.json",
+            metrics_path=model_root / "metrics.json",
+            meta_path=model_root / "meta.json",
+            dataset_snapshot_id="iter-0001",
+            dataset_hash="hash",
+            row_count=1,
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+        )
+
+    def fake_load_dataset_rows(dataset_path: Path | str) -> list[dict[str, float]]:
+        _ = dataset_path
+        return [{"full_dps": 1.0, "max_hit": 1.0}]
+
+    def fake_load_model(*args: object, **kwargs: object) -> _FakeModel:
+        _ = args
+        _ = kwargs
+        return _FakeModel()
+
+    def fake_evaluate_predictions(*args: object, **kwargs: object) -> EvaluationResult:
+        _ = args
+        _ = kwargs
+        return EvaluationResult(
+            row_count=1,
+            metric_mae={"full_dps": 0.0, "max_hit": 0.0},
+            pass_probability={"mean": 0.5, "std": 0.0, "min": 0.5, "max": 0.5},
+        )
+
+    monkeypatch.setattr(ml_loop, "run_generation", fake_run_generation)
+    monkeypatch.setattr(ml_loop, "build_dataset_snapshot", fake_build_dataset_snapshot)
+    monkeypatch.setattr(ml_loop, "train", fake_train)
+    monkeypatch.setattr(ml_loop, "load_dataset_rows", fake_load_dataset_rows)
+    monkeypatch.setattr(ml_loop, "load_model", fake_load_model)
+    monkeypatch.setattr(ml_loop, "evaluate_predictions", fake_evaluate_predictions)
+
+    result = ml_loop.start_loop(args)
+    assert result == 0
+
+    expected_profile = ml_loop._resolve_zero_gates_profile_id("pinnacle")
+    assert captured_profiles == [expected_profile]
+
+    state_path = data_path / "ml_loops" / loop_id / ml_loop.STATE_FILENAME
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["progression_stage"] is None

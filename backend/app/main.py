@@ -12,7 +12,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List, Literal, Mapping, Sequence
+from typing import Any, Dict, Generator, List, Literal, Mapping, Sequence
 
 import orjson
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -426,8 +426,8 @@ def get_artifact_base_path() -> Path:
 def get_build_evaluator(
     repo: ClickhouseRepository = Depends(get_repository),
     base_path: Path = Depends(get_artifact_base_path),
-) -> BuildEvaluator:
-    return BuildEvaluator(
+) -> Generator[BuildEvaluator, None, None]:
+    evaluator = BuildEvaluator(
         repo=repo,
         base_path=base_path,
         worker_cmd=settings.pob_worker_cmd,
@@ -435,6 +435,10 @@ def get_build_evaluator(
         worker_cwd=settings.pob_worker_cwd,
         worker_pool_size=settings.pob_worker_pool_size,
     )
+    try:
+        yield evaluator
+    finally:
+        evaluator.close()
 
 
 @app.get("/health")

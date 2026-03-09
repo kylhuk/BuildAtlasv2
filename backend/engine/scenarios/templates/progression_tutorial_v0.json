@@ -1,0 +1,33 @@
+{
+  "scenario_id": "progression_tutorial",
+  "version": "v0",
+  "profile_id": "progression_tutorial",
+  "budget_tier": "starter",
+  "pob_config": {
+    "name": "Progression Tutorial",
+    "boss": "Tutorial_Boss",
+    "debuffs": [],
+    "flasks": {
+      "life": 2,
+      "quicksilver": 1
+    }
+  },
+  "gate_thresholds": {
+    "resists": {
+      "fire": 45,
+      "cold": 45,
+      "lightning": 45,
+      "chaos": 0
+    },
+    "reservation": {
+      "max_percent": 100
+    },
+    "attributes": {
+      "strength": 40,
+      "dexterity": 30,
+      "intelligence": 20
+    },
+    "min_max_hit": 800,
+    "min_full_dps": 200
+  }
+}

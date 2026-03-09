@@ -1,0 +1,33 @@
+{
+  "scenario_id": "progression_t16",
+  "version": "v0",
+  "profile_id": "progression_t16",
+  "budget_tier": "endgame",
+  "pob_config": {
+    "name": "Progression T16",
+    "boss": "T16_Flea",
+    "debuffs": ["elementalWeakness", "enfeeble"],
+    "flasks": {
+      "granite": 1,
+      "basalt": 1
+    }
+  },
+  "gate_thresholds": {
+    "resists": {
+      "fire": 75,
+      "cold": 75,
+      "lightning": 75,
+      "chaos": 60
+    },
+    "reservation": {
+      "max_percent": 90
+    },
+    "attributes": {
+      "strength": 150,
+      "dexterity": 120,
+      "intelligence": 90
+    },
+    "min_max_hit": 3000,
+    "min_full_dps": 100000
+  }
+}

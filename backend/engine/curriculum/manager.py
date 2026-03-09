@@ -15,9 +15,7 @@ from backend.engine.scenarios.loader import ScenarioGateThresholds
 class CurriculumManager:
     """Manages curriculum state with batching and persistence."""
 
-    def __init__(
-        self, enabled: bool = True, initial_phase: CurriculumPhase | None = None
-    ) -> None:
+    def __init__(self, enabled: bool = True, initial_phase: CurriculumPhase | None = None) -> None:
         """Initialize scheduler at given phase."""
 
         self.enabled = enabled
@@ -27,6 +25,34 @@ class CurriculumManager:
         else:
             phase = initial_phase or CurriculumPhase.MAPPING
             self.scheduler = CurriculumScheduler(initial_phase=phase)
+
+    @staticmethod
+    def _restore_phase(phase_name: str | None) -> CurriculumPhase:
+        """Resolve persisted phase names with backward-compatible fallbacks."""
+
+        if not phase_name:
+            return CurriculumPhase.MAPPING
+
+        phase_name = str(phase_name).strip().upper()
+        try:
+            return CurriculumPhase[phase_name]
+        except KeyError:
+            # Keep migration path open for any legacy variants that may slip in.
+            legacy_map = {
+                "TUTORIAL": CurriculumPhase.MAPPING,
+                "ACT_5": CurriculumPhase.MAPPING,
+                "ACT5": CurriculumPhase.MAPPING,
+                "ACT_10": CurriculumPhase.BOSSING,
+                "ACT10": CurriculumPhase.BOSSING,
+                "WHITE_MAPS": CurriculumPhase.PINNACLE,
+                "YELLOW_MAPS": CurriculumPhase.PINNACLE,
+                "RED_MAPS": CurriculumPhase.PINNACLE,
+                "T16": CurriculumPhase.PINNACLE,
+                "PINNACLE": CurriculumPhase.PINNACLE,
+                "UBER": CurriculumPhase.UBER,
+                "ZERO_GATES": CurriculumPhase.ZERO_GATES,
+            }
+            return legacy_map.get(phase_name, CurriculumPhase.MAPPING)
 
     def get_thresholds(self, base: ScenarioGateThresholds) -> ScenarioGateThresholds:
         """Get phase-adjusted thresholds. Call ONCE per iteration."""
@@ -82,8 +108,8 @@ class CurriculumManager:
         if not state.get("enabled", True):
             return cls(enabled=False)
 
-        phase_name = state.get("phase", "MAPPING")
-        phase = CurriculumPhase[phase_name]
+        phase_name = state.get("phase")
+        phase = cls._restore_phase(phase_name)
 
         manager = cls(enabled=True, initial_phase=phase)
         manager.scheduler.state = CurriculumState(

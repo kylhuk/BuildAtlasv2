@@ -458,6 +458,89 @@ def test_result_caching_returns_cached_result_on_duplicate_payload() -> None:
     assert call_count["count"] == 1
 
 
+def test_batch_ordering_with_cached_and_missing_payloads() -> None:
+    def responder_factory() -> Callable[[MockProcess, Dict[str, Any]], None]:
+        def responder(process: MockProcess, request: Dict[str, Any]) -> None:
+            process.stdout.push_line(
+                json.dumps(
+                    {
+                        "id": request["id"],
+                        "ok": True,
+                        "result": {
+                            "payload": request["params"],
+                        },
+                    }
+                )
+            )
+
+        return responder
+
+    module = MockSubprocessModule(responder_factory)
+    pool = WorkerPool(num_workers=1, subprocess_module=module)
+    try:
+        payload_cached = {
+            "value": "cached",
+            "build": {"items": [], "tree": {}},
+            "scenario": "test",
+        }
+        payload_missing = {
+            "value": "fresh",
+            "build": {"items": [], "tree": {}},
+            "scenario": "test",
+        }
+        # Prime the cache for the first payload
+        pool.evaluate_batch([payload_cached])
+        responses = pool.evaluate_batch([payload_cached, payload_missing])
+    finally:
+        pool.close()
+
+    assert responses[0]["result"]["payload"]["value"] == "cached"
+    assert responses[1]["result"]["payload"]["value"] == "fresh"
+
+
+def test_evaluate_batch_best_effort_mixed_success_and_failure() -> None:
+    call_count = {"count": 0}
+
+    def responder_factory() -> Callable[[MockProcess, Dict[str, Any]], None]:
+        def responder(process: MockProcess, request: Dict[str, Any]) -> None:
+            call_count["count"] += 1
+            if request["params"]["value"] == "fail":
+                return
+            process.stdout.push_line(
+                json.dumps(
+                    {
+                        "id": request["id"],
+                        "ok": True,
+                        "result": {"value": request["params"]["value"]},
+                    }
+                )
+            )
+
+        return responder
+
+    module = MockSubprocessModule(responder_factory)
+    timeout_payload = {"value": "fail", "build": {"items": [], "tree": {}}, "scenario": "test"}
+    success_payload = {"value": "ok", "build": {"items": [], "tree": {}}, "scenario": "test"}
+    pool = WorkerPool(
+        num_workers=1,
+        subprocess_module=module,
+        request_timeout=0.01,
+    )
+    try:
+        results = pool.evaluate_batch_best_effort([timeout_payload, success_payload])
+        repeated = pool.evaluate_batch_best_effort([timeout_payload])
+    finally:
+        pool.close()
+
+    assert results[0]["ok"] is False
+    assert "WorkerTimeoutError" in results[0]["error"]["message"]
+    assert results[1]["ok"] is True
+    assert repeated[0]["ok"] is False
+    # Best-effort mode retries each timed-out payload three times and never caches non-ok results,
+    # so both batches together exercise a total of seven worker invocations for the timeout payload.
+    assert call_count["count"] == 7
+
+
 def test_cache_hit_rate_tracking() -> None:
     def responder_factory() -> Callable[[MockProcess, Dict[str, Any]], None]:
         def responder(process: MockProcess, request: Dict[str, Any]) -> None:
@@ -593,9 +676,6 @@ def test_cache_eviction_on_max_size() -> None:
     module = MockSubprocessModule(responder_factory)
     pool = WorkerPool(num_workers=1, subprocess_module=module)
     try:
-        with pool._cache_lock:
-            original_max = pool._result_cache.__class__.__dict__.get("__maxsize__", 10000)
-
         payloads = [
             {"value": f"test_{i}", "build": {"items": [], "tree": {}}, "scenario": "test"}
             for i in range(5)

@@ -4,6 +4,7 @@ import base64
 import logging
 import xml.etree.ElementTree as ET
 import zlib
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
@@ -23,12 +24,19 @@ from backend.engine.metrics_source import (
     METRICS_SOURCE_STUB,
     normalize_metrics_source,
 )
-from backend.engine.scenarios.loader import ScenarioGateThresholds, ScenarioTemplate, list_templates
-from backend.engine.worker_pool import WorkerPool, WorkerPoolError
+from backend.engine.scenarios.loader import (
+    ScenarioGateThresholds,
+    ScenarioReservationThreshold,
+    ScenarioTemplate,
+    list_templates,
+)
+from backend.engine.worker_pool import WorkerPool, WorkerPoolClosedError, WorkerPoolError
 
 logger = logging.getLogger(__name__)
 
 HARDCODED_WORKER_REQUEST_TIMEOUT_SECONDS = 120.0
+MAX_PAYLOADS_PER_BATCH = 512
+MAX_XML_BYTES_PER_BATCH = 64 * 1024 * 1024
 
 _ALLOWED_STATUS_TRANSITIONS: Dict[BuildStatus, set[BuildStatus]] = {
     BuildStatus.imported: {BuildStatus.queued},
@@ -36,6 +44,13 @@ _ALLOWED_STATUS_TRANSITIONS: Dict[BuildStatus, set[BuildStatus]] = {
     BuildStatus.evaluated: {BuildStatus.queued},
     BuildStatus.failed: {BuildStatus.queued},
 }
+
+
+@dataclass(frozen=True)
+class _PreparedBuildEvaluation:
+    build: dict[str, Any]
+    artifacts: Any
+    templates: list[ScenarioTemplate]
 
 
 @dataclass
@@ -91,6 +106,16 @@ class BuildEvaluator:
         self._pool: WorkerPool | None = None
         self._pool_lock = __import__("threading").Lock()
         self._last_evaluation_provenance: EvaluationProvenance | None = None
+        self._templates_by_profile: dict[str, tuple[ScenarioTemplate, ...]] = {}
+
+    def _templates_for_profile(self, profile_id: str) -> list[ScenarioTemplate]:
+        cached = self._templates_by_profile.get(profile_id)
+        if cached is None:
+            cached = tuple(
+                template for template in list_templates() if template.profile_id == profile_id
+            )
+            self._templates_by_profile[profile_id] = cached
+        return list(cached)
 
     def _get_worker_pool(self) -> WorkerPool:
         with self._pool_lock:
@@ -149,12 +174,132 @@ class BuildEvaluator:
                 details=str(exc),
             ) from exc
 
+    def evaluate_builds_batched(
+        self,
+        build_ids: Sequence[str],
+        gate_thresholds: Mapping[str, Any] | None = None,
+        progress_label: str | None = None,
+    ) -> dict[str, Any]:
+        results: dict[str, tuple[BuildStatus, List[ScenarioMetricRow]]] = {}
+        errors: dict[str, APIError] = {}
+        prepared_builds: dict[str, _PreparedBuildEvaluation] = {}
+        grouped_build_ids: dict[tuple[str, str], list[str]] = defaultdict(list)
+
+        for build_id in build_ids:
+            try:
+                build = self._repo.get_build(build_id)
+                if not build:
+                    raise APIError(404, "build_not_found", f"build {build_id} not found")
+                status_value = build.get("status")
+                try:
+                    current_status = BuildStatus(status_value)
+                except ValueError:
+                    current_status = BuildStatus.imported
+                self._ensure_transition(current_status, BuildStatus.queued)
+                self._repo.update_build_status(build_id, BuildStatus.queued.value)
+                prepared = self._prepare_build_evaluation(build, gate_thresholds=gate_thresholds)
+                prepared_builds[build_id] = prepared
+                profile_id = str(build.get("profile_id") or "")
+                ruleset_id = str(build.get("ruleset_id") or "")
+                grouped_build_ids[(profile_id, ruleset_id)].append(build_id)
+            except APIError as exc:
+                errors[build_id] = exc
+
+        worker_metrics_by_build: dict[str, dict[str, Any]] = {
+            build_id: {} for build_id in prepared_builds
+        }
+        worker_failures: dict[str, APIError] = {}
+        if prepared_builds:
+            try:
+                worker_metrics_by_build, worker_failures = self._collect_worker_metrics_batched(
+                    prepared_builds,
+                    grouped_build_ids,
+                    progress_label=progress_label,
+                )
+            except Exception:
+                for build_id in prepared_builds:
+                    self._repo.update_build_status(build_id, BuildStatus.failed.value)
+                raise
+        for build_id, error in worker_failures.items():
+            self._repo.update_build_status(build_id, BuildStatus.failed.value)
+            errors[build_id] = error
+
+        for build_id in build_ids:
+            if build_id in errors:
+                continue
+            prepared = prepared_builds.get(build_id)
+            if prepared is None:
+                continue
+            try:
+                raw_metrics_map = self._resolve_raw_metrics(
+                    build_id,
+                    prepared.build,
+                    prepared.artifacts,
+                    prepared.templates,
+                    precomputed_worker_metrics=worker_metrics_by_build.get(build_id),
+                )
+                scenario_rows = self._build_scenario_rows_from_raw_metrics(
+                    prepared.build,
+                    prepared.artifacts,
+                    prepared.templates,
+                    raw_metrics_map,
+                )
+                self._repo.insert_scenario_metrics(scenario_rows)
+                final_status = BuildStatus.evaluated
+                self._repo.update_build_status(build_id, final_status.value)
+                results[build_id] = (final_status, scenario_rows)
+            except APIError as exc:
+                self._repo.update_build_status(build_id, BuildStatus.failed.value)
+                errors[build_id] = exc
+            except WorkerPoolClosedError:
+                self._repo.update_build_status(build_id, BuildStatus.failed.value)
+                raise
+            except Exception as exc:  # pragma: no cover - unexpected
+                self._repo.update_build_status(build_id, BuildStatus.failed.value)
+                errors[build_id] = APIError(
+                    500,
+                    "evaluation_error",
+                    "failed to evaluate build",
+                    details=str(exc),
+                )
+
+        return {
+            "results": results,
+            "errors": errors,
+        }
+
     def _collect_scenario_rows(
         self,
         build: dict[str, Any],
         *,
         gate_thresholds: ScenarioGateThresholds | None,
     ) -> List[ScenarioMetricRow]:
+        prepared = self._prepare_build_evaluation(build, gate_thresholds=gate_thresholds)
+        build_id = prepared.build.get("build_id")
+        if not build_id:
+            raise APIError(400, "invalid_build", "build record missing build_id")
+        raw_metrics_map = self._resolve_raw_metrics(
+            build_id,
+            prepared.build,
+            prepared.artifacts,
+            prepared.templates,
+        )
+        if not raw_metrics_map:
+            raise APIError(400, "missing_metrics", "raw metrics payload missing for build")
+
+        return self._build_scenario_rows_from_raw_metrics(
+            prepared.build,
+            prepared.artifacts,
+            prepared.templates,
+            raw_metrics_map,
+        )
+
+    def _prepare_build_evaluation(
+        self,
+        build: dict[str, Any],
+        *,
+        gate_thresholds: Mapping[str, Any] | ScenarioGateThresholds | None = None,
+    ) -> _PreparedBuildEvaluation:
         build_id = build.get("build_id")
         if not build_id:
             raise APIError(400, "invalid_build", "build record missing build_id")
@@ -165,27 +310,37 @@ class BuildEvaluator:
         profile_id = build.get("profile_id")
         if not profile_id:
             raise APIError(400, "missing_profile", "build profile_id missing")
-        templates = [template for template in list_templates() if template.profile_id == profile_id]
+        templates = self._templates_for_profile(profile_id)
         if not templates:
             raise APIError(
                 400,
                 "no_scenarios",
                 f"no scenario templates configured for profile {profile_id}",
             )
-        raw_metrics_map = self._resolve_raw_metrics(build_id, build, artifacts, templates)
-        if not raw_metrics_map:
-            raise APIError(400, "missing_metrics", "raw metrics payload missing for build")
+        templates_with_gates = self._apply_gate_threshold_overrides(templates, gate_thresholds)
+        return _PreparedBuildEvaluation(
+            build=build,
+            artifacts=artifacts,
+            templates=templates_with_gates,
+        )
+
+    def _build_scenario_rows_from_raw_metrics(
+        self,
+        build: dict[str, Any],
+        artifacts: Any,
+        templates: list[ScenarioTemplate],
+        raw_metrics_map: Mapping[str, Any],
+    ) -> List[ScenarioMetricRow]:
+        build_id = build.get("build_id")
+        if not build_id:
+            raise APIError(400, "invalid_build", "build record missing build_id")
+        profile_id = build.get("profile_id")
+        if not profile_id:
+            raise APIError(400, "missing_profile", "build profile_id missing")
 
         scenarios_used = []
         for template in templates:
-            if hasattr(template.gate_thresholds, "model_dump"):
-                gate_thresholds_payload = template.gate_thresholds.model_dump(mode="json")
-            elif hasattr(template.gate_thresholds, "dict"):
-                gate_thresholds_payload = template.gate_thresholds.dict()
-            elif is_dataclass(template.gate_thresholds):
-                gate_thresholds_payload = asdict(template.gate_thresholds)
-            else:
-                gate_thresholds_payload = dict(template.gate_thresholds)
+            gate_thresholds_payload = self._serialize_gate_thresholds(template.gate_thresholds)
             scenarios_used.append(
                 {
                     "scenario_id": template.scenario_id,
@@ -202,10 +357,7 @@ class BuildEvaluator:
             if payload is not None and isinstance(payload, dict):
                 normalized = map_worker_output(payload)
                 normalized = adjust_metrics_for_profile(template.profile_id, normalized)
-                effective_thresholds = (
-                    gate_thresholds if gate_thresholds is not None else template.gate_thresholds
-                )
-                gate_eval = evaluate_gates(normalized, effective_thresholds)
+                gate_eval = evaluate_gates(normalized, template.gate_thresholds)
                 payload["gate_pass"] = gate_eval.gate_pass
                 payload["gate_fail_reasons"] = list(gate_eval.gate_fail_reasons)
                 payload["gate_slacks"] = asdict(gate_eval.gate_slacks)
@@ -283,10 +435,274 @@ class BuildEvaluator:
         )
         return scenario_rows
 
+    def _serialize_gate_thresholds(self, gate_thresholds: Any) -> dict[str, Any]:
+        model_dump = getattr(gate_thresholds, "model_dump", None)
+        if callable(model_dump):
+            dumped = model_dump(mode="json")
+            if isinstance(dumped, Mapping):
+                return dict(dumped)
+        as_dict = getattr(gate_thresholds, "dict", None)
+        if callable(as_dict):
+            dumped = as_dict()
+            if isinstance(dumped, Mapping):
+                return dict(dumped)
+        if is_dataclass(gate_thresholds) and not isinstance(gate_thresholds, type):
+            return asdict(gate_thresholds)
+        if isinstance(gate_thresholds, Mapping):
+            return dict(gate_thresholds)
+        return {}
+
+    def _apply_gate_threshold_overrides(
+        self,
+        templates: list[ScenarioTemplate],
+        gate_thresholds: Mapping[str, Any] | ScenarioGateThresholds | None,
+    ) -> list[ScenarioTemplate]:
+        if not gate_thresholds:
+            return templates
+        overridden: list[ScenarioTemplate] = []
+        for template in templates:
+            if isinstance(gate_thresholds, Mapping):
+                scenario_override = gate_thresholds.get(template.scenario_id)
+                if scenario_override is None:
+                    scenario_override = gate_thresholds
+            else:
+                scenario_override = gate_thresholds
+            coerced = self._coerce_gate_thresholds(scenario_override)
+            if coerced is None:
+                overridden.append(template)
+                continue
+            overridden.append(replace(template, gate_thresholds=coerced))
+        return overridden
+
+    def _coerce_gate_thresholds(self, payload: Any) -> ScenarioGateThresholds | None:
+        if payload is None:
+            return None
+        if isinstance(payload, ScenarioGateThresholds):
+            return payload
+        if is_dataclass(payload) and not isinstance(payload, type):
+            payload = asdict(payload)
+        model_dump = getattr(payload, "model_dump", None)
+        if callable(model_dump):
+            payload = model_dump(mode="json")
+        else:
+            as_dict = getattr(payload, "dict", None)
+            if callable(as_dict):
+                payload = as_dict()
+        if not isinstance(payload, Mapping):
+            return None
+
+        reservation_payload = payload.get("reservation")
+        if is_dataclass(reservation_payload) and not isinstance(reservation_payload, type):
+            reservation_payload = asdict(reservation_payload)
+        reservation_model_dump = getattr(reservation_payload, "model_dump", None)
+        if callable(reservation_model_dump):
+            reservation_payload = reservation_model_dump(mode="json")
+        else:
+            reservation_as_dict = getattr(reservation_payload, "dict", None)
+            if callable(reservation_as_dict):
+                reservation_payload = reservation_as_dict()
+        if not isinstance(reservation_payload, Mapping):
+            return None
+        try:
+            return ScenarioGateThresholds(
+                resists={
+                    str(key).lower(): float(value)
+                    for key, value in dict(payload.get("resists") or {}).items()
+                },
+                reservation=ScenarioReservationThreshold(
+                    max_percent=float(reservation_payload.get("max_percent", 0.0))
+                ),
+                attributes={
+                    str(key).lower(): float(value)
+                    for key, value in dict(payload.get("attributes") or {}).items()
+                },
+                min_max_hit=float(payload.get("min_max_hit", 0.0)),
+                min_full_dps=float(payload.get("min_full_dps", 0.0)),
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def _collect_worker_metrics_batched(
+        self,
+        prepared_builds: Mapping[str, _PreparedBuildEvaluation],
+        grouped_build_ids: Mapping[tuple[str, str], list[str]],
+        *,
+        progress_label: str | None = None,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, APIError]]:
+        worker_payload_entries: list[dict[str, Any]] = []
+        for (profile_id, ruleset_id), build_ids in grouped_build_ids.items():
+            for build_id in build_ids:
+                prepared = prepared_builds.get(build_id)
+                if prepared is None:
+                    continue
+                if not self._build_requires_worker_batch(
+                    prepared.build,
+                    prepared.artifacts,
+                    prepared.templates,
+                ):
+                    continue
+                xml_payload = self._extract_xml_payload(prepared.artifacts)
+                if not xml_payload:
+                    continue
+                xml_bytes = len(xml_payload.encode("utf-8"))
+                for template in prepared.templates:
+                    worker_payload_entries.append(
+                        {
+                            "build_id": build_id,
+                            "scenario_id": template.scenario_id,
+                            "xml_bytes": xml_bytes,
+                            "payload": {
+                                "xml": xml_payload,
+                                "scenario_id": template.scenario_id,
+                                "profile_id": profile_id,
+                                "ruleset_id": ruleset_id,
+                            },
+                        }
+                    )
+
+        if not worker_payload_entries:
+            return ({build_id: {} for build_id in prepared_builds}, {})
+
+        chunked_entries = self._chunk_worker_payload_entries(worker_payload_entries)
+        pool = self._get_worker_pool()
+        mapped_by_build: dict[str, dict[str, Any]] = {build_id: {} for build_id in prepared_builds}
+        failed_builds: dict[str, APIError] = {}
+        evaluated_at = datetime.now(timezone.utc).isoformat()
+
+        for chunk_index, chunk in enumerate(chunked_entries):
+            payloads = [entry["payload"] for entry in chunk]
+            label_parts = [
+                progress_label.strip()
+                if isinstance(progress_label, str) and progress_label.strip()
+                else "",
+                f"chunk={chunk_index + 1}/{len(chunked_entries)}",
+                f"payloads={len(payloads)}",
+            ]
+            label = " ".join(part for part in label_parts if part)
+            try:
+                responses = pool.evaluate_batch_best_effort(
+                    payloads,
+                    progress_label=label or None,
+                )
+            except WorkerPoolClosedError:
+                raise
+            except WorkerPoolError as exc:
+                raise APIError(
+                    502,
+                    "worker_evaluation_failed",
+                    "worker evaluation failed for batched builds",
+                    details=str(exc),
+                ) from exc
+
+            for entry, response in zip(chunk, responses, strict=False):
+                build_id = str(entry["build_id"])
+                if build_id in failed_builds:
+                    continue
+                scenario_id = str(entry["scenario_id"])
+                if not isinstance(response, Mapping):
+                    failed_builds[build_id] = APIError(
+                        502,
+                        "worker_response_invalid",
+                        f"worker response for scenario {scenario_id} was not an object",
+                    )
+                    continue
+                ok_value = response.get("ok")
+                error_obj = response.get("error")
+                if ok_value is False or isinstance(error_obj, Mapping):
+                    details: Any
+                    if isinstance(error_obj, Mapping):
+                        details = str(error_obj.get("message", "worker error"))
+                    else:
+                        details = str(error_obj) if error_obj is not None else "worker error"
+                    failed_builds[build_id] = APIError(
+                        502,
+                        "worker_response_error",
+                        f"worker returned error for scenario {scenario_id}",
+                        details=details,
+                    )
+                    continue
+
+                result_obj = response.get("result")
+                if isinstance(result_obj, Mapping):
+                    payload = dict(result_obj)
+                else:
+                    payload = dict(response)
+                payload = self._annotate_metrics_source(
+                    payload,
+                    self._worker_payload_metrics_source(payload),
+                )
+                warnings = payload.get("warnings")
+                if warnings is None:
+                    payload["warnings"] = []
+                elif isinstance(warnings, list):
+                    payload["warnings"] = [str(item) for item in warnings]
+                else:
+                    payload["warnings"] = [str(warnings)]
+                payload["worker_metadata"] = {
+                    "source": "worker_pool",
+                    "evaluated_at": evaluated_at,
+                    "scenario_id": scenario_id,
+                }
+                mapped_by_build[build_id][scenario_id] = payload
+
+        return mapped_by_build, failed_builds
+
+    def _build_requires_worker_batch(
+        self,
+        build: Mapping[str, Any],
+        artifacts: Any,
+        templates: Sequence[ScenarioTemplate],
+    ) -> bool:
+        profile_id = build.get("profile_id")
+        worker_required = self._profile_requires_worker_metrics(profile_id)
+        fallback_metrics = self._map_raw_metrics(artifacts.raw_metrics)
+        filtered_metrics, stub_only = self._filter_stub_metrics(fallback_metrics)
+
+        scenario_ids = {template.scenario_id for template in templates}
+        if worker_required and filtered_metrics and not stub_only:
+            if scenario_ids.issubset(filtered_metrics.keys()):
+                return False
+
+        if worker_required:
+            return True
+        if filtered_metrics:
+            return False
+
+        if "mapping_t16" in scenario_ids and not filtered_metrics:
+            xml_metrics = self._extract_mapping_playerstats_metrics(artifacts)
+            if xml_metrics is not None:
+                return False
+            if not stub_only and scenario_ids == {"mapping_t16"}:
+                return False
+        return True
+
+    def _chunk_worker_payload_entries(
+        self,
+        entries: Sequence[dict[str, Any]],
+    ) -> list[list[dict[str, Any]]]:
+        chunks: list[list[dict[str, Any]]] = []
+        current_chunk: list[dict[str, Any]] = []
+        current_xml_bytes = 0
+        for entry in entries:
+            xml_bytes = int(entry.get("xml_bytes") or 0)
+            over_payload_limit = len(current_chunk) >= MAX_PAYLOADS_PER_BATCH
+            over_xml_limit = (
+                bool(current_chunk) and current_xml_bytes + xml_bytes > MAX_XML_BYTES_PER_BATCH
+            )
+            if over_payload_limit or over_xml_limit:
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_xml_bytes = 0
+            current_chunk.append(entry)
+            current_xml_bytes += xml_bytes
+        if current_chunk:
+            chunks.append(current_chunk)
+        return chunks
+
     def _map_raw_metrics(self, raw_metrics: Any) -> dict[str, Any]:
         if isinstance(raw_metrics, Mapping):
             return {
-                scenario_id: self._annotate_metrics_source(payload, METRICS_SOURCE_STUB)
+                scenario_id: self._annotate_metrics_source(payload, METRICS_SOURCE_POB)
                 for scenario_id, payload in raw_metrics.items()
                 if isinstance(payload, Mapping)
             }
@@ -299,7 +715,7 @@ class BuildEvaluator:
                 if not isinstance(scenario_id, str):
                     continue
                 payload = entry.get("payload") or entry
-                mapped[scenario_id] = self._annotate_metrics_source(payload, METRICS_SOURCE_STUB)
+                mapped[scenario_id] = self._annotate_metrics_source(payload, METRICS_SOURCE_POB)
             return mapped
         return {}
 
@@ -405,24 +821,6 @@ class BuildEvaluator:
         stub_only = bool(raw_metrics) and not bool(filtered)
         return filtered, stub_only
 
-    def _build_requires_worker_batch(
-        self,
-        templates: Sequence[ScenarioTemplate],
-        raw_metrics: Mapping[str, Any],
-        *,
-        worker_required: bool,
-    ) -> bool:
-        required_scenarios = {template.scenario_id for template in templates}
-        has_all_metrics = required_scenarios.issubset(raw_metrics.keys())
-        if has_all_metrics:
-            # If we have all metrics and they are not stub-only, we don't need the worker.
-            # Note: raw_metrics here is already filtered by _filter_stub_metrics in _resolve_raw_metrics.
-            return False
-
-        if not worker_required:
-            return False
-        return True
-
     def _is_stub_metrics_payload(self, payload: Any) -> bool:
         if not isinstance(payload, Mapping):
             return False
@@ -452,20 +850,18 @@ class BuildEvaluator:
         build: dict[str, Any],
         artifacts: Any,
         templates: List[Any],
+        *,
+        precomputed_worker_metrics: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         profile_id = build.get("profile_id")
         worker_required = self._profile_requires_worker_metrics(profile_id)
         fallback_metrics = self._map_raw_metrics(artifacts.raw_metrics)
         filtered_metrics, stub_only = self._filter_stub_metrics(fallback_metrics)
         scenario_ids = {template.scenario_id for template in templates}
-        worker_batch_required = self._build_requires_worker_batch(
-            templates,
-            filtered_metrics,
-            worker_required=worker_required,
-        )
 
-        if worker_required and not worker_batch_required:
-            return filtered_metrics
+        if worker_required and filtered_metrics and not stub_only:
+            if scenario_ids.issubset(filtered_metrics.keys()):
+                return filtered_metrics
 
         if not worker_required and "mapping_t16" in scenario_ids and not filtered_metrics:
             xml_metrics = self._extract_mapping_playerstats_metrics(artifacts)
@@ -484,14 +880,17 @@ class BuildEvaluator:
                     },
                 )
 
-        if worker_batch_required:
-            worker_metrics = self._collect_worker_metrics(
-                build_id,
-                build,
-                artifacts,
-                templates,
-                allow_failure=True,
-            )
+        if worker_required:
+            if precomputed_worker_metrics is not None:
+                worker_metrics = dict(precomputed_worker_metrics)
+            else:
+                worker_metrics = self._collect_worker_metrics(
+                    build_id,
+                    build,
+                    artifacts,
+                    templates,
+                    allow_failure=True,
+                )
             if worker_metrics:
                 filtered_worker_metrics, worker_stub_only = self._filter_stub_metrics(
                     worker_metrics
@@ -534,13 +933,16 @@ class BuildEvaluator:
         if filtered_metrics:
             return filtered_metrics
 
-        worker_metrics = self._collect_worker_metrics(
-            build_id,
-            build,
-            artifacts,
-            templates,
-            allow_failure=True,
-        )
+        if precomputed_worker_metrics is not None:
+            worker_metrics = dict(precomputed_worker_metrics)
+        else:
+            worker_metrics = self._collect_worker_metrics(
+                build_id,
+                build,
+                artifacts,
+                templates,
+                allow_failure=True,
+            )
         if worker_metrics:
             filtered_worker_metrics, worker_stub_only = self._filter_stub_metrics(worker_metrics)
             if filtered_worker_metrics:

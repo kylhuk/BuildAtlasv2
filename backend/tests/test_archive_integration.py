@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
-
-import pytest
-
 from backend.engine.archive import (
     ArchiveStore,
     descriptor_values_from_metrics,
@@ -73,9 +69,10 @@ def test_archive_initialization():
     """Test that archive can be initialized with default axes."""
     archive = ArchiveStore()
     assert archive.axes is not None
-    assert len(archive.axes) == 2
+    assert len(archive.axes) == 3
     assert archive.axes[0].metric_key == "full_dps"
     assert archive.axes[1].metric_key == "max_hit"
+    assert archive.axes[2].metric_key == "utility_score"
     assert archive.total_bins > 0
 
 
@@ -115,7 +112,6 @@ def test_archive_replacement_on_higher_score():
     assert archive.insert("build-1", score=score1, descriptor=descriptor1)
 
     # Insert second build with same descriptor but higher score
-    candidate2 = _dummy_candidate(seed=43, build_id="build-2")
     metrics2 = {
         "mapping_t16": {
             "metrics": {"full_dps": 3000.0, "max_hit": 750.0},  # Higher DPS
@@ -144,7 +140,6 @@ def test_archive_multiple_bins():
     # Insert builds with different DPS values (should fill different damage bins)
     dps_values = [1000.0, 5000.0, 20000.0]
     for idx, dps in enumerate(dps_values):
-        candidate = _dummy_candidate(seed=100 + idx, build_id=f"build-{idx}")
         metrics = {
             "mapping_t16": {
                 "metrics": {"full_dps": dps, "max_hit": 750.0},
@@ -169,7 +164,6 @@ def test_archive_metrics_calculation():
 
     # Insert 3 builds
     for idx in range(3):
-        candidate = _dummy_candidate(seed=200 + idx, build_id=f"build-{idx}")
         metrics = {
             "mapping_t16": {
                 "metrics": {"full_dps": 1000.0 * (idx + 1), "max_hit": 750.0},
@@ -244,7 +238,6 @@ def test_archive_entries_sorted():
 
     # Insert builds in random order
     for idx in [2, 0, 1]:
-        candidate = _dummy_candidate(seed=300 + idx, build_id=f"build-{idx}")
         metrics = {
             "mapping_t16": {
                 "metrics": {"full_dps": 1000.0 + idx * 100, "max_hit": 750.0 + idx * 50},

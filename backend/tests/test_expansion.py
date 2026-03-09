@@ -1,7 +1,7 @@
 import json
-import pytest
-from backend.engine.skeletons.expansion import expand_skeleton
+
 from backend.app.settings import settings
+from backend.engine.skeletons.expansion import expand_skeleton
 
 
 def test_expand_skeleton(tmp_path, monkeypatch):

@@ -21,7 +21,7 @@ TORCH_CUDA_PACKAGES ?= torch torchvision torchaudio
 TORCH_CUDA_INDEX_URL ?= https://download.pytorch.org/whl/cu118
 TORCH_CUDA_INDEX_ARG = $(if $(strip $(TORCH_CUDA_INDEX_URL)),--extra-index-url $(TORCH_CUDA_INDEX_URL))
 
-.PHONY: clean db-up db-down db-init db-check dev backend-dev ui-dev test backend-test ui-test lint backend-lint ui-lint fmt backend-fmt ui-fmt regen-baselines ml-loop-start ml-loop-stop ml-loop-status ml-loop-report ml-loop-bundle torch-install-cpu torch-install-cuda torch-verify
+.PHONY: clean db-up db-down db-init db-check dev backend-dev ui-dev test backend-test ui-test lint backend-lint ui-lint fmt backend-fmt ui-fmt preflight regen-baselines ml-loop-start ml-loop-stop ml-loop-status ml-loop-report ml-loop-bundle torch-install-cpu torch-install-cuda torch-verify
 
 clean:
 	@echo "Removing ML run/build artifacts under $(ML_LOOP_DATA_PATH)"
@@ -130,3 +130,13 @@ backend-fmt:
 
 ui-fmt:
 	npm --prefix $(UI_DIR) run format
+
+preflight:
+	@echo "Running Atlas/operator preflight (fail-fast):"
+	@echo "  1) db-check"
+	@$(MAKE) db-check || { echo "Atlas/operator preflight step 1 failed: ClickHouse check failed. Run 'make db-up', wait for healthcheck, then run 'make db-init', then rerun 'make preflight'" >&2; exit 1; }
+	@echo "  2) backend-lint"
+	@$(MAKE) backend-lint || { echo "Atlas/operator preflight step 2 failed: Backend lint failed. Run 'make backend-lint' and fix issues, then rerun 'make preflight'" >&2; exit 1; }
+	@echo "  3) ui-test"
+	@$(MAKE) ui-test || { echo "Atlas/operator preflight step 3 failed: UI check failed. Run 'make ui-test' and address issues, then rerun 'make preflight'" >&2; exit 1; }
+	@echo "Atlas/operator preflight passed."

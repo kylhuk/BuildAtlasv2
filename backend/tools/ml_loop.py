@@ -11,7 +11,6 @@ import statistics
 import tarfile
 import tempfile
 from collections import Counter
-from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
@@ -26,6 +25,7 @@ from backend.engine.archive import (
     persist_archive,
     score_from_metrics,
 )
+from backend.engine.curriculum import CurriculumManager, CurriculumPhase
 from backend.engine.generation.runner import (
     _run_summary_path,
     load_run_summary,
@@ -42,7 +42,6 @@ from backend.engine.scenarios.loader import (
     ScenarioReservationThreshold,
     list_templates,
 )
-from backend.engine.curriculum import CurriculumManager, CurriculumPhase
 from backend.engine.surrogate import (
     EvaluationResult,
     SnapshotResult,
@@ -63,6 +62,14 @@ PROMOTION_CLASSIFIER_BRIER_WEIGHT = 0.05
 VAL_SPLIT_MOD = 5
 VAL_SPLIT_REMAINDER = 0
 ONLINE_LEARNING_EVAL_THRESHOLD = 100  # Retrain surrogate every N PoB evaluations
+
+
+def compute_character_level(*, iteration: int, level_interval: int) -> int:
+    """
+    Compute character level based on iteration and interval.
+    Formula: 1 + ((max(iteration, 1) - 1) // max(level_interval, 1))
+    """
+    return 1 + ((max(iteration, 1) - 1) // max(level_interval, 1))
 
 
 def _log_loop_phase(
@@ -305,6 +312,8 @@ def _build_initial_state(
         "last_skipped_iteration": None,
         "last_skip_reason_code": None,
         "last_skip_reason_message": None,
+        "progression_index": None,
+        "progression_stage": None,
         "online_learning_eval_count": 0,
         "online_learning_last_retrain_iteration": None,
     }
@@ -481,6 +490,7 @@ def _build_iteration_record(
     promoted: bool,
     promoted_model_id: str,
     promoted_model_path: str,
+    character_level: int = 1,
 ) -> dict[str, Any]:
     run_status_reason = _as_dict(run_summary.get("status_reason"))
     evaluation_info = _as_dict(run_summary.get("evaluation"))
@@ -489,6 +499,7 @@ def _build_iteration_record(
     return {
         "iteration": iteration,
         "timestamp_utc": timestamp,
+        "character_level": character_level,
         "run_id": run_summary.get("run_id"),
         "run_status": run_summary.get("status"),
         "iteration_outcome": "completed",
@@ -572,6 +583,7 @@ def _build_generation_skip_record(
     *,
     reason_code: str,
     reason_message: str,
+    character_level: int = 1,
     iteration_outcome: str = "skipped_generation_unhealthy",
 ) -> dict[str, Any]:
     run_status_reason = _as_dict(run_summary.get("status_reason"))
@@ -582,6 +594,7 @@ def _build_generation_skip_record(
         "run_id": run_summary.get("run_id"),
         "run_status": run_summary.get("status"),
         "iteration_outcome": iteration_outcome,
+        "character_level": character_level,
         "skip_reason_code": reason_code,
         "skip_reason_message": reason_message,
         "skipped_phases": ["snapshot", "train", "evaluate"],
@@ -629,6 +642,8 @@ def _build_summary_payload(state: Mapping[str, Any]) -> dict[str, Any]:
         "last_fallback_stub_count": state.get("last_fallback_stub_count"),
         "last_worker_error_count": state.get("last_worker_error_count"),
         "last_worker_error": state.get("last_worker_error"),
+        "progression_index": state.get("progression_index"),
+        "progression_stage": state.get("progression_stage"),
     }
 
 
@@ -733,7 +748,6 @@ def _retrain_surrogate_if_needed(
     Returns: (was_retrained, new_model_path)
     """
     eval_count = _coerce_int(state.get("online_learning_eval_count")) or 0
-    last_retrain_iteration = _coerce_int(state.get("online_learning_last_retrain_iteration")) or 0
 
     if eval_count < ONLINE_LEARNING_EVAL_THRESHOLD:
         return False, None
@@ -821,6 +835,81 @@ def load_thresholds_for_profile(profile_id: str):
     return templates[-1].gate_thresholds
 
 
+def _resolve_zero_gates_profile_id(profile_id: str) -> str:
+    if profile_id.endswith("_zero_gates"):
+        return profile_id
+    if profile_id == "mapping":
+        return "mapping_zero_gates"
+    return f"{profile_id}_zero_gates"
+
+
+def _resolve_mapping_profile_id(profile_id: str) -> str:
+    if profile_id.endswith("_zero_gates"):
+        return profile_id[: -len("_zero_gates")]
+    return profile_id
+
+
+def _safe_load_thresholds(profile_id: str, fallback_profile_id: str | None = None):
+    if fallback_profile_id is None:
+        fallback_profile_id = profile_id
+    for candidate in (profile_id, fallback_profile_id):
+        try:
+            return load_thresholds_for_profile(candidate)
+        except Exception:
+            if candidate == fallback_profile_id:
+                return None
+
+
+PROGRESSION_LADDER = [
+    "progression_tutorial",
+    "progression_act5",
+    "progression_act10",
+    "progression_white_maps",
+    "progression_yellow_maps",
+    "progression_red_maps",
+    "progression_t16",
+]
+PROGRESSION_MAX_INDEX = len(PROGRESSION_LADDER) - 1
+
+
+def _progression_base_index_for_profile(profile_id: str) -> int:
+    if profile_id in PROGRESSION_LADDER:
+        return PROGRESSION_LADDER.index(profile_id)
+    return 0
+
+
+def _progression_stage_for_index(index: int) -> str:
+    if PROGRESSION_LADDER:
+        bounded = max(0, min(index, PROGRESSION_MAX_INDEX))
+        return PROGRESSION_LADDER[bounded]
+    return ""
+
+
+def _resolve_progression_index(state: Mapping[str, Any], base_index: int) -> int:
+    raw_index = state.get("progression_index")
+    if isinstance(raw_index, int):
+        bounded = max(0, min(raw_index, PROGRESSION_MAX_INDEX))
+        return max(bounded, base_index)
+    return base_index
+
+
+def _progression_updates_for_index(index: int) -> dict[str, Any]:
+    return {
+        "progression_index": index,
+        "progression_stage": _progression_stage_for_index(index),
+    }
+
+
+def _maybe_advance_progression_stage(state: Mapping[str, Any], base_index: int) -> dict[str, Any]:
+    if PROGRESSION_MAX_INDEX < 0:
+        return {}
+    current_index = _resolve_progression_index(state, base_index)
+    if current_index >= PROGRESSION_MAX_INDEX:
+        return {}
+    next_index = current_index + 1
+    return _progression_updates_for_index(next_index)
+
+
 def start_loop(args: argparse.Namespace) -> int:
     loop_id = _validate_loop_id(args.loop_id)
     if args.iterations < 0:
@@ -857,11 +946,9 @@ def start_loop(args: argparse.Namespace) -> int:
     ruleset_id = _resolve_ruleset_id(args)
 
     profile_id = str(getattr(args, "profile_id", "pinnacle"))
-    scenario_templates = [
-        template for template in list_templates() if template.profile_id == profile_id
-    ]
-    snapshot_scenario_id = (
-        scenario_templates[0].scenario_id if len(scenario_templates) == 1 else None
+    progression_enabled = profile_id in PROGRESSION_LADDER
+    progression_base_index = (
+        _progression_base_index_for_profile(profile_id) if progression_enabled else 0
     )
     candidate_pool_size_arg = getattr(args, "candidate_pool_size", None)
     resolved_candidate_pool_size = (
@@ -946,6 +1033,14 @@ def start_loop(args: argparse.Namespace) -> int:
     state["_curriculum_manager"] = curriculum
     _persist_state(state_path, state)
 
+    if progression_enabled:
+        initial_index = _resolve_progression_index(state, progression_base_index)
+        state = _persist_state(
+            state_path,
+            state,
+            **_progression_updates_for_index(initial_index),
+        )
+
     gate_profile = getattr(args, "gate_profile", None)
 
     def _no_gate_thresholds() -> ScenarioGateThresholds:
@@ -958,12 +1053,117 @@ def start_loop(args: argparse.Namespace) -> int:
             min_full_dps=0.0,
         )
 
+    mapping_profile_id = _resolve_mapping_profile_id(profile_id)
     base_thresholds: ScenarioGateThresholds | None = None
-    # Only load gate thresholds if --gate-profile is explicitly set
-    if curriculum.enabled and gate_profile:
+    zero_gates_thresholds: ScenarioGateThresholds | None = None
+
+    def _resolve_iteration_threshold_profile_id() -> str:
+        if progression_enabled:
+            return _resolve_iteration_profile_id()
+        return mapping_profile_id
+
+    def _resolve_iteration_thresholds() -> ScenarioGateThresholds | None:
+        profile_id_for_thresholds = _resolve_iteration_threshold_profile_id()
+        return _safe_load_thresholds(profile_id_for_thresholds)
+
+    def _resolve_thresholds_for_phase() -> ScenarioGateThresholds | None:
+        if progression_enabled:
+            return _resolve_iteration_thresholds()
+        if not curriculum.enabled:
+            return base_thresholds
+        if curriculum.scheduler.current_phase == CurriculumPhase.ZERO_GATES:
+            return zero_gates_thresholds or base_thresholds
+        return base_thresholds
+
+    def _resolve_effective_thresholds() -> ScenarioGateThresholds:
+        """Resolve thresholds for a single generation iteration."""
+        if progression_enabled:
+            phase_thresholds = _resolve_thresholds_for_phase()
+            if phase_thresholds is None:
+                return _no_gate_thresholds()
+            return phase_thresholds
+
+        if gate_profile is not None:
+            if not curriculum.enabled or base_thresholds is None:
+                return _no_gate_thresholds()
+            phase_thresholds = _resolve_thresholds_for_phase()
+            if phase_thresholds is None:
+                return _no_gate_thresholds()
+            return curriculum.get_thresholds(phase_thresholds)
+
+        if not curriculum.enabled or base_thresholds is None:
+            return _no_gate_thresholds()
+
+        phase_thresholds = _resolve_thresholds_for_phase()
+        if phase_thresholds is None:
+            return _no_gate_thresholds()
+        return curriculum.get_thresholds(phase_thresholds)
+
+    def _resolve_iteration_profile_id() -> str:
+        if progression_enabled:
+            stage_index = _resolve_progression_index(state, progression_base_index)
+            return _progression_stage_for_index(stage_index)
+        if not curriculum.enabled:
+            return profile_id
+        if curriculum.scheduler.current_phase == CurriculumPhase.ZERO_GATES:
+            return _resolve_zero_gates_profile_id(profile_id)
+        return mapping_profile_id
+
+    snapshot_selection_by_profile: dict[str, tuple[str | None, str | None]] = {}
+
+    def _resolve_iteration_snapshot_selection(
+        current_profile_id: str,
+    ) -> tuple[str | None, str | None]:
+        if current_profile_id in snapshot_selection_by_profile:
+            return snapshot_selection_by_profile[current_profile_id]
+        templates = [
+            template for template in list_templates() if template.profile_id == current_profile_id
+        ]
+        if len(templates) == 1:
+            selection = (templates[0].scenario_id, templates[0].budget_tier)
+            snapshot_selection_by_profile[current_profile_id] = selection
+            return selection
+
+        scenario_match = re.search(r"(?:^|\|)scenarios:([^@|]+)@", ruleset_id)
+        scenario_token = scenario_match.group(1) if scenario_match else None
+        matched_template = next(
+            (
+                template
+                for template in templates
+                if scenario_token is not None and template.scenario_id == scenario_token
+            ),
+            None,
+        )
+        selection = (
+            (matched_template.scenario_id, matched_template.budget_tier)
+            if matched_template is not None
+            else (None, None)
+        )
+        snapshot_selection_by_profile[current_profile_id] = selection
+        return selection
+
+    # Curriculum uses profile gates to set phase-based thresholds,
+    # even when --gate-profile is unset.
+    if curriculum.enabled and not progression_enabled:
         try:
-            base_thresholds = load_thresholds_for_profile(profile_id)
-            logger.info("ml loop %s loaded gate thresholds for profile %s", loop_id, profile_id)
+            zero_profile_id = _resolve_zero_gates_profile_id(profile_id)
+            zero_gates_thresholds = _safe_load_thresholds(
+                zero_profile_id, fallback_profile_id=profile_id
+            )
+            if zero_gates_thresholds is not None:
+                logger.info(
+                    "ml loop %s loaded gate thresholds for zero-gates profile %s",
+                    loop_id,
+                    zero_profile_id,
+                )
+
+            base_thresholds = _safe_load_thresholds(
+                mapping_profile_id, fallback_profile_id=profile_id
+            )
+            if base_thresholds is not None:
+                logger.info(
+                    "ml loop %s loaded gate thresholds for profile %s", loop_id, mapping_profile_id
+                )
         except Exception as exc:
             logger.warning(
                 "ml loop %s unable to load base gate thresholds for curriculum: %s",
@@ -1047,11 +1247,19 @@ def start_loop(args: argparse.Namespace) -> int:
             _, seed_window_size = _seed_window_and_base(state, args)
             next_seed_start = iteration_seed_start + seed_window_size
             current_run_id = f"{loop_id}-iter-{iteration:04d}"
+
+            # Recompute character level for the current iteration
+            level_interval = _coerce_int(state.get("level_interval")) or 10
+            character_level = compute_character_level(
+                iteration=iteration, level_interval=level_interval
+            )
+
             _persist_state(
                 state_path,
                 state,
                 phase="generation",
                 iteration=iteration,
+                character_level=character_level,
                 last_iteration_seed_start=iteration_seed_start,
                 next_iteration_seed_start=next_seed_start,
             )
@@ -1061,7 +1269,8 @@ def start_loop(args: argparse.Namespace) -> int:
                 iteration=iteration,
                 detail=(
                     f"run_id={current_run_id} seed_start={iteration_seed_start} "
-                    f"eval_budget={evaluation_budget} generate_count={generate_count}"
+                    f"eval_budget={evaluation_budget} generate_count={generate_count} "
+                    f"character_level={character_level}"
                 ),
             )
             generation_started_at = monotonic()
@@ -1097,19 +1306,16 @@ def start_loop(args: argparse.Namespace) -> int:
                         predictor_name if predictor_name else "surrogate_predictor"
                     )
                     surrogate_predictor = _surrogate_predictor_wrapper
-            if gate_profile is None:
-                effective_thresholds = _no_gate_thresholds()
-            else:
-                effective_thresholds = (
-                    curriculum.get_thresholds(base_thresholds)
-                    if curriculum.enabled and base_thresholds is not None
-                    else base_thresholds
-                )
+            iteration_profile_id = _resolve_iteration_profile_id()
+            iteration_scenario_id, iteration_budget_tier = _resolve_iteration_snapshot_selection(
+                iteration_profile_id
+            )
+            effective_thresholds = _resolve_effective_thresholds()
             run_summary = run_generation(
                 count=generate_count,
                 seed_start=iteration_seed_start,
                 ruleset_id=ruleset_id,
-                profile_id=profile_id,
+                profile_id=iteration_profile_id,
                 gate_thresholds=effective_thresholds,
                 skeleton_id=getattr(args, "skeleton_id", None),
                 run_id=current_run_id,
@@ -1127,6 +1333,7 @@ def start_loop(args: argparse.Namespace) -> int:
                 optimizer_iterations=optimizer_iterations,
                 optimizer_elite_count=optimizer_elite_count,
                 enforce_worker_tripwire=True,
+                character_level=character_level,
             )
             # TASK 0.3: Add gate fail analysis to run summary
             gate_evals_raw = run_summary.get("evaluation", {}).get("gate_evaluations", [])
@@ -1167,13 +1374,14 @@ def start_loop(args: argparse.Namespace) -> int:
 
                 transition_info = curriculum.record_iteration(gate_passes)
                 if transition_info.get("transitioned"):
+                    transition_detail = (
+                        f"{transition_info.get('from_phase')} -> {transition_info.get('to_phase')}"
+                    )
                     _log_loop_phase(
                         loop_id,
                         "curriculum_transition",
                         iteration=iteration,
-                        detail=(
-                            f"{transition_info.get('from_phase')} -> {transition_info.get('to_phase')}"
-                        ),
+                        detail=transition_detail,
                     )
 
             # TASK 3.4: Update archive with verified builds
@@ -1287,6 +1495,7 @@ def start_loop(args: argparse.Namespace) -> int:
                     run_summary=run_summary,
                     reason_code=reason_code,
                     reason_message=reason_message,
+                    character_level=character_level,
                 )
                 _append_iteration_record(iterations_path, skipped_record)
                 checkpoint_path = _iteration_checkpoint_path(loop_root, iteration)
@@ -1319,8 +1528,6 @@ def start_loop(args: argparse.Namespace) -> int:
                     ),
                 )
                 iteration += 1
-                # Calculate character level based on iteration and interval
-                state["character_level"] = 1 + (iteration // state.get("level_interval", 10))
                 continue
             _persist_state(
                 state_path,
@@ -1341,19 +1548,46 @@ def start_loop(args: argparse.Namespace) -> int:
                 output_root=snapshots_root,
                 snapshot_id=snapshot_id,
                 exclude_stub_rows=True,
-                profile_id=profile_id,
-                scenario_id=snapshot_scenario_id,
+                profile_id=iteration_profile_id,
+                scenario_id=iteration_scenario_id,
+                budget_tier=iteration_budget_tier,
                 evolutionary_selection=getattr(args, "gate_profile", None) is None,
                 survival_rate=0.9,
             )
-            if snapshot.row_count <= 0 and profile_id:
+            if (
+                snapshot.row_count <= 0
+                and iteration_profile_id
+                and iteration_budget_tier is not None
+            ):
+                _log_loop_phase(
+                    loop_id,
+                    "snapshot_retry",
+                    iteration=iteration,
+                    detail=(
+                        "filtered snapshot empty; retrying without budget tier filter "
+                        f"profile_id={iteration_profile_id} scenario_id={iteration_scenario_id} "
+                        f"budget_tier={iteration_budget_tier}"
+                    ),
+                )
+                snapshot = build_dataset_snapshot(
+                    data_path=artifacts_root,
+                    output_root=snapshots_root,
+                    snapshot_id=snapshot_id,
+                    exclude_stub_rows=True,
+                    profile_id=iteration_profile_id,
+                    scenario_id=iteration_scenario_id,
+                    budget_tier=None,
+                    evolutionary_selection=getattr(args, "gate_profile", None) is None,
+                    survival_rate=0.9,
+                )
+            if snapshot.row_count <= 0 and iteration_profile_id:
                 _log_loop_phase(
                     loop_id,
                     "snapshot_retry",
                     iteration=iteration,
                     detail=(
                         "filtered snapshot empty; retrying without profile filter "
-                        f"profile_id={profile_id} scenario_id={snapshot_scenario_id}"
+                        f"profile_id={iteration_profile_id} scenario_id={iteration_scenario_id}"
                     ),
                 )
                 snapshot = build_dataset_snapshot(
@@ -1362,7 +1596,8 @@ def start_loop(args: argparse.Namespace) -> int:
                     snapshot_id=snapshot_id,
                     exclude_stub_rows=True,
                     profile_id=None,
-                    scenario_id=snapshot_scenario_id,
+                    scenario_id=iteration_scenario_id,
+                    budget_tier=None,
                     evolutionary_selection=getattr(args, "gate_profile", None) is None,
                     survival_rate=0.9,
                 )
@@ -1384,6 +1619,7 @@ def start_loop(args: argparse.Namespace) -> int:
                     run_summary=run_summary,
                     reason_code=reason_code,
                     reason_message=reason_message,
+                    character_level=character_level,
                     iteration_outcome="skipped_snapshot_empty",
                 )
                 skip_record["snapshot"] = {
@@ -1509,6 +1745,7 @@ def start_loop(args: argparse.Namespace) -> int:
                 promoted=promoted,
                 promoted_model_id=promoted_model_id,
                 promoted_model_path=promoted_model_path,
+                character_level=character_level,
             )
             _append_iteration_record(iterations_path, record)
             checkpoint_path = _iteration_checkpoint_path(loop_root, iteration)
@@ -1517,6 +1754,12 @@ def start_loop(args: argparse.Namespace) -> int:
             # Update online learning eval counter
             current_eval_count = _coerce_int(state.get("online_learning_eval_count")) or 0
             new_eval_count = current_eval_count + verified_count
+
+            progression_updates: dict[str, Any] = {}
+            if progression_enabled and verified_count > 0:
+                progression_updates = _maybe_advance_progression_stage(
+                    state, progression_base_index
+                )
 
             _persist_state(
                 state_path,
@@ -1535,6 +1778,7 @@ def start_loop(args: argparse.Namespace) -> int:
                 failed_at_utc=None,
                 last_failure_checkpoint_path=None,
                 online_learning_eval_count=new_eval_count,
+                **progression_updates,
             )
 
             # Check if online learning retrain is needed
@@ -2376,6 +2620,10 @@ def _render_status_human(
     iteration = state.get("iteration")
     total_iterations = state.get("total_iterations")
     total_text = "endless" if total_iterations is None else str(total_iterations)
+    curriculum_state = _as_dict(state.get("curriculum"))
+    curriculum_phase = curriculum_state.get("phase") or (
+        "UBER" if curriculum_state.get("enabled") is False else "MAPPING"
+    )
     summary_lines = [
         f"ML Loop Status: {loop_id}",
         (
@@ -2387,8 +2635,8 @@ def _render_status_human(
         f"Updated: {state.get('updated_at_utc')}",
         (
             "Curriculum: "
-            f"enabled={_format_bool(_as_dict(state.get('curriculum')).get('enabled', True))} "
-            f"phase={(_as_dict(state.get('curriculum')).get('phase') or ('UBER' if _as_dict(state.get('curriculum')).get('enabled') is False else 'MAPPING'))}"
+            f"enabled={_format_bool(curriculum_state.get('enabled', True))} "
+            f"phase={curriculum_phase}"
         ),
         (
             "Last IDs: "
@@ -2783,7 +3031,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     start_parser.add_argument(
         "--curriculum-initial-phase",
-        choices=["MAPPING", "BOSSING", "PINNACLE", "UBER"],
+        choices=["ZERO_GATES", "MAPPING", "BOSSING", "PINNACLE", "UBER"],
         default="MAPPING",
         help="Starting curriculum phase (default: MAPPING)",
     )
@@ -2793,7 +3041,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--gate-profile",
         default=None,
         choices=["resistances", "full"],
-        help="Enable gate checking: 'resistances' for resistance gates only, 'full' for all gates (default: None - no gates)",
+        help=(
+            "Enable gate checking: 'resistances' for resistance gates only, "
+            "'full' for all gates (default: None - no gates)"
+        ),
     )
     start_parser.add_argument(
         "--level-interval",

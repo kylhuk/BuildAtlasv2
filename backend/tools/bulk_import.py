@@ -162,133 +162,138 @@ def run_bulk_import(
 
     repo = repo or ClickhouseRepository()
     build_id_supplier = build_id_factory or (lambda: uuid.uuid4().hex)
+    created_evaluator = evaluator is None
     evaluator = evaluator or BuildEvaluator(repo=repo, base_path=base_path)
 
-    hash_to_build: dict[str, str] = {}
-    imported_builds: list[str] = []
-    file_summaries: list[dict[str, Any]] = []
+    try:
+        hash_to_build: dict[str, str] = {}
+        imported_builds: list[str] = []
+        file_summaries: list[dict[str, Any]] = []
 
-    for path in file_paths:
-        text, xml_content, dedupe_hash = _prepare_candidate(path)
-        existing = hash_to_build.get(dedupe_hash)
-        if existing:
+        for path in file_paths:
+            text, xml_content, dedupe_hash = _prepare_candidate(path)
+            existing = hash_to_build.get(dedupe_hash)
+            if existing:
+                file_summaries.append(
+                    {
+                        "path": str(path),
+                        "hash": dedupe_hash,
+                        "status": "duplicate",
+                        "build_id": None,
+                        "duplicate_of": existing,
+                    }
+                )
+                continue
+            build_id = build_id_supplier()
             file_summaries.append(
                 {
                     "path": str(path),
                     "hash": dedupe_hash,
-                    "status": "duplicate",
-                    "build_id": None,
-                    "duplicate_of": existing,
+                    "status": "imported",
+                    "build_id": build_id,
+                    "duplicate_of": None,
                 }
             )
-            continue
-        build_id = build_id_supplier()
-        file_summaries.append(
-            {
-                "path": str(path),
-                "hash": dedupe_hash,
-                "status": "imported",
-                "build_id": build_id,
-                "duplicate_of": None,
-            }
-        )
-        hash_to_build[dedupe_hash] = build_id
-        try:
-            provenance = write_build_artifacts(
-                build_id,
-                xml=xml_content,
-                code=text,
-                base_path=base_path,
-            )
-        except Exception as exc:
-            raise BulkImportError(f"failed to write artifacts for {path}: {exc}") from exc
-
-        try:
-            payload = BuildInsertPayload(
-                build_id=build_id,
-                created_at=datetime.now(timezone.utc),
-                ruleset_id=metadata.ruleset_id,
-                profile_id=metadata.profile_id,
-                class_=metadata.class_,
-                ascendancy=metadata.ascendancy,
-                main_skill=metadata.main_skill,
-                damage_type=metadata.damage_type,
-                defence_type=metadata.defence_type,
-                complexity_bucket=metadata.complexity_bucket,
-                pob_xml_path=str(provenance.paths.build_xml),
-                pob_code_path=str(provenance.paths.code),
-                genome_path=str(provenance.paths.genome),
-                tags=metadata.tags,
-                status=BuildStatus.imported.value,
-            )
-            repo.insert_build(payload)
-        except Exception as exc:
-            raise BulkImportError(f"failed to insert build {build_id}: {exc}") from exc
-
-        imported_builds.append(build_id)
-
-    evaluation_results: list[dict[str, Any]] = []
-    for chunk in _chunked(imported_builds, batch_size):
-        for build_id in chunk:
+            hash_to_build[dedupe_hash] = build_id
             try:
-                _ensure_metrics_raw_for_build(
-                    build_id=build_id,
-                    profile_id=metadata.profile_id,
+                provenance = write_build_artifacts(
+                    build_id,
+                    xml=xml_content,
+                    code=text,
                     base_path=base_path,
                 )
-                status, _rows = evaluator.evaluate_build(build_id)
-                evaluation_results.append(
-                    {"build_id": build_id, "status": status.value, "error": None}
-                )
-            except APIError as exc:
-                evaluation_results.append(
-                    {
-                        "build_id": build_id,
-                        "status": None,
-                        "error": {
-                            "code": exc.code,
-                            "message": exc.message,
-                            "details": exc.details,
-                        },
-                    }
-                )
-            except Exception as exc:  # pragma: no cover - best effort
-                evaluation_results.append(
-                    {
-                        "build_id": build_id,
-                        "status": None,
-                        "error": {
-                            "code": "evaluation_error",
-                            "message": "failed to evaluate build",
-                            "details": str(exc),
-                        },
-                    }
-                )
+            except Exception as exc:
+                raise BulkImportError(f"failed to write artifacts for {path}: {exc}") from exc
 
-    errors = sum(1 for result in evaluation_results if result["error"] is not None)
-    counts = {
-        "total_files": len(file_paths),
-        "unique_imports": len(imported_builds),
-        "duplicates_skipped": len(file_paths) - len(imported_builds),
-        "evaluated_builds": len(evaluation_results),
-        "evaluation_errors": errors,
-        "evaluation_successes": len(evaluation_results) - errors,
-    }
+            try:
+                payload = BuildInsertPayload(
+                    build_id=build_id,
+                    created_at=datetime.now(timezone.utc),
+                    ruleset_id=metadata.ruleset_id,
+                    profile_id=metadata.profile_id,
+                    class_=metadata.class_,
+                    ascendancy=metadata.ascendancy,
+                    main_skill=metadata.main_skill,
+                    damage_type=metadata.damage_type,
+                    defence_type=metadata.defence_type,
+                    complexity_bucket=metadata.complexity_bucket,
+                    pob_xml_path=str(provenance.paths.build_xml),
+                    pob_code_path=str(provenance.paths.code),
+                    genome_path=str(provenance.paths.genome),
+                    tags=metadata.tags,
+                    status=BuildStatus.imported.value,
+                )
+                repo.insert_build(payload)
+            except Exception as exc:
+                raise BulkImportError(f"failed to insert build {build_id}: {exc}") from exc
 
-    run_id = run_id or uuid.uuid4().hex
-    summary_path = base_path / "runs" / run_id / "summary.json"
-    summary = {
-        "run_id": run_id,
-        "input_dir": str(input_dir.resolve(strict=False)),
-        "batch_size": batch_size,
-        "metadata": metadata.model_dump(by_alias=True),
-        "counts": counts,
-        "files": file_summaries,
-        "evaluation": evaluation_results,
-    }
-    _write_summary(summary, summary_path)
-    logger.info("bulk import summary written to %s", summary_path)
-    return BulkImportResult(exit_code=0, summary_path=summary_path, summary=summary)
+            imported_builds.append(build_id)
+
+        evaluation_results: list[dict[str, Any]] = []
+        for chunk in _chunked(imported_builds, batch_size):
+            for build_id in chunk:
+                try:
+                    _ensure_metrics_raw_for_build(
+                        build_id=build_id,
+                        profile_id=metadata.profile_id,
+                        base_path=base_path,
+                    )
+                    status, _rows = evaluator.evaluate_build(build_id)
+                    evaluation_results.append(
+                        {"build_id": build_id, "status": status.value, "error": None}
+                    )
+                except APIError as exc:
+                    evaluation_results.append(
+                        {
+                            "build_id": build_id,
+                            "status": None,
+                            "error": {
+                                "code": exc.code,
+                                "message": exc.message,
+                                "details": exc.details,
+                            },
+                        }
+                    )
+                except Exception as exc:  # pragma: no cover - best effort
+                    evaluation_results.append(
+                        {
+                            "build_id": build_id,
+                            "status": None,
+                            "error": {
+                                "code": "evaluation_error",
+                                "message": "failed to evaluate build",
+                                "details": str(exc),
+                            },
+                        }
+                    )
+
+        errors = sum(1 for result in evaluation_results if result["error"] is not None)
+        counts = {
+            "total_files": len(file_paths),
+            "unique_imports": len(imported_builds),
+            "duplicates_skipped": len(file_paths) - len(imported_builds),
+            "evaluated_builds": len(evaluation_results),
+            "evaluation_errors": errors,
+            "evaluation_successes": len(evaluation_results) - errors,
+        }
+
+        run_id = run_id or uuid.uuid4().hex
+        summary_path = base_path / "runs" / run_id / "summary.json"
+        summary = {
+            "run_id": run_id,
+            "input_dir": str(input_dir.resolve(strict=False)),
+            "batch_size": batch_size,
+            "metadata": metadata.model_dump(by_alias=True),
+            "counts": counts,
+            "files": file_summaries,
+            "evaluation": evaluation_results,
+        }
+        _write_summary(summary, summary_path)
+        logger.info("bulk import summary written to %s", summary_path)
+        return BulkImportResult(exit_code=0, summary_path=summary_path, summary=summary)
+    finally:
+        if created_evaluator:
+            evaluator.close()
 
 
 def _build_metadata_from_args(args: argparse.Namespace) -> ImportBuildMetadata:

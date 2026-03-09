@@ -1,0 +1,35 @@
+{
+  "scenario_id": "progression_red_maps",
+  "version": "v0",
+  "profile_id": "progression_red_maps",
+  "budget_tier": "endgame",
+  "pob_config": {
+    "name": "Progression Red Maps",
+    "boss": "Red_Map_Boss",
+    "debuffs": ["elementalWeakness", "enfeeble", "temporalChains"],
+    "flasks": {
+      "granite": 1,
+      "basalt": 1,
+      "jade": 1,
+      "quicksilver": 1
+    }
+  },
+  "gate_thresholds": {
+    "resists": {
+      "fire": 75,
+      "cold": 75,
+      "lightning": 75,
+      "chaos": 55
+    },
+    "reservation": {
+      "max_percent": 91
+    },
+    "attributes": {
+      "strength": 145,
+      "dexterity": 115,
+      "intelligence": 80
+    },
+    "min_max_hit": 2900,
+    "min_full_dps": 75000
+  }
+}

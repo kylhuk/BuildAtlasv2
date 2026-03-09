@@ -4,17 +4,11 @@ End-to-end tests for the feasibility-first pipeline.
 Tests the full flow: Skeleton → CSP → Repair → Gate Evaluation
 with mock PoB evaluation and gate slack computation.
 """
-
 from __future__ import annotations
 
 import pytest
 
-from backend.engine.evaluation.gates import (
-    GateEvaluation,
-    GateSlackMetrics,
-    compute_gate_slacks,
-    evaluate_gates,
-)
+from backend.engine.evaluation.gates import compute_gate_slacks, evaluate_gates
 from backend.engine.evaluation.normalized import (
     NormalizedAttributes,
     NormalizedMetrics,
@@ -34,7 +28,6 @@ from backend.engine.scenarios.loader import (
 )
 from backend.engine.skeletons.schema import Skeleton
 from backend.engine.validation.csp import BuildCSP
-
 
 # ============================================================================
 # FIXTURES: Skeleton, Templates, Build Data

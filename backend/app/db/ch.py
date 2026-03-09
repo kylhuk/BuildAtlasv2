@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 from datetime import datetime
+from threading import Lock
 from typing import Any, Dict, List, Sequence
 
 import clickhouse_connect
 from clickhouse_connect.driver.client import Client
 from pydantic import BaseModel, ConfigDict, Field
 
-from backend.app.settings import settings
-from backend.engine.metrics_source import METRICS_SOURCE_POB
+from ...engine.metrics_source import METRICS_SOURCE_POB
+from ..settings import settings
 
 ClickhouseClient = Client
+
+_default_clickhouse_client_lock = Lock()
+_default_clickhouse_client: ClickhouseClient | None = None
 
 BUILD_COLUMNS = [
     "build_id",
@@ -177,13 +181,19 @@ class BuildListFilters(BaseModel):
 
 
 def get_clickhouse_client() -> ClickhouseClient:
-    return clickhouse_connect.get_client(
-        host=settings.clickhouse_host,
-        port=settings.clickhouse_port,
-        username=settings.clickhouse_user,
-        password=settings.clickhouse_password,
-        database=settings.clickhouse_db,
-    )
+    global _default_clickhouse_client
+    if _default_clickhouse_client is not None:
+        return _default_clickhouse_client
+    with _default_clickhouse_client_lock:
+        if _default_clickhouse_client is None:
+            _default_clickhouse_client = clickhouse_connect.get_client(
+                host=settings.clickhouse_host,
+                port=settings.clickhouse_port,
+                username=settings.clickhouse_user,
+                password=settings.clickhouse_password,
+                database=settings.clickhouse_db,
+            )
+    return _default_clickhouse_client
 
 
 class ClickhouseRepository:
@@ -208,6 +218,7 @@ class ClickhouseRepository:
     _MEDIUM_PRIORITY_SORT_FIELDS = {"total_cost_chaos", "dps_per_chaos", "max_hit_per_chaos"}
 
     def __init__(self, client: ClickhouseClient | None = None) -> None:
+        self._is_default_client = client is None
         self._client = client or get_clickhouse_client()
         self._query_timeout_seconds = max(1, int(settings.clickhouse_query_timeout_seconds))
         self._query_settings: Dict[str, Any] = {
@@ -230,6 +241,8 @@ class ClickhouseRepository:
 
     def close(self) -> None:
         client = self._client
+        if self._is_default_client:
+            return
         close_fn = getattr(client, "close", None)
         if callable(close_fn):
             try:

@@ -147,11 +147,27 @@ def _compare_against_baseline(path: Path, payload: dict[str, Any]) -> None:
         if baseline_value != 0:
             pct = (delta / float(baseline_value)) * 100.0
             print(
-                f"  {key}: current={current_value:.6f}, baseline={baseline_value:.6f}, delta={delta:+.6f} ({pct:+.2f}%)"
+                (
+                    "  {key}: current={current:.6f}, baseline={baseline:.6f}, "
+                    "delta={delta:+.6f} ({pct:+.2f}%)"
+                ).format(
+                    key=key,
+                    current=current_value,
+                    baseline=baseline_value,
+                    delta=delta,
+                    pct=pct,
+                )
             )
         else:
             print(
-                f"  {key}: current={current_value:.6f}, baseline={baseline_value:.6f}, delta={delta:+.6f}"
+                (
+                    "  {key}: current={current:.6f}, baseline={baseline:.6f}, delta={delta:+.6f}"
+                ).format(
+                    key=key,
+                    current=current_value,
+                    baseline=baseline_value,
+                    delta=delta,
+                )
             )
 
 
@@ -193,7 +209,7 @@ def benchmark_worker_pool(args: argparse.Namespace) -> int:
     ]
 
     worker_pool_module = importlib.import_module("backend.engine.worker_pool")
-    worker_pool_cls = getattr(worker_pool_module, "WorkerPool")
+    worker_pool_cls = worker_pool_module.WorkerPool
     pool = worker_pool_cls(
         num_workers=workers,
         request_timeout=max(0.01, float(args.request_timeout)),
@@ -256,7 +272,7 @@ def benchmark_api(args: argparse.Namespace) -> int:
     from fastapi.testclient import TestClient
 
     app_module = importlib.import_module("app.main")
-    app = getattr(app_module, "app")
+    app = app_module.app
 
     count = max(1, int(args.count))
     latencies_ms: list[float] = []

@@ -1,8 +1,23 @@
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Any, Sequence
 
 from backend.engine.archive.store import ArchiveStoreEntry
+
+
+def _coerce_probability(value: Any) -> float | None:
+    try:
+        probability = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, probability))
+
+
+def _uncertainty_score(entry: ArchiveStoreEntry) -> float:
+    probability = _coerce_probability(entry.metadata.get("pass_probability"))
+    if probability is None:
+        return -1.0
+    return 1.0 - abs(probability - 0.5) * 2.0
 
 
 class ArchiveEmitter:
@@ -47,7 +62,14 @@ class UncertaintyEmitter(ArchiveEmitter):
     name = "uncertainty"
 
     def select(self, entries: Sequence[ArchiveStoreEntry], budget: int) -> list[ArchiveStoreEntry]:
-        return []
+        if budget <= 0:
+            return []
+        scored_entries: list[tuple[float, ArchiveStoreEntry]] = []
+        for entry in entries:
+            score = _uncertainty_score(entry)
+            scored_entries.append((score, entry))
+        scored_entries.sort(key=lambda scored: (-scored[0], scored[1].build_id))
+        return [entry for _, entry in scored_entries[:budget]]
 
 
 def deterministic_allocator(

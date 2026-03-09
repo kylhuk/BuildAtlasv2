@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from .dna import BuildDNA
 from .loader import load_skeleton
 from .schema import Skeleton
-from .dna import BuildDNA
 
 
 def expand_skeleton(skeleton_id: str) -> BuildDNA:

@@ -489,13 +489,13 @@ class SurrogateModel:
             cross_hash_dim=max(0, cross_hash_dim),
         )
 
-        X = torch.zeros((1, input_dim), dtype=torch.float32)
+        x = torch.zeros((1, input_dim), dtype=torch.float32)
         for idx, val in features.items():
             if 0 <= idx < input_dim:
-                X[0, idx] = val
+                x[0, idx] = val
 
         with torch.no_grad():
-            prediction = model(X)
+            prediction = model(x)
             return float(prediction.item())
 
 
@@ -1436,20 +1436,20 @@ def _train_slack_regressor(
     ]
 
     # Convert to tensors
-    X = torch.zeros((len(vectors), input_dim), dtype=torch.float32, device=device)
+    x = torch.zeros((len(vectors), input_dim), dtype=torch.float32, device=device)
     for i, vec in enumerate(vectors):
         for idx, val in vec.items():
             if 0 <= idx < input_dim:
-                X[i, idx] = val
+                x[i, idx] = val
 
     y = torch.tensor(targets, dtype=torch.float32, device=device).view(-1, 1)
 
     model.train()
-    for epoch in range(epochs):
-        permutation = torch.randperm(X.size()[0])
-        for i in range(0, X.size()[0], batch_size):
+    for _epoch in range(epochs):
+        permutation = torch.randperm(x.size()[0])
+        for i in range(0, x.size()[0], batch_size):
             indices = permutation[i : i + batch_size]
-            batch_x, batch_y = X[indices], y[indices]
+            batch_x, batch_y = x[indices], y[indices]
 
             optimizer.zero_grad()
             outputs = model(batch_x)
@@ -1459,7 +1459,7 @@ def _train_slack_regressor(
 
     model.eval()
     with torch.no_grad():
-        predictions = model(X)
+        predictions = model(x)
         mse = criterion(predictions, y).item()
         mae = torch.mean(torch.abs(predictions - y)).item()
 

@@ -8,7 +8,7 @@ from backend.engine.scenarios.loader import ScenarioGateThresholds, ScenarioRese
 
 
 def test_init_default():
-    """Test default initialization starts at MAPPING phase."""
+    """Test default initialization starts at mapping phase."""
     mgr = CurriculumManager()
     assert mgr.enabled is True
     assert mgr.scheduler.current_phase == CurriculumPhase.MAPPING
@@ -18,6 +18,12 @@ def test_init_with_phase():
     """Test initialization with specific phase."""
     mgr = CurriculumManager(initial_phase=CurriculumPhase.BOSSING)
     assert mgr.scheduler.current_phase == CurriculumPhase.BOSSING
+
+
+def test_init_with_zero_gates_phase():
+    """Test initialization with zero-gates phase."""
+    mgr = CurriculumManager(initial_phase=CurriculumPhase.ZERO_GATES)
+    assert mgr.scheduler.current_phase == CurriculumPhase.ZERO_GATES
 
 
 def test_init_disabled():
@@ -85,6 +91,18 @@ def test_record_iteration_with_transition():
     assert mgr.scheduler.current_phase == CurriculumPhase.BOSSING
 
 
+def test_record_iteration_zero_gates_to_mapping():
+    """Test zero-gates transition into Mapping when criteria are met."""
+    mgr = CurriculumManager(initial_phase=CurriculumPhase.ZERO_GATES)
+
+    result = mgr.record_iteration([True] * 20)
+
+    assert result["transitioned"] is True
+    assert result["from_phase"] == "ZERO_GATES"
+    assert result["to_phase"] == "MAPPING"
+    assert mgr.scheduler.current_phase == CurriculumPhase.MAPPING
+
+
 def test_record_iteration_disabled():
     """Test disabled mode doesn't record."""
     mgr = CurriculumManager(enabled=False)
@@ -137,3 +155,31 @@ def test_from_state_disabled():
     mgr = CurriculumManager.from_state(state)
     assert mgr.enabled is False
     assert mgr.scheduler.current_phase == CurriculumPhase.UBER
+
+
+def test_from_state_with_legacy_phase_name():
+    """Legacy phase names from persisted state should remain valid."""
+    state = {
+        "enabled": True,
+        "phase": "MAPPING",
+        "total_samples": 15,
+        "feasible_samples": 3,
+        "phase_samples": 15,
+        "phase_feasible_samples": 3,
+    }
+    mgr = CurriculumManager.from_state(state)
+    assert mgr.scheduler.current_phase == CurriculumPhase.MAPPING
+
+
+def test_from_state_with_legacy_bossing_name():
+    """Legacy BOSSING name should continue mapping to bossing."""
+    state = {
+        "enabled": True,
+        "phase": "BOSSING",
+        "total_samples": 20,
+        "feasible_samples": 4,
+        "phase_samples": 20,
+        "phase_feasible_samples": 4,
+    }
+    mgr = CurriculumManager.from_state(state)
+    assert mgr.scheduler.current_phase == CurriculumPhase.BOSSING

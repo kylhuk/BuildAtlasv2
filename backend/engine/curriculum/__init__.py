@@ -1,14 +1,14 @@
 """Curriculum learning module for progressive gate tightening."""
 
+from backend.engine.curriculum.manager import CurriculumManager
 from backend.engine.curriculum.scheduler import (
+    FEASIBILITY_TRANSITION_THRESHOLD,
+    PHASE_CONFIGS,
     CurriculumGateConfig,
     CurriculumPhase,
     CurriculumScheduler,
     CurriculumState,
-    FEASIBILITY_TRANSITION_THRESHOLD,
-    PHASE_CONFIGS,
 )
-from backend.engine.curriculum.manager import CurriculumManager
 
 __all__ = [
     "CurriculumPhase",

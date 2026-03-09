@@ -1,10 +1,11 @@
+import importlib
 from datetime import datetime
 from unittest.mock import MagicMock
 
 import pytest
 from clickhouse_connect.driver.exceptions import ClickHouseError
 
-from backend.app.db.ch import (
+from ..app.db.ch import (
     BuildCostRow,
     BuildInsertPayload,
     BuildListFilters,
@@ -449,3 +450,22 @@ def test_update_build_constraints_issues_command():
     assert params["constraint_reason_code"] == "reason"
     assert params["violated_constraints"] == ["rule-a"]
     assert params["constraint_checked_at"] is checked_at
+
+
+def test_default_client_reuses_cached_instance(monkeypatch):
+    ch_module = importlib.import_module(ClickhouseRepository.__module__)
+
+    ch_module._default_clickhouse_client = None
+    shared_client = MagicMock()
+    client_factory = MagicMock(return_value=shared_client)
+    monkeypatch.setattr(ch_module.clickhouse_connect, "get_client", client_factory)
+
+    repo_a = ClickhouseRepository()
+    repo_b = ClickhouseRepository()
+
+    assert repo_a._client is shared_client
+    assert repo_b._client is shared_client
+    assert repo_a._client is repo_b._client
+    assert client_factory.call_count == 1
+
+    ch_module._default_clickhouse_client = None

@@ -6,6 +6,7 @@ import random
 import re
 import uuid
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from functools import partial
@@ -15,7 +16,10 @@ from statistics import mean, median, pstdev
 from time import monotonic
 from typing import Any, Callable, Literal, Mapping, Sequence
 
-from backend.app.api.evaluator import BuildEvaluator, EvaluationProvenance
+from backend.app.api.evaluator import (
+    BuildEvaluator,
+    EvaluationProvenance,
+)
 from backend.app.api.models import BuildStatus
 from backend.app.db.ch import BuildInsertPayload, ClickhouseRepository, ScenarioMetricRow
 from backend.app.settings import settings
@@ -54,6 +58,12 @@ from backend.engine.metrics_source import (
     normalize_metrics_source,
 )
 from backend.engine.passives.builder import PassiveTreePlan, build_passive_tree_plan
+from backend.engine.repair.operators import (
+    AttributeRepair,
+    LifeRepair,
+    ReservationRepair,
+    ResistanceRepair,
+)
 from backend.engine.scenarios.loader import ScenarioGateThresholds, ScenarioTemplate, list_templates
 from backend.engine.skeletons.expansion import expand_skeleton
 from backend.engine.skills.catalog import GemPlan, SkillCatalog, load_default_skill_catalog
@@ -241,6 +251,7 @@ DEFAULT_POINT_BUDGETS: dict[str, int] = {
 }
 SURROGATE_PREDICTION_SCHEMA_VERSION = 1
 DEGENERATE_FULL_DPS_STDDEV_THRESHOLD = 1e-6
+SURROGATE_PASS_PROBABILITY_THRESHOLD = 0.25
 
 PRECHECK_CATEGORIES: tuple[str, ...] = (
     "socket_precheck_failed",
@@ -612,6 +623,47 @@ def _surrogate_rank_key(
     return (-full_dps, max_hit_sort, -probability_sort, tie_breaker)
 
 
+def _surrogate_candidate_pass_probability(candidate: Candidate) -> float | None:
+    """Normalize cached pass probability for gating decisions."""
+    return _surrogate_prediction_components(candidate)[2]
+
+
+def _passes_surrogate_probability_gate(candidate: Candidate, threshold: float) -> bool:
+    """Return True when the candidate meets or exceeds the gate threshold."""
+    if threshold <= 0:
+        return True
+    pass_probability = _surrogate_candidate_pass_probability(candidate)
+    if pass_probability is None:
+        return True
+    return pass_probability >= threshold
+
+
+def _surrogate_probability_screen(
+    ranked_candidates: Sequence[Candidate],
+    *,
+    threshold: float,
+    top_k: int | None,
+) -> tuple[list[Candidate], list[Candidate], list[Candidate]]:
+    """Partition ranked candidates by pass probability and backfill if needed."""
+    if top_k is None or threshold <= 0:
+        return list(ranked_candidates), [], []
+    eligible: list[Candidate] = []
+    screened: list[Candidate] = []
+    for candidate in ranked_candidates:
+        if _passes_surrogate_probability_gate(candidate, threshold):
+            eligible.append(candidate)
+        else:
+            screened.append(candidate)
+    selection_limit = min(top_k, len(ranked_candidates))
+    top_candidates = _select_diverse_top_candidates(eligible, top_k=top_k)
+    backfilled: list[Candidate] = []
+    if len(top_candidates) < selection_limit and screened:
+        needed = selection_limit - len(top_candidates)
+        backfilled = screened[:needed]
+        top_candidates.extend(backfilled)
+    return top_candidates, screened, backfilled
+
+
 def _calculate_min_gate_slack(
     candidate: Candidate,
     templates: Sequence[ScenarioTemplate],
@@ -772,6 +824,12 @@ MetricsGenerator = Callable[[int, Sequence[ScenarioTemplate]], Mapping[str, Any]
 
 def _point_budget_for(genome: GenomeV0) -> int:
     return DEFAULT_POINT_BUDGETS.get(genome.budget_tier, 70)
+
+
+def _stage_point_budget(character_level: int) -> int:
+    stage = max(1, min(character_level, 4))
+    stage_budgets = {1: 55, 2: 70, 3: 90, 4: 123}
+    return stage_budgets[stage]
 
 
 def _default_metrics_generator(
@@ -1067,9 +1125,12 @@ def _render_items_section(candidate: Candidate) -> list[str]:
         # Render the item as Rare
         lines.append(f'    <Item id="{item_id}">')
         lines.append("      Rarity: Rare")
+        lines.append(f"      Generated {base_type}")
         lines.append(f"      {base_type}")
         lines.append("      --------")
         lines.append("      Item Level: 100")
+        if affix_lines:
+            lines.append("      --------")
         for affix in affix_lines:
             lines.append(f"      {affix}")
         lines.append("    </Item>")
@@ -1280,6 +1341,33 @@ def _build_worker_xml_payload(candidate: Candidate) -> str:
         )
     lines.append("</PathOfBuilding>")
     return "\n".join(lines)
+
+
+def _apply_viability_repairs(
+    build_details_payload: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, int] | None]:
+    repaired = deepcopy(build_details_payload)
+    if not isinstance(repaired, dict):
+        return {}, None
+
+    repairs: dict[str, int] = {}
+    operators = (
+        ResistanceRepair(),
+        LifeRepair(),
+        AttributeRepair(),
+        ReservationRepair(),
+    )
+    for operator in operators:
+        for _ in range(5):
+            before = deepcopy(repaired)
+            if not operator.needs_repair(repaired):
+                break
+            operator.apply(repaired)
+            if repaired == before:
+                break
+            repairs[type(operator).__name__] = repairs.get(type(operator).__name__, 0) + 1
+    summary = repairs if repairs else None
+    return repaired, summary
 
 
 def _socket_precheck_failed(plan: SocketPlan) -> bool:
@@ -1626,6 +1714,8 @@ def generate_from_skeleton(
     templates: Sequence[ScenarioTemplate],
     evaluator: BuildEvaluator,
     *,
+    character_level: int | None = None,
+    gate_thresholds: ScenarioGateThresholds | None = None,
     socket_planner: SocketPlanner | None = None,
     passive_planner: PassivePlanner | None = None,
     template_builder: TemplateBuilder | None = None,
@@ -1662,7 +1752,12 @@ def generate_from_skeleton(
         metrics_generator = partial(_default_metrics_generator, gate_thresholds=gate_thresholds)
 
     gem_plan = catalog.build_plan(genome)
-    passive_plan = passive_planner(genome, _point_budget_for(genome))
+    passive_budget = (
+        _stage_point_budget(character_level)
+        if character_level is not None
+        else _point_budget_for(genome)
+    )
+    passive_plan = passive_planner(genome, passive_budget)
     socket_plan = socket_planner(catalog, genome)
     template_plan = template_builder(genome, gem_plan, passive_plan, socket_plan)
 
@@ -1672,6 +1767,7 @@ def generate_from_skeleton(
         passive_plan=passive_plan,
         socket_plan=socket_plan,
         template_plan=template_plan,
+        profile_id=profile_id,
     )
     metrics_payload = metrics_generator(seed, templates)
 
@@ -1707,6 +1803,87 @@ def run_generation(
     seed_start: int,
     ruleset_id: str,
     profile_id: str,
+    character_level: int | None = None,
+    gate_thresholds: ScenarioGateThresholds | None = None,
+    skeleton_id: str | None = None,
+    run_id: str | None = None,
+    base_path: Path | None = None,
+    repo: ClickhouseRepository | None = None,
+    evaluator: BuildEvaluator | None = None,
+    socket_planner: SocketPlanner | None = None,
+    passive_planner: Callable[[GenomeV0, int], PassiveTreePlan] | None = None,
+    template_builder: TemplateBuilder | None = None,
+    metrics_generator: MetricsGenerator | None = None,
+    surrogate_enabled: bool = False,
+    surrogate_model_path: Path | str | None = None,
+    candidate_pool_size: int | None = None,
+    surrogate_exploration_pct: float = 0.2,
+    surrogate_top_k: int | None = None,
+    surrogate_predictor: Callable[[Sequence[dict[str, Any]]], Sequence[Any]] | None = None,
+    run_mode: Literal["standard", "optimizer"] = "standard",
+    optimizer_iterations: int = 1,
+    optimizer_elite_count: int = 2,
+    constraints: Mapping[str, Any] | None = None,
+    enforce_worker_tripwire: bool = False,
+    archive: ArchiveStore | None = None,
+) -> dict[str, Any]:
+    created_repo = repo is None
+    repo = repo or ClickhouseRepository()
+    created_evaluator = evaluator is None
+    evaluator = evaluator or BuildEvaluator(
+        repo=repo,
+        base_path=base_path if base_path is not None else settings.data_path,
+        worker_cmd=settings.pob_worker_cmd,
+        worker_args=settings.pob_worker_args,
+        worker_cwd=settings.pob_worker_cwd,
+        worker_pool_size=settings.pob_worker_pool_size,
+    )
+    try:
+        return _run_generation_internal(
+            count=count,
+            seed_start=seed_start,
+            ruleset_id=ruleset_id,
+            profile_id=profile_id,
+            character_level=character_level,
+            gate_thresholds=gate_thresholds,
+            skeleton_id=skeleton_id,
+            run_id=run_id,
+            base_path=base_path,
+            repo=repo,
+            evaluator=evaluator,
+            socket_planner=socket_planner,
+            passive_planner=passive_planner,
+            template_builder=template_builder,
+            metrics_generator=metrics_generator,
+            surrogate_enabled=surrogate_enabled,
+            surrogate_model_path=surrogate_model_path,
+            candidate_pool_size=candidate_pool_size,
+            surrogate_exploration_pct=surrogate_exploration_pct,
+            surrogate_top_k=surrogate_top_k,
+            surrogate_predictor=surrogate_predictor,
+            run_mode=run_mode,
+            optimizer_iterations=optimizer_iterations,
+            optimizer_elite_count=optimizer_elite_count,
+            constraints=constraints,
+            enforce_worker_tripwire=enforce_worker_tripwire,
+            archive=archive,
+        )
+    finally:
+        if created_evaluator:
+            evaluator.close()
+        if created_repo and hasattr(repo, "close"):
+            close_repo = repo.close
+            if callable(close_repo):
+                close_repo()
+
+
+def _run_generation_internal(
+    *,
+    count: int,
+    seed_start: int,
+    ruleset_id: str,
+    profile_id: str,
+    character_level: int | None = None,
     gate_thresholds: ScenarioGateThresholds | None = None,
     skeleton_id: str | None = None,
     run_id: str | None = None,
@@ -1780,23 +1957,14 @@ def run_generation(
     if not templates:
         raise ValueError(f"no scenario templates for profile_id={profile_id}")
 
-    created_repo = repo is None
-    repo = repo or ClickhouseRepository()
-    created_evaluator = evaluator is None
-    evaluator = evaluator or BuildEvaluator(
-        repo=repo,
-        base_path=base_path,
-        worker_cmd=settings.pob_worker_cmd,
-        worker_args=settings.pob_worker_args,
-        worker_cwd=settings.pob_worker_cwd,
-        worker_pool_size=settings.pob_worker_pool_size,
-    )
+    if repo is None:
+        raise RuntimeError("repo must be provided by the public run_generation wrapper")
+    if evaluator is None:
+        raise RuntimeError("evaluator must be provided by the public run_generation wrapper")
     if run_mode == "optimizer":
         evaluator.require_worker_metrics_for_profile(profile_id)
         if profile_id.strip().lower() == "uber_pinnacle":
             evaluator.require_non_stub_metrics_for_profile(profile_id)
-    assert repo is not None
-    assert evaluator is not None
     session_id = run_id or uuid.uuid4().hex
     run_started_at = monotonic()
     synthesis_started_at = run_started_at
@@ -1838,6 +2006,8 @@ def run_generation(
                 profile_id=profile_id,
                 templates=templates,
                 evaluator=evaluator,
+                character_level=character_level,
+                gate_thresholds=gate_thresholds,
                 socket_planner=socket_planner,
                 passive_planner=passive_planner,
                 template_builder=template_builder,
@@ -1846,7 +2016,12 @@ def run_generation(
         else:
             genome = deterministic_genome_from_seed(seed)
             gem_plan = catalog.build_plan(genome)
-            passive_plan = passive_planner(genome, _point_budget_for(genome))
+            passive_budget = (
+                _stage_point_budget(character_level)
+                if character_level is not None
+                else _point_budget_for(genome)
+            )
+            passive_plan = passive_planner(genome, passive_budget)
             socket_plan = socket_planner(catalog, genome)
             template_plan = template_builder(genome, gem_plan, passive_plan, socket_plan)
             build_details_payload = build_details_from_generation(
@@ -1855,6 +2030,7 @@ def run_generation(
                 passive_plan=passive_plan,
                 socket_plan=socket_plan,
                 template_plan=template_plan,
+                profile_id=profile_id,
             )
             metrics_payload = metrics_generator(seed, templates)
 
@@ -1904,6 +2080,16 @@ def run_generation(
     def _persist_candidate(candidate: Candidate) -> None:
         if candidate.persisted:
             return
+        repaired_build_details, repair_summary = _apply_viability_repairs(
+            candidate.build_details_payload
+        )
+        candidate.build_details_payload = repaired_build_details
+        if repair_summary:
+            logger.debug(
+                "applied viability repairs to build %s: %s",
+                candidate.build_id,
+                repair_summary,
+            )
         xml_payload = _build_worker_xml_payload(candidate)
         artifacts = write_build_artifacts(
             candidate.build_id,
@@ -2107,11 +2293,14 @@ def run_generation(
         "selection_params": {
             "top_k": top_k,
             "exploration_pct": exploration_pct,
+            "pass_probability_threshold": SURROGATE_PASS_PROBABILITY_THRESHOLD,
         },
         "counts": {
             "candidates": len(prefiltered_candidates),
             "selected": 0,
             "pruned": 0,
+            "screened": 0,
+            "backfilled": 0,
         },
         "fallback_reason": None,
     }
@@ -2185,14 +2374,19 @@ def run_generation(
                 ]
                 ranked_candidates.sort(key=lambda item: item[1])
                 scored_candidates = [candidate for candidate, _ in ranked_candidates]
-                if top_k is None:
-                    top_candidates = scored_candidates
-                    remaining = []
-                else:
-                    top_candidates = _select_diverse_top_candidates(
+                selection_threshold = SURROGATE_PASS_PROBABILITY_THRESHOLD
+                top_candidates, screened_candidates, backfilled_candidates = (
+                    _surrogate_probability_screen(
                         scored_candidates,
                         top_k=top_k,
+                        threshold=selection_threshold,
                     )
+                )
+                surrogate_summary["counts"]["screened"] = len(screened_candidates)
+                surrogate_summary["counts"]["backfilled"] = len(backfilled_candidates)
+                if top_k is None:
+                    remaining: list[Candidate] = []
+                else:
                     selected_ids = {candidate.build_id for candidate in top_candidates}
                     remaining = [
                         candidate
@@ -2210,6 +2404,8 @@ def run_generation(
                 for candidate in top_candidates:
                     candidate.selected_for_evaluation = True
                     candidate.selection_reason = "surrogate_top"
+                for candidate in backfilled_candidates:
+                    candidate.selection_reason = "surrogate_backfilled"
                 for candidate in exploration_candidates:
                     candidate.selected_for_evaluation = True
                     candidate.selection_reason = "surrogate_exploration"
@@ -2311,229 +2507,336 @@ def run_generation(
             selected_count,
         )
 
-    for candidate in candidates:
-        if not candidate.selected_for_evaluation:
-            continue
-        evaluation_attempted += 1
-        abort_for_non_pob_metrics = False
+    selected_candidates = [
+        candidate for candidate in candidates if candidate.selected_for_evaluation
+    ]
+    selected_build_ids = [candidate.build_id for candidate in selected_candidates]
+
+    for candidate in selected_candidates:
+        _persist_candidate(candidate)
+
+    def _extract_error_fields(error: Any) -> tuple[str, str, Any]:
+        if isinstance(error, Mapping):
+            code_value = error.get("code", "generation_error")
+            message_value = error.get("message", "generation error")
+            details_value = error.get("details")
+            return str(code_value), str(message_value), details_value
+        code_value = getattr(error, "code", "generation_error")
+        message_value = getattr(error, "message", str(error))
+        details_value = getattr(error, "details", None)
+        return str(code_value), str(message_value), details_value
+
+    batched_outcome: Mapping[str, Any] = {}
+    if selected_build_ids:
         try:
-            _persist_candidate(candidate)
-            status, rows = evaluator.evaluate_build(
-                candidate.build_id, gate_thresholds=gate_thresholds
+            batched_outcome = evaluator.evaluate_builds_batched(
+                selected_build_ids,
+                gate_thresholds=gate_thresholds,
+                progress_label=f"generation:{session_id}",
             )
-            provenance = evaluator.pop_last_evaluation_provenance()
-            _record_provenance_counts(provenance, evaluation_counters)
-            candidate.evaluation_status = status.value
-            if rows:
-                candidate.gate_pass = all(getattr(row, "gate_pass", True) for row in rows)
-                if candidate.gate_pass:
-                    gate_pass_count += 1
-                else:
-                    gate_fail_count += 1
-                for row in rows:
-                    if not getattr(row, "gate_pass", True):
-                        for reason in getattr(row, "gate_fail_reasons", []) or []:
-                            reason_key = str(reason)
-                            gate_fail_reason_counts[reason_key] = (
-                                gate_fail_reason_counts.get(reason_key, 0) + 1
-                            )
-                    source_value = normalize_metrics_source(
-                        getattr(row, "metrics_source", None), METRICS_SOURCE_STUB
-                    )
-                    source_key = source_value or METRICS_SOURCE_STUB
-                    metrics_source_counts[source_key] = metrics_source_counts.get(source_key, 0) + 1
-            candidate.verified_metrics_payload = _metrics_payload_from_scenario_rows(rows)
-            evaluation_rows.extend(rows)
-            metrics_sources = _row_metrics_sources(rows)
-            tripwire_reason: str | None = None
-            tripwire_message: str | None = None
-            tripwire_details: dict[str, Any] = {}
-            if provenance:
-                if provenance.worker_metadata_missing_count > 0:
-                    tripwire_reason = "worker_metadata_missing"
-                    scenarios_text = _describe_scenarios(
-                        provenance.worker_metadata_missing_scenarios
-                    )
-                    tripwire_message = (
-                        "PoB evaluation inactive; worker metadata missing "
-                        f"for scenarios {scenarios_text}"
-                    )
-                    tripwire_details["worker_metadata_missing_scenarios"] = (
-                        provenance.worker_metadata_missing_scenarios
-                    )
-                elif provenance.stub_warning_count > 0:
-                    tripwire_reason = "stub_metrics_detected"
-                    scenarios_text = _describe_scenarios(provenance.stub_warning_scenarios)
-                    tripwire_message = (
-                        "PoB evaluation inactive; stub metrics detected "
-                        f"for scenarios {scenarios_text}"
-                    )
-                    tripwire_details["stub_warning_scenarios"] = provenance.stub_warning_scenarios
-            detection_triggered = tripwire_reason is not None
-            if detection_triggered:
-                if enforce_worker_tripwire:
-                    abort_for_non_pob_metrics = True
-                    message_text = (
-                        tripwire_message or "PoB evaluation inactive; non-PoB metrics returned"
-                    )
-                    error_details = {
-                        "build_id": candidate.build_id,
-                        "metrics_sources": sorted(metrics_sources),
-                        **tripwire_details,
-                    }
-                    candidate.evaluation_error = {
-                        "code": "evaluation_non_pob_metrics",
-                        "message": message_text,
+        except Exception as exc:  # pylint: disable=broad-except
+            error_code, error_message, error_details = _extract_error_fields(exc)
+            details_text = str(error_details).lower() if error_details is not None else ""
+            reason_code = "evaluation_infrastructure_error"
+            reason_message = "PoB evaluation aborted after infrastructure failure"
+            if "make db-init" in details_text or (
+                "scenario_metrics.metrics_source" in details_text
+                and "schema mismatch" in details_text
+            ):
+                reason_code = "clickhouse_schema_mismatch"
+                reason_message = "ClickHouse schema mismatch detected; run `make db-init`"
+            infrastructure_failure_reason = {
+                "code": reason_code,
+                "message": reason_message,
+                "details": {
+                    "error": {
+                        "code": error_code,
+                        "message": error_message,
                         "details": error_details,
                     }
-                    candidate.evaluation_status = BuildStatus.failed.value
-                    if infrastructure_failure_reason is None:
-                        infrastructure_failure_reason = {
-                            "code": "evaluation_non_pob_metrics",
-                            "message": message_text,
-                            "details": error_details,
-                        }
-            metrics_ok = (
-                status is BuildStatus.evaluated
-                and metrics_sources == {METRICS_SOURCE_POB}
-                and not (enforce_worker_tripwire and detection_triggered)
-            )
-            candidate.metrics_ok = metrics_ok
-            if metrics_ok:
-                metrics_ok_count += 1
-                if candidate.surrogate_prediction_payload:
-                    _persist_surrogate_prediction(
-                        candidate.build_id,
-                        base_path,
-                        candidate.surrogate_prediction_payload,
-                    )
-            else:
+                },
+            }
+            for candidate in selected_candidates:
+                evaluation_attempted += 1
+                candidate.evaluation_status = BuildStatus.failed.value
+                candidate.metrics_ok = False
+                candidate.gate_pass = False
+                candidate.evaluation_error = {
+                    "code": error_code,
+                    "message": error_message,
+                    "details": error_details,
+                }
+                evaluation_errors += 1
                 evaluation_failures += 1
-                if metrics_sources != {METRICS_SOURCE_POB} and not candidate.evaluation_error:
-                    candidate.evaluation_error = {
-                        "code": "metrics_source_mismatch",
-                        "message": "non-PoB metrics discarded",
-                        "details": {
-                            "metrics_sources": sorted(metrics_sources),
-                        },
+                evaluation_records.append(
+                    {
+                        "build_id": candidate.build_id,
+                        "status": None,
+                        "error": candidate.evaluation_error,
                     }
-                if metrics_sources and METRICS_SOURCE_POB not in metrics_sources:
-                    abort_for_non_pob_metrics = True
+                )
+
+    batched_results_raw = (
+        batched_outcome.get("results") if isinstance(batched_outcome, Mapping) else {}
+    )
+    batched_errors_raw = (
+        batched_outcome.get("errors") if isinstance(batched_outcome, Mapping) else {}
+    )
+    batched_results = batched_results_raw if isinstance(batched_results_raw, Mapping) else {}
+    batched_errors = batched_errors_raw if isinstance(batched_errors_raw, Mapping) else {}
+
+    if infrastructure_failure_reason is None:
+        for candidate in selected_candidates:
+            evaluation_attempted += 1
+            abort_for_non_pob_metrics = False
+            outcome_error = batched_errors.get(candidate.build_id)
+            if outcome_error is not None:
+                error_code, error_message, error_details = _extract_error_fields(outcome_error)
+                candidate.evaluation_error = {
+                    "code": error_code,
+                    "message": error_message,
+                    "details": error_details,
+                }
+                evaluation_records.append(
+                    {
+                        "build_id": candidate.build_id,
+                        "status": None,
+                        "error": candidate.evaluation_error,
+                    }
+                )
+                evaluation_errors += 1
+                evaluation_failures += 1
+                candidate.evaluation_status = BuildStatus.failed.value
+                candidate.metrics_ok = False
+                candidate.gate_pass = False
+                logger.warning(
+                    "generation run %s candidate %s evaluation error code=%s message=%s details=%s",
+                    session_id,
+                    candidate.build_id,
+                    candidate.evaluation_error["code"],
+                    candidate.evaluation_error["message"],
+                    candidate.evaluation_error.get("details"),
+                )
+                normalized_code = str(error_code) if error_code is not None else ""
+                if enforce_worker_tripwire and normalized_code == "stub_metrics_disallowed":
+                    _record_stub_disallowed_error_counts(
+                        candidate.evaluation_error, evaluation_counters
+                    )
                     if infrastructure_failure_reason is None:
                         infrastructure_failure_reason = {
                             "code": "evaluation_non_pob_metrics",
-                            "message": "PoB evaluation inactive; non-PoB metrics returned",
+                            "message": error_message
+                            or "PoB evaluation aborted after non-PoB metrics",
                             "details": {
                                 "build_id": candidate.build_id,
-                                "metrics_sources": sorted(metrics_sources),
                                 "error": candidate.evaluation_error,
                             },
                         }
-            evaluation_records.append(
-                {
-                    "build_id": candidate.build_id,
-                    "status": candidate.evaluation_status,
-                    "error": candidate.evaluation_error,
-                }
-            )
-            if abort_for_non_pob_metrics:
-                break
-        except Exception as exc:  # pylint: disable=broad-except
-            error_code = getattr(exc, "code", "generation_error")
-            error_message = getattr(exc, "message", str(exc))
-            error_details = getattr(exc, "details", None)
-            candidate.evaluation_error = {
-                "code": error_code,
-                "message": error_message,
-                "details": error_details,
-            }
-            evaluation_records.append(
-                {
-                    "build_id": candidate.build_id,
-                    "status": None,
-                    "error": candidate.evaluation_error,
-                }
-            )
-            evaluation_errors += 1
-            evaluation_failures += 1
-            candidate.evaluation_status = BuildStatus.failed.value
-            candidate.metrics_ok = False
-            logger.warning(
-                "generation run %s candidate %s evaluation error code=%s message=%s details=%s",
-                session_id,
-                candidate.build_id,
-                candidate.evaluation_error["code"],
-                candidate.evaluation_error["message"],
-                candidate.evaluation_error.get("details"),
-            )
-            normalized_code = str(error_code) if error_code is not None else ""
-            if enforce_worker_tripwire and normalized_code == "stub_metrics_disallowed":
-                _record_stub_disallowed_error_counts(
-                    candidate.evaluation_error, evaluation_counters
+                    break
+                is_infrastructure_error = (
+                    normalized_code in INFRASTRUCTURE_EVALUATION_ERROR_CODES
+                    or any(
+                        normalized_code.startswith(prefix)
+                        for prefix in INFRASTRUCTURE_ERROR_CODE_PREFIXES
+                    )
                 )
-                if infrastructure_failure_reason is None:
-                    infrastructure_failure_reason = {
-                        "code": "evaluation_non_pob_metrics",
-                        "message": error_message or "PoB evaluation aborted after non-PoB metrics",
-                        "details": {
-                            "build_id": candidate.build_id,
-                            "error": candidate.evaluation_error,
-                        },
+                if is_infrastructure_error:
+                    if infrastructure_failure_reason is None:
+                        details_text = (
+                            str(error_details).lower() if error_details is not None else ""
+                        )
+                        reason_code = "evaluation_infrastructure_error"
+                        reason_message = "PoB evaluation aborted after infrastructure failure"
+                        if "make db-init" in details_text or (
+                            "scenario_metrics.metrics_source" in details_text
+                            and "schema mismatch" in details_text
+                        ):
+                            reason_code = "clickhouse_schema_mismatch"
+                            reason_message = (
+                                "ClickHouse schema mismatch detected; run `make db-init`"
+                            )
+                        infrastructure_failure_reason = {
+                            "code": reason_code,
+                            "message": reason_message,
+                            "details": {
+                                "build_id": candidate.build_id,
+                                "error": candidate.evaluation_error,
+                            },
+                        }
+                    break
+            else:
+                result_entry = batched_results.get(candidate.build_id)
+                if not isinstance(result_entry, tuple) or len(result_entry) != 2:
+                    candidate.evaluation_error = {
+                        "code": "evaluation_error",
+                        "message": "missing batched evaluation result",
+                        "details": {"build_id": candidate.build_id},
                     }
-                break
-            is_infrastructure_error = (
-                normalized_code in INFRASTRUCTURE_EVALUATION_ERROR_CODES
-                or any(
-                    normalized_code.startswith(prefix)
-                    for prefix in INFRASTRUCTURE_ERROR_CODE_PREFIXES
+                    evaluation_records.append(
+                        {
+                            "build_id": candidate.build_id,
+                            "status": None,
+                            "error": candidate.evaluation_error,
+                        }
+                    )
+                    evaluation_errors += 1
+                    evaluation_failures += 1
+                    candidate.evaluation_status = BuildStatus.failed.value
+                    candidate.metrics_ok = False
+                else:
+                    status, rows = result_entry
+                    provenance = None
+                    _record_provenance_counts(provenance, evaluation_counters)
+                    candidate.evaluation_status = (
+                        status.value if isinstance(status, BuildStatus) else str(status)
+                    )
+                    if rows:
+                        candidate.gate_pass = all(getattr(row, "gate_pass", True) for row in rows)
+                        if candidate.gate_pass:
+                            gate_pass_count += 1
+                        else:
+                            gate_fail_count += 1
+                        for row in rows:
+                            if not getattr(row, "gate_pass", True):
+                                for reason in getattr(row, "gate_fail_reasons", []) or []:
+                                    reason_key = str(reason)
+                                    gate_fail_reason_counts[reason_key] = (
+                                        gate_fail_reason_counts.get(reason_key, 0) + 1
+                                    )
+                            source_value = normalize_metrics_source(
+                                getattr(row, "metrics_source", None), METRICS_SOURCE_STUB
+                            )
+                            source_key = source_value or METRICS_SOURCE_STUB
+                            metrics_source_counts[source_key] = (
+                                metrics_source_counts.get(source_key, 0) + 1
+                            )
+                    candidate.verified_metrics_payload = _metrics_payload_from_scenario_rows(rows)
+                    evaluation_rows.extend(rows)
+                    metrics_sources = _row_metrics_sources(rows)
+                    tripwire_reason: str | None = None
+                    tripwire_message: str | None = None
+                    tripwire_details: dict[str, Any] = {}
+                    if provenance:
+                        if provenance.worker_metadata_missing_count > 0:
+                            tripwire_reason = "worker_metadata_missing"
+                            scenarios_text = _describe_scenarios(
+                                provenance.worker_metadata_missing_scenarios
+                            )
+                            tripwire_message = (
+                                "PoB evaluation inactive; worker metadata missing "
+                                f"for scenarios {scenarios_text}"
+                            )
+                            tripwire_details["worker_metadata_missing_scenarios"] = (
+                                provenance.worker_metadata_missing_scenarios
+                            )
+                        elif provenance.stub_warning_count > 0:
+                            tripwire_reason = "stub_metrics_detected"
+                            scenarios_text = _describe_scenarios(provenance.stub_warning_scenarios)
+                            tripwire_message = (
+                                "PoB evaluation inactive; stub metrics detected "
+                                f"for scenarios {scenarios_text}"
+                            )
+                            tripwire_details["stub_warning_scenarios"] = (
+                                provenance.stub_warning_scenarios
+                            )
+                    detection_triggered = tripwire_reason is not None
+                    if detection_triggered:
+                        if enforce_worker_tripwire:
+                            abort_for_non_pob_metrics = True
+                            message_text = (
+                                tripwire_message
+                                or "PoB evaluation inactive; non-PoB metrics returned"
+                            )
+                            error_details = {
+                                "build_id": candidate.build_id,
+                                "metrics_sources": sorted(metrics_sources),
+                                **tripwire_details,
+                            }
+                            candidate.evaluation_error = {
+                                "code": "evaluation_non_pob_metrics",
+                                "message": message_text,
+                                "details": error_details,
+                            }
+                            candidate.evaluation_status = BuildStatus.failed.value
+                            if infrastructure_failure_reason is None:
+                                infrastructure_failure_reason = {
+                                    "code": "evaluation_non_pob_metrics",
+                                    "message": message_text,
+                                    "details": error_details,
+                                }
+                    metrics_ok = (
+                        status is BuildStatus.evaluated
+                        and metrics_sources == {METRICS_SOURCE_POB}
+                        and not (enforce_worker_tripwire and detection_triggered)
+                    )
+                    candidate.metrics_ok = metrics_ok
+                    if metrics_ok:
+                        metrics_ok_count += 1
+                        if candidate.surrogate_prediction_payload:
+                            _persist_surrogate_prediction(
+                                candidate.build_id,
+                                base_path,
+                                candidate.surrogate_prediction_payload,
+                            )
+                    else:
+                        evaluation_failures += 1
+                        if (
+                            metrics_sources != {METRICS_SOURCE_POB}
+                            and not candidate.evaluation_error
+                        ):
+                            candidate.evaluation_error = {
+                                "code": "metrics_source_mismatch",
+                                "message": "non-PoB metrics discarded",
+                                "details": {
+                                    "metrics_sources": sorted(metrics_sources),
+                                },
+                            }
+                        if metrics_sources and METRICS_SOURCE_POB not in metrics_sources:
+                            abort_for_non_pob_metrics = True
+                            if infrastructure_failure_reason is None:
+                                infrastructure_failure_reason = {
+                                    "code": "evaluation_non_pob_metrics",
+                                    "message": "PoB evaluation inactive; non-PoB metrics returned",
+                                    "details": {
+                                        "build_id": candidate.build_id,
+                                        "metrics_sources": sorted(metrics_sources),
+                                        "error": candidate.evaluation_error,
+                                    },
+                                }
+                    evaluation_records.append(
+                        {
+                            "build_id": candidate.build_id,
+                            "status": candidate.evaluation_status,
+                            "error": candidate.evaluation_error,
+                        }
+                    )
+                    if abort_for_non_pob_metrics:
+                        break
+
+            now = monotonic()
+            should_log_progress = (
+                evaluation_attempted == selected_count
+                or evaluation_attempted >= next_progress_count
+                or (now - last_progress_log_at) >= 30.0
+            )
+            if should_log_progress:
+                _phase_log(
+                    "generation run %s phase=evaluation_progress "
+                    "(completed=%d/%d metrics_ok=%d gate_pass=%d gate_fail=%d "
+                    "failures=%d errors=%d elapsed=%.1fs)",
+                    session_id,
+                    evaluation_attempted,
+                    selected_count,
+                    metrics_ok_count,
+                    gate_pass_count,
+                    gate_fail_count,
+                    evaluation_failures,
+                    evaluation_errors,
+                    max(0.0, now - evaluation_started_at),
                 )
-            )
-            if is_infrastructure_error:
-                if infrastructure_failure_reason is None:
-                    details_text = str(error_details).lower() if error_details is not None else ""
-                    reason_code = "evaluation_infrastructure_error"
-                    reason_message = "PoB evaluation aborted after infrastructure failure"
-                    if "make db-init" in details_text or (
-                        "scenario_metrics.metrics_source" in details_text
-                        and "schema mismatch" in details_text
-                    ):
-                        reason_code = "clickhouse_schema_mismatch"
-                        reason_message = "ClickHouse schema mismatch detected; run `make db-init`"
-                    infrastructure_failure_reason = {
-                        "code": reason_code,
-                        "message": reason_message,
-                        "details": {
-                            "build_id": candidate.build_id,
-                            "error": candidate.evaluation_error,
-                        },
-                    }
-                break
-
-        now = monotonic()
-        should_log_progress = (
-            evaluation_attempted == selected_count
-            or evaluation_attempted >= next_progress_count
-            or (now - last_progress_log_at) >= 30.0
-        )
-        if should_log_progress:
-            _phase_log(
-                "generation run %s phase=evaluation_progress "
-                "(completed=%d/%d metrics_ok=%d gate_pass=%d gate_fail=%d "
-                "failures=%d errors=%d elapsed=%.1fs)",
-                session_id,
-                evaluation_attempted,
-                selected_count,
-                metrics_ok_count,
-                gate_pass_count,
-                gate_fail_count,
-                evaluation_failures,
-                evaluation_errors,
-                max(0.0, now - evaluation_started_at),
-            )
-            while next_progress_count <= evaluation_attempted:
-                next_progress_count += progress_step
-            last_progress_log_at = now
-
+                while next_progress_count <= evaluation_attempted:
+                    next_progress_count += progress_step
+                last_progress_log_at = now
     _phase_log(
         "generation run %s phase=evaluation_complete "
         "(attempted=%d metrics_ok=%d gate_pass=%d gate_fail=%d "
@@ -2647,6 +2950,8 @@ def run_generation(
         }
         if candidate.failures:
             metadata["failures"] = list(candidate.failures)
+        if candidate.pass_probability is not None:
+            metadata["pass_probability"] = candidate.pass_probability
         archive_store.insert(candidate.build_id, score, descriptor, metadata=metadata)
 
     emitters = (ExploitEmitter(), NoveltyEmitter(), UncertaintyEmitter())
@@ -2913,12 +3218,6 @@ def run_generation(
         summary_path,
         max(0.0, monotonic() - run_started_at),
     )
-    if created_evaluator:
-        evaluator.close()
-    if created_repo and hasattr(repo, "close"):
-        close_repo = repo.close
-        if callable(close_repo):
-            close_repo()
     return summary
 
 

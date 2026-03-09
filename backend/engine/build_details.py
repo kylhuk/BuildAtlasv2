@@ -10,6 +10,9 @@ from backend.engine.passives.builder import PassiveTreePlan
 from backend.engine.skills.catalog import GemPlan
 from backend.engine.sockets.planner import SocketPlan
 
+_RESIST_KEYS = ("fire", "cold", "lightning", "chaos")
+_ATTRIBUTE_KEYS = ("strength", "dexterity", "intelligence")
+
 
 def _normalize_text(value: Any, default: str = "unknown") -> str:
     if isinstance(value, str):
@@ -40,6 +43,52 @@ def _to_json_compatible(value: Any) -> Any:
     return value
 
 
+def _aggregate_slot_template_fields(
+    slot_templates: list[dict[str, Any]],
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    resistances = {key: 0 for key in _RESIST_KEYS}
+    attributes = {key: 0 for key in _ATTRIBUTE_KEYS}
+    stats = {"life": 0, "energy_shield": 0}
+
+    for template in slot_templates:
+        contributions = template.get("contributions")
+        if not isinstance(contributions, dict):
+            continue
+        for key in _RESIST_KEYS:
+            value = contributions.get(key)
+            if isinstance(value, int):
+                resistances[key] += value
+        for key in _ATTRIBUTE_KEYS:
+            value = contributions.get(key)
+            if isinstance(value, int):
+                attributes[key] += value
+        for key in ("life", "energy_shield"):
+            value = contributions.get(key)
+            if isinstance(value, int):
+                stats[key] += value
+
+    stats["ehp"] = stats["life"] + stats["energy_shield"]
+    return resistances, attributes, stats
+
+
+def _estimate_reservation(
+    groups: list[dict[str, Any]], attributes: Mapping[str, int]
+) -> tuple[int, int]:
+    reservation = 0
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        gems = group.get("gems")
+        gem_count = len(gems) if isinstance(gems, list) else 0
+        group_type = _normalize_text(group.get("group_type"), "unknown")
+        if group_type in {"aura", "support", "utility"}:
+            reservation += 50 * gem_count
+        elif group_type in {"guard", "movement"}:
+            reservation += 20 * gem_count
+    total_mana = 100 + int(attributes.get("intelligence", 0) / 2)
+    return reservation, total_mana
+
+
 def build_details_from_generation(
     *,
     genome: GenomeV0,
@@ -47,6 +96,7 @@ def build_details_from_generation(
     passive_plan: PassiveTreePlan,
     socket_plan: SocketPlan,
     template_plan: ItemTemplatePlan,
+    profile_id: str | None = None,
 ) -> dict[str, Any]:
     groups = []
     for group in gem_plan.groups:
@@ -71,6 +121,9 @@ def build_details_from_generation(
             }
         )
 
+    resistances, attributes, stats = _aggregate_slot_template_fields(slot_templates)
+    reservation, total_mana = _estimate_reservation(groups, attributes)
+
     return {
         "schema_version": 1,
         "source": "generator_plan",
@@ -78,7 +131,7 @@ def build_details_from_generation(
             "class": genome.class_name,
             "ascendancy": genome.ascendancy,
             "main_skill": genome.main_skill_package,
-            "profile_id": genome.profile_id,
+            "profile_id": profile_id or genome.profile_id,
             "defense_archetype": genome.defense_archetype,
             "budget_tier": genome.budget_tier,
             "sources": {
@@ -91,6 +144,11 @@ def build_details_from_generation(
             "slot_templates": slot_templates,
             "repair_report": asdict(template_plan.repair_report),
         },
+        "resistances": resistances,
+        "attributes": attributes,
+        "stats": stats,
+        "reservation": reservation,
+        "total_mana": total_mana,
         "passives": {
             "node_ids": [str(node_id) for node_id in passive_plan.node_ids],
             "required_targets": [str(target) for target in passive_plan.required_targets],
