@@ -17,6 +17,8 @@ RULESET_PATTERN = re.compile(
 
 BUILD_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
+ARTIFACT_SCHEMA_VERSION = 1
+
 
 @dataclass(frozen=True)
 class ArtifactPaths:
@@ -184,6 +186,7 @@ def write_build_artifacts(
     scenarios_used: Optional[Any] = None,
     raw_metrics: Optional[Any] = None,
     build_details: Optional[Any] = None,
+    surrogate_prediction: Optional[Any] = None,
     base_path: Optional[Union[str, Path]] = None,
 ) -> ArtifactProvenance:
     xml_bytes: bytes | None = None
@@ -194,12 +197,34 @@ def write_build_artifacts(
 
     if xml_bytes is not None:
         _atomic_write_gzip(paths.build_xml, xml_bytes)
-    _atomic_write_bytes(paths.code, code if isinstance(code, bytes) else code.encode("utf-8"))
+    code_bytes = code if isinstance(code, bytes) else code.encode("utf-8")
+    _atomic_write_bytes(paths.code, code_bytes)
 
     _write_optional_json(paths.genome, genome)
     _write_optional_json(paths.scenarios_used, scenarios_used)
     _write_optional_json(paths.metrics_raw, raw_metrics)
     _write_optional_json(paths.build_details, build_details)
+    _write_optional_json(paths.surrogate_prediction, surrogate_prediction)
+
+    included_files: list[str] = []
+    integrity_hash = _compute_integrity_hash(
+        paths=paths,
+        xml_bytes=xml_bytes,
+        code_bytes=code_bytes,
+        genome=genome,
+        scenarios_used=scenarios_used,
+        raw_metrics=raw_metrics,
+        build_details=build_details,
+        surrogate_prediction=surrogate_prediction,
+        included_files=included_files,
+    )
+
+    metadata = {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "integrity_hash": integrity_hash,
+        "included_files": included_files,
+    }
+    _write_optional_json(paths.base_dir / "artifact_metadata.json", metadata)
 
     return ArtifactProvenance(build_id=build_id, xml_hash=hash_value, paths=paths)
 
@@ -215,10 +240,116 @@ def write_build_constraints(
     return paths.constraints
 
 
+def _serialize_for_hash(obj: Any) -> bytes:
+    serialized = json.dumps(obj, ensure_ascii=False, sort_keys=True)
+    return serialized.encode("utf-8")
+
+
+def _compute_integrity_hash(
+    paths: ArtifactPaths,
+    xml_bytes: bytes | None,
+    code_bytes: bytes,
+    genome: Any,
+    scenarios_used: Any,
+    raw_metrics: Any,
+    build_details: Any,
+    surrogate_prediction: Any,
+    included_files: list[str],
+) -> str:
+    hasher = sha256()
+    if xml_bytes is not None:
+        hasher.update(b"xml:")
+        hasher.update(xml_bytes)
+        included_files.append("xml")
+    hasher.update(b"code:")
+    hasher.update(code_bytes)
+    included_files.append("code")
+    if genome is not None:
+        hasher.update(b"genome:")
+        hasher.update(_serialize_for_hash(genome))
+        included_files.append("genome")
+    if scenarios_used is not None:
+        hasher.update(b"scenarios_used:")
+        hasher.update(_serialize_for_hash(scenarios_used))
+        included_files.append("scenarios_used")
+    if raw_metrics is not None:
+        hasher.update(b"raw_metrics:")
+        hasher.update(_serialize_for_hash(raw_metrics))
+        included_files.append("raw_metrics")
+    if build_details is not None:
+        hasher.update(b"build_details:")
+        hasher.update(_serialize_for_hash(build_details))
+        included_files.append("build_details")
+    if surrogate_prediction is not None:
+        hasher.update(b"surrogate_prediction:")
+        hasher.update(_serialize_for_hash(surrogate_prediction))
+        included_files.append("surrogate_prediction")
+    return hasher.hexdigest()
+
+
 def _read_optional_json(path: Path) -> Optional[Any]:
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def verify_artifacts(build_id: str, base_path: Optional[Union[str, Path]] = None) -> None:
+    paths = artifact_paths(build_id, base_path)
+    if not paths.base_dir.exists():
+        raise FileNotFoundError(f"artifacts missing for {build_id}")
+
+    metadata_path = paths.base_dir / "artifact_metadata.json"
+    if not metadata_path.exists():
+        raise ValueError("artifact metadata missing, cannot verify integrity")
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    stored_hash = metadata.get("integrity_hash")
+    if stored_hash is None:
+        raise ValueError("integrity_hash missing from metadata")
+
+    included_files = metadata.get("included_files", [])
+
+    xml_bytes: bytes | None = None
+    if "xml" in included_files and paths.build_xml.exists():
+        with gzip.open(paths.build_xml, "rb") as handle:
+            xml_bytes = handle.read()
+
+    code_bytes = paths.code.read_bytes() if "code" in included_files else b""
+
+    genome = None
+    if "genome" in included_files:
+        genome = _read_optional_json(paths.genome)
+
+    scenarios_used = None
+    if "scenarios_used" in included_files:
+        scenarios_used = _read_optional_json(paths.scenarios_used)
+
+    raw_metrics = None
+    if "raw_metrics" in included_files:
+        raw_metrics = _read_optional_json(paths.metrics_raw)
+
+    build_details = None
+    if "build_details" in included_files:
+        build_details = _read_optional_json(paths.build_details)
+
+    surrogate_prediction = None
+    if "surrogate_prediction" in included_files:
+        surrogate_prediction = _read_optional_json(paths.surrogate_prediction)
+
+    computed_hash = _compute_integrity_hash(
+        paths=paths,
+        xml_bytes=xml_bytes,
+        code_bytes=code_bytes,
+        genome=genome,
+        scenarios_used=scenarios_used,
+        raw_metrics=raw_metrics,
+        build_details=build_details,
+        surrogate_prediction=surrogate_prediction,
+        included_files=included_files,
+    )
+
+    if stored_hash != computed_hash:
+        raise ValueError("artifact integrity check failed: data has been corrupted or modified")
 
 
 def read_build_artifacts(
@@ -227,6 +358,7 @@ def read_build_artifacts(
     paths = artifact_paths(build_id, base_path)
     if not paths.base_dir.exists():
         raise FileNotFoundError(f"artifacts missing for {build_id}")
+    verify_artifacts(build_id, base_path)
     xml_content: str | None = None
     if paths.build_xml.exists():
         with gzip.open(paths.build_xml, "rb") as handle:
