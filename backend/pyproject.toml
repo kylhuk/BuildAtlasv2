@@ -29,7 +29,9 @@ dev = [
 ml = [
     "numpy",
     "scikit-learn",
-    "torch"
+    "torch",
+    "pandas",
+    "pyarrow"
 ]
 
 performance = [
