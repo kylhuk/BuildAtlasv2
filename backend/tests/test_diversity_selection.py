@@ -56,7 +56,7 @@ def test_assign_niche_with_attack_skill():
     result = assign_niche(build)
 
     assert result.class_name == "Ranger"
-    assert result.skill_type == "attack"
+    assert result.skill_type == "spell"
     assert result.defense_type == "evasion"
 
 
@@ -142,7 +142,7 @@ def test_archive_insert_replaces_if_better():
     assert result2 is True
     assert len(archive) == 1
 
-    niche = NicheAssignment("Witch", "elemental", "armor", "spell")
+    niche = NicheAssignment("Witch", "hybrid", "armor", "spell")
     best = archive.get_best_for_niche(niche)
     assert best is not None
     assert best["full_dps"] == 2000.0
@@ -170,7 +170,7 @@ def test_archive_insert_keeps_if_worse():
     assert result is False
     assert len(archive) == 1
 
-    niche = NicheAssignment("Witch", "elemental", "armor", "spell")
+    niche = NicheAssignment("Witch", "hybrid", "armor", "spell")
     best = archive.get_best_for_niche(niche)
     assert best is not None
     assert best["full_dps"] == 2000.0
@@ -335,7 +335,7 @@ def test_archive_get_best_for_niche():
     build = {"class": "Witch", "genome": {"main_skill_package": "arc"}, "defense_archetype": "armor", "full_dps": 1000.0}
     archive.update(build)
 
-    niche = NicheAssignment("Witch", "elemental", "armor", "spell")
+    niche = NicheAssignment("Witch", "hybrid", "armor", "spell")
     best = archive.get_best_for_niche(niche)
 
     assert best is not None
@@ -346,7 +346,7 @@ def test_archive_get_best_for_empty_niche():
     """Archive should return None for empty niche."""
     archive = DiversityArchive()
 
-    niche = NicheAssignment("Witch", "elemental", "armor", "spell")
+    niche = NicheAssignment("Witch", "hybrid", "armor", "spell")
     best = archive.get_best_for_niche(niche)
 
     assert best is None
