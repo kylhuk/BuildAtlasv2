@@ -32,6 +32,13 @@ except ImportError:
     torch = None  # type: ignore
     nn = None  # type: ignore
 
+try:
+    from sklearn.isotonic import IsotonicRegression
+
+    HAS_ISOTONIC = True
+except ImportError:
+    HAS_ISOTONIC = False
+
 from backend.engine.surrogate.dataset import (
     FEATURE_IDENTITY_CROSS_TOKENS,
     FEATURE_IDENTITY_TOKENS,
@@ -1019,6 +1026,166 @@ def load_dataset_rows(dataset_path: Path | str) -> list[Mapping[str, Any]]:
     return list(_load_dataset_rows(dataset_root))
 
 
+def incremental_train(
+    existing_model_path: Path | str,
+    new_data_path: Path | str,
+    output_root: Path | str,
+    model_id: str | None = None,
+    compute_backend: str = BACKEND_PREFERENCE_AUTO,
+    learning_rate: float = 0.001,
+    epochs: int = 10,
+) -> TrainResult:
+    """Incrementally train an existing model with new data.
+    
+    This function updates the model weights using the new data without
+    requiring full retraining from scratch. It uses the existing model
+    as a starting point and continues training.
+    
+    Args:
+        existing_model_path: Path to existing model
+        new_data_path: Path to new dataset snapshot
+        output_root: Directory to write updated model
+        model_id: Optional model ID for the updated model
+        compute_backend: Compute backend preference
+        learning_rate: Learning rate for incremental training
+        epochs: Number of epochs for incremental training
+        
+    Returns:
+        TrainResult with updated model artifacts
+    """
+    from backend.engine.surrogate.dataset import (
+        _DATASET_FORMAT_JSONL,
+        _read_rows,
+    )
+    
+    train_started_at = monotonic()
+    
+    existing_model = load_model(existing_model_path)
+    dataset_root = resolve_snapshot_root(Path(new_data_path))
+    manifest = _load_manifest(dataset_root)
+    
+    dataset_path = dataset_root / _DATASET_FORMAT_JSONL.replace('.jsonl', '')
+    new_rows = _read_rows(dataset_path, manifest.get("dataset_format"))
+    
+    if not new_rows:
+        raise ValueError("no new data available for incremental training")
+    
+    model_id = model_id or f"{existing_model.model_id}-incremental"
+    backend_preference = _normalize_backend_preference(compute_backend)
+    resolved_backend, fallback_reason = _resolve_compute_backend(backend_preference)
+    
+    _train_phase_log(
+        "incremental train %s phase=start "
+        "(existing_model=%s new_rows=%d epochs=%d lr=%f)",
+        model_id,
+        existing_model.model_id,
+        len(new_rows),
+        epochs,
+        learning_rate,
+    )
+    
+    signal_feature_keys = list(FEATURE_SIGNAL_KEYS)
+    identity_hash_dim = existing_model.identity_hash_dim
+    cross_hash_dim = existing_model.cross_hash_dim
+    
+    new_regression_rows = [row for row in new_rows if row.get("gate_pass") is True]
+    if not new_regression_rows:
+        new_regression_rows = list(new_rows)
+    
+    if new_regression_rows:
+        regressor_payload, regressor_metrics = _train_regressor(
+            new_regression_rows,
+            signal_feature_keys=signal_feature_keys,
+            identity_hash_dim=identity_hash_dim,
+            cross_hash_dim=cross_hash_dim,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            compute_backend=resolved_backend,
+        )
+    else:
+        regressor_payload = existing_model.regressor
+        regressor_metrics = {}
+    
+    classifier_payload = existing_model.classifier
+    classifier_metrics = existing_model.classifier_metrics
+    
+    if existing_model.classifier is not None:
+        classification_rows = [row for row in new_rows if "gate_pass" in row]
+        if classification_rows:
+            try:
+                classifier_payload, classifier_metrics = _train_logistic_classifier(
+                    classification_rows,
+                    signal_feature_keys=signal_feature_keys,
+                    identity_hash_dim=identity_hash_dim,
+                    cross_hash_dim=cross_hash_dim,
+                    epochs=epochs,
+                    learning_rate=learning_rate,
+                    l2=0.01,
+                    lr_decay=0.95,
+                )
+            except ValueError:
+                pass
+    
+    model_root = Path(output_root) / model_id
+    meta_payload = {
+        "model_id": model_id,
+        "model_version": MODEL_VERSION,
+        "parent_model_id": existing_model.model_id,
+        "training_type": "incremental",
+        "new_data_rows": len(new_rows),
+        "epochs": epochs,
+        "learning_rate": learning_rate,
+        "snapshot_id": manifest.get("snapshot_id"),
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "compute_backend_preference": compute_backend,
+        "compute_backend_resolved": resolved_backend,
+        "fallback_reason": fallback_reason,
+    }
+    
+    model_payload = {
+        "model_id": model_id,
+        "model_version": MODEL_VERSION,
+        "regressor": regressor_payload,
+        "regressor_feature_keys": signal_feature_keys,
+        "identity_hash_dim": identity_hash_dim,
+        "cross_hash_dim": cross_hash_dim,
+        "classifier": classifier_payload,
+    }
+    
+    metrics_payload = {
+        "regressor": regressor_metrics,
+        "classifier": classifier_metrics,
+    }
+    
+    model_path, metrics_path, meta_path = _write_model_artifacts_atomic(
+        model_root,
+        model_payload=model_payload,
+        metrics_payload=metrics_payload,
+        meta_payload=meta_payload,
+    )
+    
+    incremental_elapsed = max(0.0, monotonic() - train_started_at)
+    _train_phase_log(
+        "incremental train %s phase=complete "
+        "(status=success elapsed=%.2fs)",
+        model_id,
+        incremental_elapsed,
+    )
+    
+    return TrainResult(
+        model_id=model_id,
+        model_path=model_path,
+        metrics_path=metrics_path,
+        meta_path=meta_path,
+        dataset_snapshot_id=manifest.get("snapshot_id"),
+        row_count=len(new_rows),
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        compute_backend_preference=compute_backend,
+        compute_backend_resolved=resolved_backend,
+        compute_backend_fallback_reason=fallback_reason,
+    )
+
+
 def resolve_snapshot_root(path: Path | str) -> Path:
     candidate = Path(path)
     if candidate.exists() and _is_snapshot(candidate):
@@ -1713,6 +1880,89 @@ def _sigmoid(value: float) -> float:
         return 1.0 / (1.0 + exp(-value))
     except OverflowError:
         return 0.0 if value < 0 else 1.0
+
+
+def _calibrate_probabilities(
+    labels: list[int],
+    probabilities: list[float],
+) -> tuple[dict[str, Any] | None, float | None]:
+    """Calibrate probabilities using isotonic regression.
+    
+    Returns:
+        Tuple of (calibration payload, ECE score)
+    """
+    if not HAS_ISOTONIC or len(labels) < 10:
+        return None, None
+    
+    try:
+        iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='clip')
+        iso.fit(probabilities, labels)
+        
+        calibrated = iso.transform(probabilities)
+        
+        ece = _compute_ece(labels, calibrated)
+        
+        calibration_payload = {
+            "method": "isotonic",
+            "n_samples": len(labels),
+            "ece": ece,
+        }
+        
+        return calibration_payload, ece
+    except Exception:
+        return None, None
+
+
+def _compute_ece(labels: list[int], probabilities: list[float], n_bins: int = 10) -> float:
+    """Compute Expected Calibration Error (ECE)."""
+    if not labels or not probabilities:
+        return 0.0
+    
+    bin_boundaries = [i / n_bins for i in range(n_bins + 1)]
+    ece = 0.0
+    
+    for i in range(n_bins):
+        bin_lower = bin_boundaries[i]
+        bin_upper = bin_boundaries[i + 1]
+        
+        in_bin = []
+        for j, prob in enumerate(probabilities):
+            if bin_lower <= prob < bin_upper or (i == n_bins - 1 and prob == bin_upper):
+                in_bin.append(j)
+        
+        if not in_bin:
+            continue
+        
+        avg_confidence = mean([probabilities[j] for j in in_bin])
+        avg_accuracy = mean([labels[j] for j in in_bin])
+        bin_size = len(in_bin) / len(labels)
+        
+        ece += bin_size * abs(avg_accuracy - avg_confidence)
+    
+    return ece
+
+
+def _apply_calibration(
+    probabilities: list[float],
+    calibration_payload: dict[str, Any] | None,
+) -> list[float]:
+    """Apply calibration to probabilities."""
+    if not calibration_payload or not HAS_ISOTONIC:
+        return probabilities
+    
+    try:
+        from sklearn.isotonic import IsotonicRegression
+        
+        method = calibration_payload.get("method")
+        if method != "isotonic":
+            return probabilities
+        
+        iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='clip')
+        iso.fit(calibration_payload.get("_train_probs", []), calibration_payload.get("_train_labels", []))
+        
+        return iso.transform(probabilities).tolist()
+    except Exception:
+        return probabilities
 
 
 def _stat_summary(values: Sequence[float]) -> dict[str, float]:

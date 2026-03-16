@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 from dataclasses import dataclass
@@ -13,9 +14,19 @@ from typing import Any, Iterable, Mapping, Sequence, TypeGuard
 
 from backend.engine.metrics_source import METRICS_SOURCE_POB, normalize_metrics_source
 
+try:
+    import pandas as pd
+
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
+
 FEATURE_SCHEMA_VERSION = "v4"
 _DATASET_FILENAME = "dataset.jsonl"
+_DATASET_PARQUET_FILENAME = "dataset.parquet"
 _MANIFEST_FILENAME = "manifest.json"
+_DATASET_FORMAT_JSONL = "jsonl"
+_DATASET_FORMAT_PARQUET = "parquet"
 _RESIST_KEYS = ("fire", "cold", "lightning", "chaos")
 _ATTRIBUTE_KEYS = ("strength", "dexterity", "intelligence")
 _SNAPSHOT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -92,6 +103,7 @@ class SnapshotResult:
     row_count: int
     feature_schema_version: str
     dataset_hash: str
+    dataset_format: str = _DATASET_FORMAT_JSONL
 
 
 def build_dataset_snapshot(
@@ -105,8 +117,22 @@ def build_dataset_snapshot(
     budget_tier: str | None = None,
     evolutionary_selection: bool = False,
     survival_rate: float = 0.9,
+    dataset_format: str = _DATASET_FORMAT_JSONL,
 ) -> SnapshotResult:
-    """Build a dataset snapshot from the given data/artifacts root."""
+    """Build a dataset snapshot from the given data/artifacts root.
+    
+    Args:
+        data_path: Root path containing build artifacts
+        output_root: Directory to write snapshot
+        snapshot_id: Unique identifier for this snapshot
+        exclude_stub_rows: Whether to exclude stub metrics
+        profile_id: Filter by profile ID
+        scenario_id: Filter by scenario ID
+        budget_tier: Filter by budget tier
+        evolutionary_selection: Enable evolutionary selection
+        survival_rate: Survival rate for evolutionary selection
+        dataset_format: Format for dataset storage ('jsonl' or 'parquet')
+    """
 
     if not snapshot_id or not snapshot_id.strip():
         raise ValueError("snapshot_id must be a non-empty string")
@@ -176,11 +202,12 @@ def build_dataset_snapshot(
         }
 
     dataset_path = snapshot_dir / _DATASET_FILENAME
-    dataset_hash = _write_rows(rows, dataset_path)
+    dataset_hash = _write_rows(rows, dataset_path, dataset_format)
 
     manifest = {
         "snapshot_id": snapshot_id,
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "dataset_format": dataset_format,
         "row_count": len(rows),
         "source_root_path": str(builds_root.resolve()),
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -198,6 +225,7 @@ def build_dataset_snapshot(
         row_count=len(rows),
         feature_schema_version=FEATURE_SCHEMA_VERSION,
         dataset_hash=dataset_hash,
+        dataset_format=dataset_format,
     )
 
 
@@ -379,15 +407,68 @@ def _extend_identity_tokens(tokens: list[str], extras: Sequence[str]) -> list[st
     return extended[:_IDENTITY_TOKEN_LIMIT]
 
 
-def _write_rows(rows: Iterable[Mapping[str, Any]], path: Path) -> str:
+def _write_rows(rows: Iterable[Mapping[str, Any]], path: Path, format: str = _DATASET_FORMAT_JSONL) -> str:
     hasher = sha256()
-    with path.open("w", encoding="utf-8") as handle:
+    
+    if format == _DATASET_FORMAT_PARQUET and HAS_PANDAS:
+        return _write_rows_parquet(rows, path, hasher)
+    else:
+        return _write_rows_jsonl(rows, path, hasher)
+
+
+def _write_rows_jsonl(rows: Iterable[Mapping[str, Any]], path: Path, hasher: Any) -> str:
+    jsonl_path = path.with_suffix('.jsonl')
+    with jsonl_path.open("w", encoding="utf-8") as handle:
         for row in rows:
             line = json.dumps(row, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
             handle.write(line + "\n")
             hasher.update(line.encode("utf-8"))
             hasher.update(b"\n")
     return hasher.hexdigest()
+
+
+def _write_rows_parquet(rows: Iterable[Mapping[str, Any]], path: Path, hasher: Any) -> str:
+    parquet_path = path.with_suffix('.parquet')
+    row_list = list(rows)
+    
+    for row in row_list:
+        line = json.dumps(row, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        hasher.update(line.encode("utf-8"))
+        hasher.update(b"\n")
+    
+    df = pd.DataFrame(row_list)
+    df.to_parquet(parquet_path, index=False, engine='pyarrow', compression='snappy')
+    
+    return hasher.hexdigest()
+
+
+def _read_rows(path: Path, format: str | None = None) -> list[Mapping[str, Any]]:
+    if format is None:
+        parquet_path = path.with_suffix('.parquet')
+        jsonl_path = path.with_suffix('.jsonl')
+        if parquet_path.exists():
+            format = _DATASET_FORMAT_PARQUET
+        elif jsonl_path.exists():
+            format = _DATASET_FORMAT_JSONL
+        else:
+            return []
+    
+    if format == _DATASET_FORMAT_PARQUET and HAS_PANDAS:
+        parquet_path = path.with_suffix('.parquet')
+        if not parquet_path.exists():
+            return []
+        df = pd.read_parquet(parquet_path)
+        return df.to_dict('records')
+    else:
+        jsonl_path = path.with_suffix('.jsonl')
+        if not jsonl_path.exists():
+            return []
+        rows = []
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            rows.append(json.loads(line))
+        return rows
 
 
 def _read_json(path: Path) -> Mapping[str, Any] | None:
@@ -998,6 +1079,120 @@ def _combine_token_components(*pairs: tuple[str, str]) -> str:
     return "|".join(components)
 
 
+@dataclass(frozen=True)
+class DatasetValidationResult:
+    """Result of dataset validation."""
+    is_valid: bool
+    row_count: int
+    duplicate_count: int
+    missing_values_count: int
+    invalid_values_count: int
+    quality_score: float
+    issues: list[str]
+
+
+def validate_dataset(rows: Sequence[Mapping[str, Any]]) -> DatasetValidationResult:
+    """Validate dataset rows for quality issues.
+    
+    Checks for:
+    - Duplicate rows
+    - Missing required values
+    - Invalid numeric values
+    - Overall quality score
+    
+    Args:
+        rows: Dataset rows to validate
+        
+    Returns:
+        DatasetValidationResult with validation results
+    """
+    issues: list[str] = []
+    duplicate_count = 0
+    missing_values_count = 0
+    invalid_values_count = 0
+    
+    required_fields = ["build_id", "scenario_id", "full_dps", "max_hit"]
+    
+    seen_rows: dict[str, int] = {}
+    for row in rows:
+        row_key = f"{row.get('build_id')}|{row.get('scenario_id')}"
+        seen_rows[row_key] = seen_rows.get(row_key, 0) + 1
+    
+    duplicate_count = sum(1 for count in seen_rows.values() if count > 1)
+    if duplicate_count > 0:
+        issues.append(f"Found {duplicate_count} duplicate rows")
+    
+    for row in rows:
+        for field in required_fields:
+            if field not in row or row.get(field) is None:
+                missing_values_count += 1
+                issues.append(f"Missing required field: {field}")
+        
+        for field in ["full_dps", "max_hit", "armour", "evasion", "life"]:
+            value = row.get(field)
+            if value is not None:
+                try:
+                    float_val = float(value)
+                    if not _isfinite(float_val):
+                        invalid_values_count += 1
+                        issues.append(f"Invalid value for {field}: {value}")
+                except (TypeError, ValueError):
+                    invalid_values_count += 1
+                    issues.append(f"Non-numeric value for {field}: {value}")
+    
+    total_checks = len(rows) * (len(required_fields) + 5)
+    valid_checks = total_checks - missing_values_count - invalid_values_count
+    quality_score = valid_checks / total_checks if total_checks > 0 else 0.0
+    
+    is_valid = duplicate_count == 0 and missing_values_count == 0 and invalid_values_count == 0
+    
+    return DatasetValidationResult(
+        is_valid=is_valid,
+        row_count=len(rows),
+        duplicate_count=duplicate_count,
+        missing_values_count=missing_values_count,
+        invalid_values_count=invalid_values_count,
+        quality_score=quality_score,
+        issues=issues,
+    )
+
+
+def compute_dataset_statistics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Compute statistics about the dataset.
+    
+    Args:
+        rows: Dataset rows
+        
+    Returns:
+        Dictionary with dataset statistics
+    """
+    if not rows:
+        return {"row_count": 0}
+    
+    numeric_fields = ["full_dps", "max_hit", "utility_score", "armour", "evasion", "life"]
+    stats: dict[str, Any] = {
+        "row_count": len(rows),
+        "unique_builds": len(set(row.get("build_id") for row in rows)),
+        "unique_scenarios": len(set(row.get("scenario_id") for row in rows)),
+        "gate_pass_count": sum(1 for row in rows if row.get("gate_pass")),
+        "gate_fail_count": sum(1 for row in rows if not row.get("gate_pass")),
+    }
+    
+    for field in numeric_fields:
+        values = [float(row[field]) for row in rows if row.get(field) is not None]
+        if values:
+            stats[f"{field}_mean"] = sum(values) / len(values)
+            stats[f"{field}_min"] = min(values)
+            stats[f"{field}_max"] = max(values)
+    
+    return stats
+
+
+def _isfinite(value: float) -> bool:
+    """Check if a value is finite."""
+    return math.isfinite(value)
+
+
 __all__ = [
     "FEATURE_SCHEMA_VERSION",
     "FEATURE_SIGNAL_KEYS",
@@ -1006,4 +1201,10 @@ __all__ = [
     "SnapshotResult",
     "build_dataset_snapshot",
     "extract_feature_signals",
+    "_DATASET_FORMAT_JSONL",
+    "_DATASET_FORMAT_PARQUET",
+    "_read_rows",
+    "DatasetValidationResult",
+    "validate_dataset",
+    "compute_dataset_statistics",
 ]
